@@ -1,0 +1,31 @@
+[package]
+name = "opencode-backend-opencode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opencode-types.workspace = true
+opencode-backend = { path = "../backend" }
+futures-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwless = { version = "0.14", default-features = false }
+embedded-io-async = "0.7"
+
+[dependencies.tokio]
+version = "1"
+features = ["net", "io-util"]
+optional = true
+
+[dependencies.embedded-nal-async]
+version = "0.9"
+optional = true
+
+[features]
+std = ["dep:tokio", "dep:embedded-nal-async", "embedded-io-async/std"]
+default = ["std"]
+
+[dev-dependencies.tokio]
+version = "1"
+features = ["macros", "rt-multi-thread"]

@@ -1,0 +1,17 @@
+[package]
+name = "opencode-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "opencode-native"
+path = "src/main.rs"
+
+[dependencies]
+opencode-types.workspace = true
+opencode-backend = { path = "../backend" }
+opencode-backend-opencode = { path = "../backend-opencode", features = ["std"] }
+opencode-tui = { path = "../tui" }
+ratatui-core.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

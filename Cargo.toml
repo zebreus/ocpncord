@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "types",
+    "backend",
+    "backend-opencode",
+    "tui",
+    "native",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[workspace.dependencies]
+opencode-types = { path = "types" }
+opencode-backend = { path = "backend" }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+futures-core = { version = "0.3", default-features = false, features = ["alloc"] }
+ratatui-core = { version = "0.1", default-features = false }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
