@@ -59,6 +59,9 @@ impl KeyChord {
             Scancode::Char('l') | Scancode::Char('L') => {
                 Some(Action::OpenModal(ModalId::SessionList))
             }
+            Scancode::Char('m') | Scancode::Char('M') => {
+                Some(Action::OpenModal(ModalId::ModelPicker))
+            }
             _ => None,
         }
     }

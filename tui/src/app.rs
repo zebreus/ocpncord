@@ -9,7 +9,7 @@ use opencode_backend::Backend;
 use crate::chat::{render_chat, Chat};
 use crate::event::{Event, Scancode};
 use crate::key_chord::KeyChord;
-use crate::modal::{Modal, SessionListModal};
+use crate::modal::{Modal, ModelPickerModal, SessionListModal};
 use crate::prompt_bar::PromptBar;
 use crate::screen::{Action, ModalId, Screen, ScreenId};
 use crate::start_page::StartPage;
@@ -325,6 +325,16 @@ impl<B: Backend> App<B> {
 
     async fn handle_slash_command(&mut self, text: &str) -> bool {
         match text {
+            "/models" => {
+                self.prompt_bar.clear();
+                let mut modal = ModelPickerModal::new();
+                match self.backend.get_config().await {
+                    Ok(config) => modal.set_config(config),
+                    Err(e) => modal.set_error(alloc::format!("{}", e)),
+                }
+                self.active_modal = Some(Box::new(modal));
+                true
+            }
             "/new" => {
                 match self.backend.create_session("Chat", "").await {
                     Ok(session) => {
@@ -424,6 +434,14 @@ impl<B: Backend> App<B> {
                 let mut modal = SessionListModal::new();
                 match self.backend.list_sessions().await {
                     Ok(sessions) => modal.set_sessions(sessions),
+                    Err(e) => modal.set_error(alloc::format!("{}", e)),
+                }
+                self.active_modal = Some(Box::new(modal));
+            }
+            Some(Action::OpenModal(ModalId::ModelPicker)) => {
+                let mut modal = ModelPickerModal::new();
+                match self.backend.get_config().await {
+                    Ok(config) => modal.set_config(config),
                     Err(e) => modal.set_error(alloc::format!("{}", e)),
                 }
                 self.active_modal = Some(Box::new(modal));
@@ -1243,6 +1261,46 @@ mod tests {
             app.backend().sessions.len(),
             session_count_before + 1,
             "/new should create a new session"
+        );
+    }
+
+    #[test]
+    fn slash_models_opens_modal() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, char_key('/'));
+        run(&mut app, char_key('m'));
+        run(&mut app, char_key('o'));
+        run(&mut app, char_key('d'));
+        run(&mut app, char_key('e'));
+        run(&mut app, char_key('l'));
+        run(&mut app, char_key('s'));
+        run(&mut app, enter_key());
+
+        assert!(
+            app.active_modal().is_some(),
+            "/models should open the model picker modal"
+        );
+    }
+
+    #[test]
+    fn ctrl_x_m_opens_model_picker_modal() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, ctrl('x'));
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Char('m'),
+                modifiers: Modifiers::default(),
+            }),
+        );
+
+        assert!(
+            app.active_modal().is_some(),
+            "Ctrl+X M should open the model picker modal"
         );
     }
 }

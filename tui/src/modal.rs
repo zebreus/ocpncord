@@ -16,7 +16,7 @@ pub trait Modal {
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use opencode_backend::Session;
+use opencode_backend::{Config, Session};
 use ratatui_core::text::Text;
 use ratatui_core::widgets::Widget;
 
@@ -175,6 +175,77 @@ impl Modal for SessionListModal {
     }
 }
 
+// --- Model picker modal ---
+
+pub struct ModelPickerModal {
+    model: Option<String>,
+    error: Option<String>,
+}
+
+impl ModelPickerModal {
+    pub fn new() -> Self {
+        Self {
+            model: None,
+            error: None,
+        }
+    }
+
+    pub fn set_config(&mut self, config: Config) {
+        self.model = config.model;
+    }
+
+    pub fn set_error(&mut self, error: String) {
+        self.error = Some(error);
+    }
+}
+
+impl Modal for ModelPickerModal {
+    fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect) {
+        Text::from("Model")
+            .style(theme.text_accent)
+            .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
+
+        let content_y = area.y + 2;
+
+        if let Some(err) = &self.error {
+            Text::from(err.as_str()).style(theme.text_error).render(
+                Rect::new(area.x, content_y, area.width, 1),
+                frame.buffer_mut(),
+            );
+        } else if let Some(model) = &self.model {
+            Text::from(alloc::format!("Current model: {}", model))
+                .style(theme.text)
+                .render(
+                    Rect::new(area.x, content_y, area.width, 1),
+                    frame.buffer_mut(),
+                );
+        } else {
+            Text::from("No model configured")
+                .style(theme.text_dim)
+                .render(
+                    Rect::new(area.x, content_y, area.width, 1),
+                    frame.buffer_mut(),
+                );
+        }
+
+        if self.error.is_none() {
+            let notice = "Read-only: configure model via server config";
+            Text::from(notice).style(theme.text_dim).render(
+                Rect::new(area.x, area.y + 4, area.width, 1),
+                frame.buffer_mut(),
+            );
+        }
+    }
+
+    fn handle_event(&mut self, _event: Event) -> Action {
+        Action::None
+    }
+
+    fn title(&self) -> &str {
+        "Model Picker"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +290,80 @@ mod tests {
         assert!(
             has_loading,
             "Loading state should show text starting with L"
+        );
+    }
+
+    #[test]
+    fn model_picker_shows_model_from_config() {
+        use opencode_backend::Config;
+        let mut modal = ModelPickerModal::new();
+        modal.set_config(Config {
+            model: Some("gpt-4".into()),
+            username: None,
+        });
+
+        let theme = Theme::default();
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                Modal::render(&modal, frame, &theme, Rect::new(10, 5, 40, 10));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let screen: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            screen.contains("gpt-4"),
+            "Model name 'gpt-4' should appear. Screen: {}",
+            screen
+        );
+    }
+
+    #[test]
+    fn model_picker_shows_readonly_notice() {
+        use opencode_backend::Config;
+        let mut modal = ModelPickerModal::new();
+        modal.set_config(Config {
+            model: Some("gpt-4".into()),
+            username: None,
+        });
+
+        let theme = Theme::default();
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                Modal::render(&modal, frame, &theme, Rect::new(10, 5, 40, 10));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let screen: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            screen.contains("Read-only:"),
+            "Read-only notice should appear. Screen: {}",
+            screen
+        );
+    }
+
+    #[test]
+    fn model_picker_shows_error_state() {
+        let mut modal = ModelPickerModal::new();
+        modal.set_error("Failed to load model config".into());
+
+        let theme = Theme::default();
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                Modal::render(&modal, frame, &theme, Rect::new(10, 5, 40, 10));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let screen: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            screen.contains("Failed to load model config"),
+            "Error message should appear. Screen: {}",
+            screen
         );
     }
 }
