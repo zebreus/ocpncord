@@ -42,6 +42,10 @@ An async `Stream` of `BackendEvent`s returned by `prompt()` or `command()`. Carr
 **Session**:
 A single conversation with the **Agent**, consisting of a sequence of **Message**s.
 
+**Theme**:
+A collection of semantic `Style` values (colours, modifiers) used throughout the TUI. Defined as a plain struct with a `Default` impl (TokyoNight palette). Every `Screen::render()` receives a `&Theme`. Swappable later by loading from `tui.json` config.
+_Avoid_: Hardcoding colours in widget code.
+
 **TUI**:
 The terminal/embedded user interface built with Ratatui widgets. Platform-agnostic; renders via Crossterm on desktop and mousefood on embedded. Receives generic keypress events (SDL2-style scancodes), not tied to any input hardware.
 

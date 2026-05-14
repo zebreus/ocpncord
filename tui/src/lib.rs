@@ -11,7 +11,9 @@ extern crate alloc;
 mod app;
 mod event;
 mod screen;
+mod theme;
 
 pub use app::App;
 pub use event::Event;
 pub use screen::Screen;
+pub use theme::Theme;

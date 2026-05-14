@@ -1,9 +1,9 @@
-use crate::Event;
+use crate::{Event, Theme};
 use ratatui_core::terminal::Frame;
 
 /// One screen or widget tree in the TUI.
 pub trait Screen {
-    fn render(&self, frame: &mut Frame);
+    fn render(&self, frame: &mut Frame, theme: &Theme);
     fn handle_event(&mut self, event: Event) -> Action;
 }
 
