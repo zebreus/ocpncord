@@ -65,6 +65,8 @@ pub trait Backend {
 
     async fn health(&mut self) -> Result<Health>;
 
+    async fn list_agents(&mut self) -> Result<Vec<Agent>>;
+
     async fn list_sessions(&mut self) -> Result<Vec<Session>>;
     async fn get_session(&mut self, id: &SessionId) -> Result<Session>;
     async fn create_session(&mut self, title: &str, cwd: &str) -> Result<Session>;
@@ -80,8 +82,8 @@ pub trait Backend {
         message_id: &MessageId,
     ) -> Result<MessageDetail>;
 
-    async fn prompt(&mut self, id: &SessionId, text: &str) -> Result<Self::PromptStream>;
-    async fn command(&mut self, id: &SessionId, text: &str) -> Result<Self::PromptStream>;
+    async fn prompt(&mut self, id: &SessionId, text: &str, agent: Option<&str>) -> Result<Self::PromptStream>;
+    async fn command(&mut self, id: &SessionId, text: &str, agent: Option<&str>) -> Result<Self::PromptStream>;
 
     async fn find_text(&mut self, pattern: &str) -> Result<Vec<TextMatch>>;
 

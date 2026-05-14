@@ -4,9 +4,13 @@ A `no_std`+`alloc` Rust client for the opencode AI coding agent. Connects to a r
 
 ## Language
 
-**Agent**:
+**Agent** (the server):
 The opencode server — a headless AI coding agent with a REST API on port 4096.
 _Avoid_: Backend (overloaded), LLM (too narrow)
+
+**Agent** (the type):
+A named configuration on the server that defines a mode (`primary`/`subagent`/`all`), optional model binding, permissions, and a system prompt. Built-in agents include `build` (full tool access) and `plan` (restricted, read-only). The TUI lists agents via `Backend::list_agents()` and cycles through primary agents with Tab. The PromptBar displays the currently active agent name.
+_Avoid_: Mode (deprecated term for this concept)
 
 **Backend**:
 The Rust trait in the `backend` crate that abstracts the Agent protocol. Implementations include `backend-opencode` (HTTP) and mocks used in tests.
@@ -41,9 +45,25 @@ A single conversation with the **Agent**, consisting of a sequence of **Message*
 **TUI**:
 The terminal/embedded user interface built with Ratatui widgets. Platform-agnostic; renders via Crossterm on desktop and mousefood on embedded. Receives generic keypress events (SDL2-style scancodes), not tied to any input hardware.
 
+**Modal**:
+An overlay dialog drawn on top of a full-screen view. Used for session list, settings, model picker, and command palette. The underlying screen stays visible underneath (typically dimmed).
+
+**Screen**:
+A full-screen view in the TUI. There are exactly two: `StartPage` (shown on launch) and `Chat` (the primary interaction mode). All other views are **Modals** overlaid on the current screen.
+
+**StartPage**:
+The initial screen shown on launch. Displays the opencode logo (ASCII art) centered vertically, with the **PromptBar** centered below it (not docked to the bottom). Shows model/agent indicators and a tip line. Typing a message and pressing Enter transitions seamlessly to the **Chat** screen.
+
+**PromptBar**:
+The text input widget at the bottom of the **Chat** screen (or centered on the **StartPage**). Accepts plain text messages, `/` slash commands, `!` shell commands, and `@` file references. Shows the current model and active agent (build/plan).
+
+**Chat**:
+The primary interaction screen. Shows a scrollable list of **Messages** (user + assistant) in the main area, with the **PromptBar** docked at the bottom. Entered by sending a message from the **StartPage** or selecting a **Session**.
+
 ## Relationships
 
-- The **TUI** calls a **Backend** to interact with the **Agent**
+- The **TUI** calls a **Backend** to interact with the **Agent** (the server)
+- The **TUI** lists **Agent**s (the type) from the server via `Backend::list_agents()` and passes the selected agent name to `prompt()`/`command()`
 - A **Session** contains zero or more **Messages**
 - A **Message** contains zero or more **Parts**
 - **Prompt** and **Command** both yield a **PromptStream**

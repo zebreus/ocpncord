@@ -120,7 +120,7 @@ async fn prompt_and_messages() {
 
     // Send a prompt (will actually call the AI)
     let _stream = b
-        .prompt(&s.id, "say hello in one word")
+        .prompt(&s.id, "say hello in one word", None)
         .await
         .expect("prompt should succeed");
 
@@ -143,7 +143,7 @@ async fn send_command() {
     let mut b = backend();
     let s = b.create_session("command-test", "/tmp").await.unwrap();
     let _stream = b
-        .command(&s.id, "init")
+        .command(&s.id, "init", None)
         .await
         .expect("command should succeed");
 }

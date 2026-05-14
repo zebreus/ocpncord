@@ -11,6 +11,7 @@ pub struct MockBackend {
     pub message_detail: Option<MessageDetail>,
     pub health_status: Option<Health>,
     pub config_info: Option<Config>,
+    pub agents: Vec<Agent>,
     pub prompt_events: Vec<Result<BackendEvent>>,
     pub event_events: Vec<Result<BackendEvent>>,
     pub text_matches: Vec<TextMatch>,
@@ -30,6 +31,7 @@ impl Default for MockBackend {
                 model: Some("mock/model".into()),
                 username: Some("mock-user".into()),
             }),
+            agents: Vec::new(),
             prompt_events: Vec::new(),
             event_events: Vec::new(),
             text_matches: Vec::new(),
@@ -45,6 +47,10 @@ impl Backend for MockBackend {
         self.health_status.clone().ok_or(BackendError::Connection {
             message: "no health stub".into(),
         })
+    }
+
+    async fn list_agents(&mut self) -> Result<Vec<Agent>> {
+        Ok(self.agents.clone())
     }
 
     async fn list_sessions(&mut self) -> Result<Vec<Session>> {
@@ -115,12 +121,22 @@ impl Backend for MockBackend {
         })
     }
 
-    async fn prompt(&mut self, _id: &SessionId, _text: &str) -> Result<Self::PromptStream> {
+    async fn prompt(
+        &mut self,
+        _id: &SessionId,
+        _text: &str,
+        _agent: Option<&str>,
+    ) -> Result<Self::PromptStream> {
         let events = core::mem::take(&mut self.prompt_events);
         Ok(MockStream { events, pos: 0 })
     }
 
-    async fn command(&mut self, _id: &SessionId, _text: &str) -> Result<Self::PromptStream> {
+    async fn command(
+        &mut self,
+        _id: &SessionId,
+        _text: &str,
+        _agent: Option<&str>,
+    ) -> Result<Self::PromptStream> {
         let events = core::mem::take(&mut self.prompt_events);
         Ok(MockStream { events, pos: 0 })
     }

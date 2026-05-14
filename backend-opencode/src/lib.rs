@@ -111,6 +111,8 @@ struct TextPartBody<'a> {
 #[serde(rename_all = "camelCase")]
 struct PromptBody<'a> {
     parts: &'a [TextPartBody<'a>],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<&'a str>,
 }
 
 // --- Helper: send + check status + return body ---
@@ -235,13 +237,19 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
-    async fn prompt(&mut self, id: &SessionId, text: &str) -> Result<Self::PromptStream> {
+    async fn prompt(
+        &mut self,
+        id: &SessionId,
+        text: &str,
+        agent: Option<&str>,
+    ) -> Result<Self::PromptStream> {
         let url = alloc::format!("{}/session/{id}/message", self.base_url);
         let prompt_body = PromptBody {
             parts: &[TextPartBody {
                 type_: "text",
                 text,
             }],
+            agent,
         };
         let json = serde_json::to_string(&prompt_body).map_err(parse_err)?;
         let raw = self
@@ -251,16 +259,24 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         Ok(BufferedStream::new(events))
     }
 
-    async fn command(&mut self, id: &SessionId, text: &str) -> Result<Self::PromptStream> {
+    async fn command(
+        &mut self,
+        id: &SessionId,
+        text: &str,
+        agent: Option<&str>,
+    ) -> Result<Self::PromptStream> {
         let url = alloc::format!("{}/session/{id}/command", self.base_url);
         #[derive(Serialize)]
         struct CommandBody<'a> {
             command: &'a str,
             arguments: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            agent: Option<&'a str>,
         }
         let cmd_body = CommandBody {
             command: text,
             arguments: "",
+            agent,
         };
         let json = serde_json::to_string(&cmd_body).map_err(parse_err)?;
         let raw = self
@@ -268,6 +284,12 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             .await?;
         let events = BufferedStream::parse_sse(&raw);
         Ok(BufferedStream::new(events))
+    }
+
+    async fn list_agents(&mut self) -> Result<Vec<Agent>> {
+        let url = alloc::format!("{}/agent", self.base_url);
+        let body = self.send_get_body(Method::GET, &url, None).await?;
+        serde_json::from_slice(&body).map_err(parse_err)
     }
 
     async fn find_text(&mut self, pattern: &str) -> Result<Vec<TextMatch>> {

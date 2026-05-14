@@ -147,6 +147,47 @@ pub enum Part {
     StepFinish(StepFinishPart),
 }
 
+// --- Agents ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Agent {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub mode: AgentMode,
+    #[serde(default)]
+    pub native: Option<bool>,
+    #[serde(default)]
+    pub hidden: Option<bool>,
+    #[serde(default)]
+    pub model: Option<AgentModel>,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub variant: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub steps: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentMode {
+    Primary,
+    Subagent,
+    #[serde(rename = "all")]
+    All,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModel {
+    pub model_id: String,
+    pub provider_id: String,
+}
+
 // --- Search ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
