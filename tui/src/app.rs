@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec;
@@ -6,13 +7,15 @@ use alloc::vec::Vec;
 use opencode_backend::Backend;
 
 use crate::chat::{render_chat, Chat};
-use crate::event::Event;
+use crate::event::{Event, Scancode};
 use crate::key_chord::KeyChord;
+use crate::modal::{Modal, SessionListModal};
 use crate::prompt_bar::PromptBar;
-use crate::screen::{Action, Screen, ScreenId};
+use crate::screen::{Action, ModalId, Screen, ScreenId};
 use crate::start_page::StartPage;
 use crate::theme::Theme;
 use ratatui_core::layout::Rect;
+use ratatui_core::style::{Color, Style};
 use ratatui_core::text::Text;
 use ratatui_core::widgets::Widget;
 
@@ -39,6 +42,7 @@ pub struct App<B: Backend> {
     partial_parts: Vec<opencode_backend::Part>,
     messages: Vec<LoadedMessage>,
     stream: Option<B::PromptStream>,
+    active_modal: Option<Box<dyn Modal>>,
 }
 
 impl<B: Backend> App<B> {
@@ -58,7 +62,16 @@ impl<B: Backend> App<B> {
             partial_parts: Vec::new(),
             messages: Vec::new(),
             stream: None,
+            active_modal: None,
         }
+    }
+
+    pub fn set_active_modal(&mut self, modal: Box<dyn Modal>) {
+        self.active_modal = Some(modal);
+    }
+
+    pub fn active_modal(&self) -> Option<&dyn Modal> {
+        self.active_modal.as_deref()
     }
 
     pub fn backend(&self) -> &B {
@@ -111,8 +124,24 @@ impl<B: Backend> App<B> {
             Event::Key(ref key) => {
                 self.error = None;
 
+                if let Some(ref mut modal) = self.active_modal {
+                    if key.scancode == Scancode::Escape {
+                        self.active_modal = None;
+                        return true;
+                    }
+                    let action = modal.handle_event(Event::Key(key.clone()));
+                    match action {
+                        Action::CloseModal => self.active_modal = None,
+                        Action::None => {}
+                        other => {
+                            return self.apply_action(Some(other)).await;
+                        }
+                    }
+                    return true;
+                }
+
                 if self.is_streaming {
-                    if key.scancode == crate::event::Scancode::Escape {
+                    if key.scancode == Scancode::Escape {
                         return self.handle_interrupt().await;
                     }
                     return true;
@@ -169,12 +198,9 @@ impl<B: Backend> App<B> {
     async fn handle_send_message(&mut self) -> bool {
         let text = self.prompt_bar.text().to_string();
 
-        if text == "/new" {
-            self.prompt_bar.clear();
-            self.active_session = None;
-            self.draft = None;
-            self.active_screen = ScreenId::StartPage;
-            return true;
+        // Slash command routing
+        if text.starts_with('/') {
+            return self.handle_slash_command(&text).await;
         }
 
         if self.active_session.is_none() {
@@ -220,6 +246,87 @@ impl<B: Backend> App<B> {
         true
     }
 
+    async fn handle_slash_command(&mut self, text: &str) -> bool {
+        match text {
+            "/new" => {
+                match self.backend.create_session("Chat", "").await {
+                    Ok(session) => {
+                        self.active_session = Some(session);
+                    }
+                    Err(e) => {
+                        self.error = Some(alloc::format!("{}", e));
+                        return true;
+                    }
+                }
+                self.prompt_bar.clear();
+                self.draft = None;
+                self.messages.clear();
+                self.active_modal = None;
+                self.active_screen = ScreenId::Chat;
+                true
+            }
+            "/sessions" => {
+                self.prompt_bar.clear();
+                let mut modal = SessionListModal::new();
+                match self.backend.list_sessions().await {
+                    Ok(sessions) => modal.set_sessions(sessions),
+                    Err(e) => modal.set_error(alloc::format!("{}", e)),
+                }
+                self.active_modal = Some(Box::new(modal));
+                true
+            }
+            "/exit" => false,
+            _ => {
+                // Unknown command — submit as message
+                self.handle_unknown_slash_command(text).await
+            }
+        }
+    }
+
+    async fn handle_unknown_slash_command(&mut self, text: &str) -> bool {
+        if self.active_session.is_none() {
+            match self.backend.create_session("Chat", "").await {
+                Ok(session) => {
+                    self.active_session = Some(session);
+                }
+                Err(e) => {
+                    self.error = Some(alloc::format!("{}", e));
+                    return true;
+                }
+            }
+        }
+
+        let session_id = self
+            .active_session
+            .as_ref()
+            .map(|s| s.id.clone())
+            .unwrap_or_default();
+
+        self.messages.push(LoadedMessage {
+            role: opencode_backend::MessageRole::User,
+            parts: vec![opencode_backend::Part::Text(opencode_backend::TextPart {
+                text: text.into(),
+            })],
+        });
+
+        self.draft = Some(text.into());
+        self.prompt_bar.clear();
+        self.active_screen = ScreenId::Chat;
+
+        match self.backend.prompt(&session_id, text, None).await {
+            Ok(stream) => {
+                self.stream = Some(stream);
+                self.is_streaming = true;
+                self.partial_parts = Vec::new();
+            }
+            Err(e) => {
+                self.error = Some(alloc::format!("{}", e));
+            }
+        }
+
+        true
+    }
+
     async fn handle_interrupt(&mut self) -> bool {
         if let Some(session) = &self.active_session {
             let _ = self.backend.abort_session(&session.id).await;
@@ -234,6 +341,51 @@ impl<B: Backend> App<B> {
         match action {
             Some(Action::Quit) => return false,
             Some(Action::SwitchScreen(id)) => self.active_screen = id,
+            Some(Action::CloseModal) => self.active_modal = None,
+            Some(Action::OpenModal(ModalId::SessionList)) => {
+                let mut modal = SessionListModal::new();
+                match self.backend.list_sessions().await {
+                    Ok(sessions) => modal.set_sessions(sessions),
+                    Err(e) => modal.set_error(alloc::format!("{}", e)),
+                }
+                self.active_modal = Some(Box::new(modal));
+            }
+            Some(Action::OpenModal(_)) => {}
+            Some(Action::LoadSession(ref id)) => {
+                match self.backend.list_messages(id).await {
+                    Ok(summaries) => {
+                        // Load full messages
+                        let mut messages = Vec::new();
+                        for summary in summaries {
+                            if let Ok(detail) =
+                                self.backend.get_message(id, &summary.id).await
+                            {
+                                messages.push(LoadedMessage {
+                                    role: detail.info.role,
+                                    parts: detail.parts,
+                                });
+                            }
+                        }
+                        self.messages = messages;
+                    }
+                    Err(e) => {
+                        self.error = Some(alloc::format!("{}", e));
+                    }
+                }
+                self.active_session = self.backend.get_session(id).await.ok();
+                self.active_modal = None;
+                self.active_screen = ScreenId::Chat;
+            }
+            Some(Action::DeleteSession(ref id)) => {
+                let _ = self.backend.delete_session(id).await;
+                // Re-fetch sessions and re-open modal
+                let mut modal = SessionListModal::new();
+                match self.backend.list_sessions().await {
+                    Ok(sessions) => modal.set_sessions(sessions),
+                    Err(e) => modal.set_error(alloc::format!("{}", e)),
+                }
+                self.active_modal = Some(Box::new(modal));
+            }
             Some(Action::Interrupt) => {
                 return self.handle_interrupt().await;
             }
@@ -288,6 +440,20 @@ impl<B: Backend> App<B> {
                 .style(self.theme.text_error)
                 .render(err_area, frame.buffer_mut());
         }
+
+        if let Some(ref modal) = self.active_modal {
+            let area = frame.area();
+            frame
+                .buffer_mut()
+                .set_style(area, Style::new().bg(Color::Rgb(0, 0, 0)).fg(Color::Rgb(0, 0, 0)));
+
+            let modal_width = (area.width as f32 * 0.6) as u16;
+            let modal_height = (area.height as f32 * 0.7) as u16;
+            let modal_x = area.x + (area.width.saturating_sub(modal_width)) / 2;
+            let modal_y = area.y + (area.height.saturating_sub(modal_height)) / 2;
+            let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+            modal.render(frame, &self.theme, modal_area);
+        }
     }
 }
 
@@ -296,6 +462,8 @@ mod tests {
     use super::*;
     use crate::event::{KeyEvent, Modifiers, Scancode};
     use opencode_backend::mock::MockBackend;
+    use ratatui_core::backend::TestBackend;
+    use ratatui_core::terminal::Terminal;
 
     fn ctrl(key: char) -> Event {
         Event::Key(KeyEvent {
@@ -514,8 +682,185 @@ mod tests {
         assert_eq!(app.backend().sessions.len(), 0);
     }
 
+    fn make_session(id: &str, title: &str) -> opencode_backend::Session {
+        opencode_backend::Session {
+            id: id.into(),
+            title: title.into(),
+            project_id: "p1".into(),
+            directory: "/".into(),
+            parent_id: None,
+            time: opencode_backend::SessionTime {
+                created: 0,
+                updated: 0,
+            },
+            slug: String::new(),
+            version: String::new(),
+        }
+    }
+
     #[test]
-    fn new_command_resets_to_start_page() {
+    fn session_list_shows_sessions_from_backend() {
+        let mut backend = MockBackend::default();
+        backend.sessions = vec![
+            make_session("s1", "First session"),
+            make_session("s2", "Second session"),
+        ];
+        let mut app = App::new(backend);
+
+        run(&mut app, ctrl('x'));
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Char('l'),
+                modifiers: Modifiers::default(),
+            }),
+        );
+
+        let test_backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal
+            .draw(|frame| app.render(frame))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let has_session_1 = buf.content().iter().any(|c| c.symbol() == "F");
+        assert!(
+            has_session_1,
+            "First session title should appear in rendered output"
+        );
+    }
+
+    #[test]
+    fn session_list_shows_empty_state() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, ctrl('x'));
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Char('l'),
+                modifiers: Modifiers::default(),
+            }),
+        );
+
+        let test_backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal
+            .draw(|frame| app.render(frame))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let has_empty_msg = buf.content().iter().any(|c| c.symbol() == "N");
+        assert!(
+            has_empty_msg,
+            "Empty state should show 'No sessions yet'"
+        );
+    }
+
+    #[test]
+    fn ctrl_x_l_opens_session_list_modal() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, ctrl('x'));
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Char('l'),
+                modifiers: Modifiers::default(),
+            }),
+        );
+
+        assert!(
+            app.active_modal().is_some(),
+            "Ctrl+X L should open session list modal"
+        );
+    }
+
+    #[test]
+    fn escape_closes_active_modal() {
+        use crate::modal::Modal;
+        use ratatui_core::terminal::Frame;
+
+        struct TestCloseModal;
+
+        impl Modal for TestCloseModal {
+            fn render(&self, _frame: &mut Frame, _theme: &Theme, _area: Rect) {}
+            fn handle_event(&mut self, _event: Event) -> Action {
+                Action::None
+            }
+            fn title(&self) -> &str {
+                "Test"
+            }
+        }
+
+        let mut app = App::new(MockBackend::default());
+        app.set_active_modal(Box::new(TestCloseModal));
+        assert!(
+            app.active_modal().is_some(),
+            "modal should be active after set"
+        );
+
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Escape,
+                modifiers: Modifiers::default(),
+            }),
+        );
+        assert!(
+            app.active_modal().is_none(),
+            "Escape should close the modal"
+        );
+    }
+
+    #[test]
+    fn slash_sessions_opens_modal() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, char_key('/'));
+        run(&mut app, char_key('s'));
+        run(&mut app, char_key('e'));
+        run(&mut app, char_key('s'));
+        run(&mut app, char_key('s'));
+        run(&mut app, char_key('i'));
+        run(&mut app, char_key('o'));
+        run(&mut app, char_key('n'));
+        run(&mut app, char_key('s'));
+        run(&mut app, enter_key());
+
+        assert!(
+            app.active_modal().is_some(),
+            "/sessions should open the session list modal"
+        );
+    }
+
+    #[test]
+    fn unknown_slash_command_submits_as_message() {
+        let mut backend = MockBackend::default();
+        backend.prompt_events = vec![Ok(opencode_backend::BackendEvent::Done)];
+        let mut app = App::new(backend);
+
+        run(&mut app, char_key('/'));
+        run(&mut app, char_key('u'));
+        run(&mut app, char_key('n'));
+        run(&mut app, char_key('k'));
+        run(&mut app, char_key('n'));
+        run(&mut app, char_key('o'));
+        run(&mut app, char_key('w'));
+        run(&mut app, char_key('n'));
+        run(&mut app, enter_key());
+
+        assert_eq!(
+            app.active_screen(),
+            ScreenId::Chat,
+            "unknown command should transition to chat"
+        );
+        assert!(app.messages().len() > 0, "unknown command should add a message");
+    }
+
+    #[test]
+    fn new_command_creates_session_and_stays_on_chat() {
         let backend = MockBackend::default();
         let mut app = App::new(backend);
 
@@ -527,12 +872,19 @@ mod tests {
         // Complete the stream so input is accepted again
         run(&mut app, Event::Backend(opencode_backend::BackendEvent::Done));
 
+        let session_count_before = app.backend().sessions.len();
+
         run(&mut app, char_key('/'));
         run(&mut app, char_key('n'));
         run(&mut app, char_key('e'));
         run(&mut app, char_key('w'));
         run(&mut app, enter_key());
 
-        assert_eq!(app.active_screen(), ScreenId::StartPage);
+        assert_eq!(app.active_screen(), ScreenId::Chat);
+        assert_eq!(
+            app.backend().sessions.len(),
+            session_count_before + 1,
+            "/new should create a new session"
+        );
     }
 }

@@ -1,3 +1,5 @@
+use alloc::string::String;
+
 use crate::{Event, Theme};
 use ratatui_core::terminal::Frame;
 
@@ -7,7 +9,7 @@ pub trait Screen {
     fn handle_event(&mut self, event: Event) -> Action;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     None,
     Quit,
@@ -21,6 +23,8 @@ pub enum Action {
     ScrollUp,
     ScrollDown,
     ToggleDetails,
+    LoadSession(String),
+    DeleteSession(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,5 +1,5 @@
 use crate::event::{KeyEvent, Modifiers, Scancode};
-use crate::screen::Action;
+use crate::screen::{Action, ModalId};
 
 const LEADER_TIMEOUT_TICKS: u64 = 40;
 
@@ -56,6 +56,9 @@ impl KeyChord {
         self.leader_tick = None;
         match key.scancode {
             Scancode::Char('q') | Scancode::Char('Q') => Some(Action::Quit),
+            Scancode::Char('l') | Scancode::Char('L') => {
+                Some(Action::OpenModal(ModalId::SessionList))
+            }
             _ => None,
         }
     }
