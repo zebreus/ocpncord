@@ -15,6 +15,7 @@ pub struct MockBackend {
     pub prompt_events: Vec<Result<BackendEvent>>,
     pub event_events: Vec<Result<BackendEvent>>,
     pub text_matches: Vec<TextMatch>,
+    pub fail_create_session: Option<BackendError>,
 }
 
 impl Default for MockBackend {
@@ -35,6 +36,7 @@ impl Default for MockBackend {
             prompt_events: Vec::new(),
             event_events: Vec::new(),
             text_matches: Vec::new(),
+            fail_create_session: None,
         }
     }
 }
@@ -65,6 +67,9 @@ impl Backend for MockBackend {
     }
 
     async fn create_session(&mut self, title: &str, cwd: &str) -> Result<Session> {
+        if let Some(err) = self.fail_create_session.take() {
+            return Err(err);
+        }
         let session = Session {
             id: "mock-session-id".into(),
             title: title.into(),

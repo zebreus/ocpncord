@@ -9,8 +9,10 @@
 extern crate alloc;
 
 mod app;
+mod chat;
 mod event;
 mod key_chord;
+mod prompt_bar;
 mod screen;
 mod start_page;
 mod theme;

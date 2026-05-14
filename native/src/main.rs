@@ -161,11 +161,11 @@ async fn main() {
         tokio::select! {
             maybe_event = read_crossterm_event() => {
                 if let Some(event) = maybe_event {
-                    running = app.handle_event(event);
+                    running = app.handle_event(event).await;
                 }
             }
             _ = tick_interval.tick() => {
-                running = app.handle_event(Event::Tick);
+                running = app.handle_event(Event::Tick).await;
             }
         }
 
