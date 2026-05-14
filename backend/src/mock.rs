@@ -84,6 +84,11 @@ impl Backend for MockBackend {
             },
             slug: String::new(),
             version: String::new(),
+            workspace_id: None,
+            summary: None,
+            share: None,
+            permission: None,
+            revert: None,
         };
         self.sessions.push(session.clone());
         Ok(session)
@@ -106,6 +111,11 @@ impl Backend for MockBackend {
             },
             slug: String::new(),
             version: String::new(),
+            workspace_id: None,
+            summary: None,
+            share: None,
+            permission: None,
+            revert: None,
         })
     }
 
@@ -169,6 +179,33 @@ impl Backend for MockBackend {
     }
 
     async fn set_auth(&mut self, _provider: &str, _api_key: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn sync_events(&mut self) -> Result<Self::EventStream> {
+        let events = core::mem::take(&mut self.event_events);
+        Ok(MockStream { events, pos: 0 })
+    }
+
+    async fn set_config(&mut self, _config: &Config) -> Result<Config> {
+        self.config_info.clone().ok_or(BackendError::Connection {
+            message: "no config stub".into(),
+        })
+    }
+
+    async fn dispose(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn upgrade(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn log(&mut self, _level: &str, _message: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn remove_auth(&mut self, _provider: &str) -> Result<()> {
         Ok(())
     }
 }

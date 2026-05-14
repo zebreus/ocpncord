@@ -26,17 +26,17 @@ pub fn render_part<'a>(
         }
         opencode_backend::Part::Tool(tp) => {
             let (icon, style) = match &tp.state {
-                opencode_backend::ToolState::Pending => ("...", theme.part_tool_idle),
-                opencode_backend::ToolState::Running => (">>>", theme.part_tool_running),
+                opencode_backend::ToolState::Pending { .. } => ("...", theme.part_tool_idle),
+                opencode_backend::ToolState::Running { .. } => (">>>", theme.part_tool_running),
                 opencode_backend::ToolState::Completed { .. } => ("[ok]", theme.part_tool_done),
                 opencode_backend::ToolState::Error { .. } => ("[!!]", theme.part_tool_error),
             };
             if show_details {
                 let summary = match &tp.state {
-                    opencode_backend::ToolState::Completed { output } => {
+                    opencode_backend::ToolState::Completed { output, .. } => {
                         alloc::format!("{icon} {} - done: {output}", tp.tool)
                     }
-                    opencode_backend::ToolState::Error { error } => {
+                    opencode_backend::ToolState::Error { error, .. } => {
                         alloc::format!("{icon} {} - error: {error}", tp.tool)
                     }
                     _ => alloc::format!("{icon} {}", tp.tool),
@@ -59,6 +59,29 @@ pub fn render_part<'a>(
                 None => "--- step finish ---".into(),
             };
             vec![Line::from(text).style(theme.part_step_divider)]
+        }
+        opencode_backend::Part::File(fp) => {
+            let label = fp.filename.as_deref().unwrap_or(&fp.url);
+            vec![Line::from(alloc::format!("[file] {label}")).style(theme.part_text)]
+        }
+        opencode_backend::Part::Snapshot(sp) => {
+            vec![Line::from(alloc::format!("[snapshot] {}", sp.snapshot)).style(theme.text_dim)]
+        }
+        opencode_backend::Part::Patch(pp) => {
+            vec![Line::from(alloc::format!("[patch] {} files", pp.files.len())).style(theme.text_dim)]
+        }
+        opencode_backend::Part::Agent(ap) => {
+            vec![Line::from(alloc::format!("[agent] {}", ap.name)).style(theme.text_dim)]
+        }
+        opencode_backend::Part::Subtask(st) => {
+            vec![Line::from(alloc::format!("[subtask] {}", st.description)).style(theme.text_dim)]
+        }
+        opencode_backend::Part::Retry(rp) => {
+            vec![Line::from(alloc::format!("[retry #{}]", rp.attempt)).style(theme.text_dim)]
+        }
+        opencode_backend::Part::Compaction(cp) => {
+            let label = if cp.overflow == Some(true) { "compaction (overflow)" } else { "compaction" };
+            vec![Line::from(label).style(theme.text_dim)]
         }
     }
 }
@@ -105,7 +128,10 @@ mod tests {
         let theme = Theme::default();
         let part = Part::Tool(ToolPart {
             tool: "read".into(),
-            state: ToolState::Pending,
+            state: ToolState::Pending {
+                input: alloc::collections::BTreeMap::new(),
+                raw: "".into(),
+            },
         });
         let lines = render_part(&part, &theme, true);
         assert_eq!(lines.len(), 1);
@@ -117,7 +143,12 @@ mod tests {
         let theme = Theme::default();
         let part = Part::Tool(ToolPart {
             tool: "write".into(),
-            state: ToolState::Running,
+            state: ToolState::Running {
+                input: alloc::collections::BTreeMap::new(),
+                title: None,
+                metadata: None,
+                time: None,
+            },
         });
         let lines = render_part(&part, &theme, true);
         assert_eq!(lines.len(), 1);
@@ -130,7 +161,12 @@ mod tests {
         let part = Part::Tool(ToolPart {
             tool: "grep".into(),
             state: ToolState::Completed {
+                input: alloc::collections::BTreeMap::new(),
                 output: "found 3 matches".into(),
+                title: "grep".into(),
+                metadata: alloc::collections::BTreeMap::new(),
+                time: opencode_backend::ToolTimeCompleted { start: 0, end: 1 },
+                attachments: Vec::new(),
             },
         });
         let lines = render_part(&part, &theme, true);
@@ -144,7 +180,10 @@ mod tests {
         let part = Part::Tool(ToolPart {
             tool: "curl".into(),
             state: ToolState::Error {
+                input: alloc::collections::BTreeMap::new(),
                 error: "timeout".into(),
+                metadata: None,
+                time: opencode_backend::ToolTimeCompleted { start: 0, end: 1 },
             },
         });
         let lines = render_part(&part, &theme, true);

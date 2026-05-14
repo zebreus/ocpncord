@@ -7,14 +7,15 @@ use alloc::vec::Vec;
 use opencode_backend::Backend;
 
 use crate::chat::{render_chat, Chat};
+use crate::command_palette::CommandPaletteModal;
 use crate::event::{Event, Scancode};
 use crate::key_chord::KeyChord;
-use crate::modal::{Modal, ModelPickerModal, SessionListModal};
+use crate::modal::{HelpModal, Modal, ModelPickerModal, SessionListModal};
 use crate::prompt_bar::PromptBar;
 use crate::screen::{Action, ModalId, Screen, ScreenId};
 use crate::start_page::StartPage;
 use crate::theme::Theme;
-use ratatui_core::layout::Rect;
+use ratatui_core::layout::{Position, Rect};
 use ratatui_core::style::{Color, Style};
 use ratatui_core::text::Text;
 use ratatui_core::widgets::Widget;
@@ -258,6 +259,7 @@ impl<B: Backend> App<B> {
                         self.is_streaming = false;
                         self.stream = None;
                     }
+                    _ => {}
                 }
             }
             Event::Tick => {
@@ -362,6 +364,11 @@ impl<B: Backend> App<B> {
                 self.active_modal = Some(Box::new(modal));
                 true
             }
+            "/help" => {
+                self.prompt_bar.clear();
+                self.active_modal = Some(Box::new(HelpModal::new()));
+                true
+            }
             "/exit" => false,
             _ => {
                 // Unknown command — submit as message
@@ -425,12 +432,16 @@ impl<B: Backend> App<B> {
         true
     }
 
-    async fn apply_action(&mut self, action: Option<Action>) -> bool {
-        match action {
-            Some(Action::Quit) => return false,
-            Some(Action::SwitchScreen(id)) => self.active_screen = id,
-            Some(Action::CloseModal) => self.active_modal = None,
-            Some(Action::OpenModal(ModalId::SessionList)) => {
+async fn apply_action(&mut self, action: Option<Action>) -> bool {
+         match action {
+             Some(Action::Quit) => return false,
+             Some(Action::SwitchScreen(id)) => self.active_screen = id,
+             Some(Action::CloseModal) => self.active_modal = None,
+             Some(Action::OpenPalette) => {
+                 let modal = CommandPaletteModal::new(crate::command_palette::default_commands());
+                 self.active_modal = Some(Box::new(modal));
+             }
+             Some(Action::OpenModal(ModalId::SessionList)) => {
                 let mut modal = SessionListModal::new();
                 match self.backend.list_sessions().await {
                     Ok(sessions) => modal.set_sessions(sessions),
@@ -445,6 +456,9 @@ impl<B: Backend> App<B> {
                     Err(e) => modal.set_error(alloc::format!("{}", e)),
                 }
                 self.active_modal = Some(Box::new(modal));
+            }
+            Some(Action::OpenModal(ModalId::Help)) => {
+                self.active_modal = Some(Box::new(HelpModal::new()));
             }
             Some(Action::OpenModal(_)) => {}
             Some(Action::LoadSession(ref id)) => {
@@ -557,8 +571,61 @@ impl<B: Backend> App<B> {
             let modal_height = (area.height as f32 * 0.7) as u16;
             let modal_x = area.x + (area.width.saturating_sub(modal_width)) / 2;
             let modal_y = area.y + (area.height.saturating_sub(modal_height)) / 2;
-            let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
-            modal.render(frame, &self.theme, modal_area);
+
+            use ratatui_core::symbols::border::ROUNDED;
+
+            let border_style = self.theme.border;
+            let buf = frame.buffer_mut();
+
+            for x in modal_x..modal_x + modal_width {
+                if let Some(cell) = buf.cell_mut(Position::new(x, modal_y)) {
+                    cell.set_style(border_style).set_symbol(ROUNDED.horizontal_top);
+                }
+                if let Some(cell) = buf.cell_mut(Position::new(x, modal_y + modal_height - 1)) {
+                    cell.set_style(border_style).set_symbol(ROUNDED.horizontal_bottom);
+                }
+            }
+            for y in modal_y..modal_y + modal_height {
+                if let Some(cell) = buf.cell_mut(Position::new(modal_x, y)) {
+                    cell.set_style(border_style).set_symbol(ROUNDED.vertical_left);
+                }
+                if let Some(cell) = buf.cell_mut(Position::new(modal_x + modal_width - 1, y)) {
+                    cell.set_style(border_style).set_symbol(ROUNDED.vertical_right);
+                }
+            }
+
+            if let Some(cell) = buf.cell_mut(Position::new(modal_x, modal_y)) {
+                cell.set_symbol(ROUNDED.top_left);
+            }
+            if let Some(cell) = buf.cell_mut(Position::new(modal_x + modal_width - 1, modal_y)) {
+                cell.set_symbol(ROUNDED.top_right);
+            }
+            if let Some(cell) = buf.cell_mut(Position::new(modal_x, modal_y + modal_height - 1)) {
+                cell.set_symbol(ROUNDED.bottom_left);
+            }
+            if let Some(cell) = buf.cell_mut(Position::new(modal_x + modal_width - 1, modal_y + modal_height - 1)) {
+                cell.set_symbol(ROUNDED.bottom_right);
+            }
+
+            let title = modal.title();
+            let title_style = self.theme.text_accent;
+            let title_x = modal_x + 2;
+            for (i, ch) in title.chars().enumerate() {
+                let tx = title_x + i as u16;
+                if tx < modal_x + modal_width - 1 {
+                    if let Some(cell) = buf.cell_mut(Position::new(tx, modal_y)) {
+                        cell.set_char(ch).set_style(title_style);
+                    }
+                }
+            }
+
+            let content_area = Rect::new(
+                modal_x + 1,
+                modal_y + 1,
+                modal_width - 2,
+                modal_height - 2,
+            );
+            modal.render(frame, &self.theme, content_area);
         }
     }
 }
@@ -1071,6 +1138,11 @@ mod tests {
             },
             slug: String::new(),
             version: String::new(),
+            workspace_id: None,
+            summary: None,
+            share: None,
+            permission: None,
+            revert: None,
         }
     }
 
@@ -1285,6 +1357,24 @@ mod tests {
     }
 
     #[test]
+    fn slash_help_opens_modal() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, char_key('/'));
+        run(&mut app, char_key('h'));
+        run(&mut app, char_key('e'));
+        run(&mut app, char_key('l'));
+        run(&mut app, char_key('p'));
+        run(&mut app, enter_key());
+
+        assert!(
+            app.active_modal().is_some(),
+            "/help should open the help modal"
+        );
+    }
+
+    #[test]
     fn ctrl_x_m_opens_model_picker_modal() {
         let backend = MockBackend::default();
         let mut app = App::new(backend);
@@ -1301,6 +1391,54 @@ mod tests {
         assert!(
             app.active_modal().is_some(),
             "Ctrl+X M should open the model picker modal"
+        );
+    }
+
+    #[test]
+    fn ctrl_x_h_opens_help_modal() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, ctrl('x'));
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Char('h'),
+                modifiers: Modifiers::default(),
+            }),
+        );
+
+        assert!(
+            app.active_modal().is_some(),
+            "Ctrl+X H should open the help modal"
+        );
+    }
+
+    #[test]
+    fn escape_closes_help_modal() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, ctrl('x'));
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Char('h'),
+                modifiers: Modifiers::default(),
+            }),
+        );
+        assert!(app.active_modal().is_some(), "help modal should be open");
+
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Escape,
+                modifiers: Modifiers::default(),
+            }),
+        );
+        assert!(
+            app.active_modal().is_none(),
+            "Escape should close the help modal"
         );
     }
 }

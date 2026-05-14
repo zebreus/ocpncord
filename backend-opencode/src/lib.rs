@@ -11,8 +11,6 @@ use opencode_backend::*;
 use reqwless::client::HttpClient;
 use reqwless::headers::ContentType;
 use reqwless::request::{Method, RequestBuilder};
-use serde::Serialize;
-
 #[cfg(feature = "std")]
 pub mod std_transport;
 #[cfg(feature = "std")]
@@ -85,36 +83,6 @@ fn api_err(status: u16, body: &[u8]) -> BackendError {
     }
 }
 
-// --- Request body types ---
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateSessionBody<'a> {
-    title: &'a str,
-    directory: &'a str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateSessionBody<'a> {
-    title: &'a str,
-}
-
-#[derive(Serialize)]
-struct TextPartBody<'a> {
-    #[serde(rename = "type")]
-    type_: &'a str,
-    text: &'a str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PromptBody<'a> {
-    parts: &'a [TextPartBody<'a>],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent: Option<&'a str>,
-}
-
 // --- Helper: send + check status + return body ---
 
 impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + 'static>
@@ -181,7 +149,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
     async fn create_session(&mut self, title: &str, cwd: &str) -> Result<Session> {
         let url = alloc::format!("{}/session", self.base_url);
-        let body = CreateSessionBody { title, directory: cwd };
+        let body = opencode_types::CreateSessionBody { title, directory: cwd };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
         let body = self
             .send_get_body(Method::POST, &url, Some(json.as_bytes()))
@@ -197,7 +165,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
     async fn update_session(&mut self, id: &SessionId, title: &str) -> Result<Session> {
         let url = alloc::format!("{}/session/{id}", self.base_url);
-        let body = UpdateSessionBody { title };
+        let body = opencode_types::UpdateSessionBody { title };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
         let body = self
             .send_get_body(Method::PATCH, &url, Some(json.as_bytes()))
@@ -244,8 +212,8 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         agent: Option<&str>,
     ) -> Result<Self::PromptStream> {
         let url = alloc::format!("{}/session/{id}/message", self.base_url);
-        let prompt_body = PromptBody {
-            parts: &[TextPartBody {
+        let prompt_body = opencode_types::PromptBody {
+            parts: &[opencode_types::TextPartBody {
                 type_: "text",
                 text,
             }],
@@ -266,14 +234,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         agent: Option<&str>,
     ) -> Result<Self::PromptStream> {
         let url = alloc::format!("{}/session/{id}/command", self.base_url);
-        #[derive(Serialize)]
-        struct CommandBody<'a> {
-            command: &'a str,
-            arguments: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            agent: Option<&'a str>,
-        }
-        let cmd_body = CommandBody {
+        let cmd_body = opencode_types::CommandBody {
             command: text,
             arguments: "",
             agent,
@@ -329,20 +290,68 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
     }
 
     async fn set_auth(&mut self, provider: &str, api_key: &str) -> Result<()> {
-        #[derive(Serialize)]
-        struct AuthBody<'a> {
-            #[serde(rename = "type")]
-            type_: &'a str,
-            key: &'a str,
-        }
         let url = alloc::format!("{}/auth/{provider}", self.base_url);
-        let body = AuthBody {
+        let body = opencode_types::AuthBody {
             type_: "api",
             key: api_key,
         };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
         self.send_get_body(Method::PUT, &url, Some(json.as_bytes()))
             .await?;
+        Ok(())
+    }
+
+    async fn sync_events(&mut self) -> Result<Self::EventStream> {
+        let url = alloc::format!("{}/global/sync-event", self.base_url);
+        #[cfg(not(feature = "std"))]
+        {
+            let raw = self.send_get_body(Method::GET, &url, None).await?;
+            let events = BufferedStream::parse_sse(&raw);
+            return Ok(BufferedStream::new(events));
+        }
+        #[cfg(feature = "std")]
+        {
+            return crate::TcpSseStream::connect(&url).await;
+        }
+    }
+
+    async fn set_config(&mut self, config: &Config) -> Result<Config> {
+        let url = alloc::format!("{}/config", self.base_url);
+        let body = opencode_types::ConfigBody {
+            model: config.model.as_deref(),
+            username: config.username.as_deref(),
+        };
+        let json = serde_json::to_string(&body).map_err(parse_err)?;
+        let body = self
+            .send_get_body(Method::PATCH, &url, Some(json.as_bytes()))
+            .await?;
+        serde_json::from_slice(&body).map_err(parse_err)
+    }
+
+    async fn dispose(&mut self) -> Result<()> {
+        let url = alloc::format!("{}/global/dispose", self.base_url);
+        self.send_get_body(Method::POST, &url, None).await?;
+        Ok(())
+    }
+
+    async fn upgrade(&mut self) -> Result<()> {
+        let url = alloc::format!("{}/global/upgrade", self.base_url);
+        self.send_get_body(Method::POST, &url, None).await?;
+        Ok(())
+    }
+
+    async fn log(&mut self, level: &str, message: &str) -> Result<()> {
+        let url = alloc::format!("{}/log", self.base_url);
+        let body = opencode_types::LogBody { level, message };
+        let json = serde_json::to_string(&body).map_err(parse_err)?;
+        self.send_get_body(Method::POST, &url, Some(json.as_bytes()))
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_auth(&mut self, provider: &str) -> Result<()> {
+        let url = alloc::format!("{}/auth/{provider}", self.base_url);
+        self.send_get_body(Method::DELETE, &url, None).await?;
         Ok(())
     }
 }
