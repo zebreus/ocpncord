@@ -1,9 +1,11 @@
 use alloc::string::String;
 use alloc::string::ToString;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use opencode_backend::Backend;
 
-use crate::chat::Chat;
+use crate::chat::{render_chat, Chat};
 use crate::event::Event;
 use crate::key_chord::KeyChord;
 use crate::prompt_bar::PromptBar;
@@ -14,6 +16,13 @@ use ratatui_core::layout::Rect;
 use ratatui_core::text::Text;
 use ratatui_core::widgets::Widget;
 
+/// A message held in memory, built from streaming Parts.
+#[derive(Debug, Clone)]
+pub struct LoadedMessage {
+    pub role: opencode_backend::MessageRole,
+    pub parts: Vec<opencode_backend::Part>,
+}
+
 /// Top-level application state.
 pub struct App<B: Backend> {
     backend: B,
@@ -22,9 +31,14 @@ pub struct App<B: Backend> {
     key_chord: KeyChord,
     tick: u64,
     prompt_bar: PromptBar,
+    chat: Chat,
     active_session: Option<opencode_backend::Session>,
     draft: Option<String>,
     error: Option<String>,
+    is_streaming: bool,
+    partial_parts: Vec<opencode_backend::Part>,
+    messages: Vec<LoadedMessage>,
+    stream: Option<B::PromptStream>,
 }
 
 impl<B: Backend> App<B> {
@@ -36,9 +50,14 @@ impl<B: Backend> App<B> {
             key_chord: KeyChord::new(),
             tick: 0,
             prompt_bar: PromptBar::new(),
+            chat: Chat::new(),
             active_session: None,
             draft: None,
             error: None,
+            is_streaming: false,
+            partial_parts: Vec::new(),
+            messages: Vec::new(),
+            stream: None,
         }
     }
 
@@ -70,11 +89,34 @@ impl<B: Backend> App<B> {
         self.active_session.as_ref()
     }
 
+    pub fn take_stream(&mut self) -> Option<B::PromptStream> {
+        self.stream.take()
+    }
+
+    pub fn is_streaming(&self) -> bool {
+        self.is_streaming
+    }
+
+    pub fn partial_parts(&self) -> &[opencode_backend::Part] {
+        &self.partial_parts
+    }
+
+    pub fn messages(&self) -> &[LoadedMessage] {
+        &self.messages
+    }
+
     /// Returns `false` when the application should quit.
     pub async fn handle_event(&mut self, event: Event) -> bool {
         match event {
             Event::Key(ref key) => {
                 self.error = None;
+
+                if self.is_streaming {
+                    if key.scancode == crate::event::Scancode::Escape {
+                        return self.handle_interrupt().await;
+                    }
+                    return true;
+                }
 
                 if let Some(action) = self.key_chord.handle(key, self.tick) {
                     return self.apply_action(Some(action)).await;
@@ -86,6 +128,30 @@ impl<B: Backend> App<B> {
                             return self.handle_send_message().await;
                         }
                         _ => {}
+                    }
+                }
+            }
+            Event::Backend(event) => {
+                match event {
+                    opencode_backend::BackendEvent::Part { part, .. } => {
+                        self.partial_parts.push(part);
+                    }
+                    opencode_backend::BackendEvent::Done => {
+                        let parts = core::mem::take(&mut self.partial_parts);
+                        if !parts.is_empty() {
+                            self.messages.push(LoadedMessage {
+                                role: opencode_backend::MessageRole::Assistant,
+                                parts,
+                            });
+                        }
+                        self.is_streaming = false;
+                        self.stream = None;
+                    }
+                    opencode_backend::BackendEvent::Error { message } => {
+                        self.error = Some(message);
+                        self.partial_parts.clear();
+                        self.is_streaming = false;
+                        self.stream = None;
                     }
                 }
             }
@@ -123,9 +189,44 @@ impl<B: Backend> App<B> {
             }
         }
 
-        self.draft = Some(text);
+        let session_id = self
+            .active_session
+            .as_ref()
+            .map(|s| s.id.clone())
+            .unwrap_or_default();
+
+        self.messages.push(LoadedMessage {
+            role: opencode_backend::MessageRole::User,
+            parts: vec![opencode_backend::Part::Text(opencode_backend::TextPart {
+                text: text.clone(),
+            })],
+        });
+
+        self.draft = Some(text.clone());
         self.prompt_bar.clear();
         self.active_screen = ScreenId::Chat;
+
+        match self.backend.prompt(&session_id, &text, None).await {
+            Ok(stream) => {
+                self.stream = Some(stream);
+                self.is_streaming = true;
+                self.partial_parts = Vec::new();
+            }
+            Err(e) => {
+                self.error = Some(alloc::format!("{}", e));
+            }
+        }
+
+        true
+    }
+
+    async fn handle_interrupt(&mut self) -> bool {
+        if let Some(session) = &self.active_session {
+            let _ = self.backend.abort_session(&session.id).await;
+        }
+        self.stream = None;
+        self.is_streaming = false;
+        self.partial_parts.clear();
         true
     }
 
@@ -133,6 +234,15 @@ impl<B: Backend> App<B> {
         match action {
             Some(Action::Quit) => return false,
             Some(Action::SwitchScreen(id)) => self.active_screen = id,
+            Some(Action::Interrupt) => {
+                return self.handle_interrupt().await;
+            }
+            Some(Action::ScrollUp) => {
+                self.chat.scroll = self.chat.scroll.saturating_add(1);
+            }
+            Some(Action::ScrollDown) => {
+                self.chat.scroll = self.chat.scroll.saturating_sub(1);
+            }
             _ => {}
         }
         true
@@ -149,13 +259,22 @@ impl<B: Backend> App<B> {
                     50.min(area.width),
                     1,
                 );
-                self.prompt_bar.render(prompt_area, frame, &self.theme);
+                self.prompt_bar
+                    .render(prompt_area, frame, &self.theme, self.is_streaming);
             }
             ScreenId::Chat => {
-                Chat.render(frame, &self.theme);
+                render_chat(
+                    frame,
+                    &self.theme,
+                    &self.messages,
+                    &self.partial_parts,
+                    self.is_streaming,
+                    self.chat.scroll,
+                );
                 let area = frame.area();
                 let prompt_area = Rect::new(area.x, area.height.saturating_sub(1), area.width, 1);
-                self.prompt_bar.render(prompt_area, frame, &self.theme);
+                self.prompt_bar
+                    .render(prompt_area, frame, &self.theme, self.is_streaming);
             }
         }
 
@@ -258,6 +377,71 @@ mod tests {
         assert!(!run(&mut app, Event::Quit));
     }
 
+    fn enter_key() -> Event {
+        Event::Key(KeyEvent {
+            scancode: Scancode::Enter,
+            modifiers: Modifiers::default(),
+        })
+    }
+
+    #[test]
+    fn send_message_starts_stream_and_accumulates_parts() {
+        let mut backend = MockBackend::default();
+        backend.prompt_events = vec![
+            Ok(opencode_backend::BackendEvent::Part {
+                part: opencode_backend::Part::Text(opencode_backend::TextPart {
+                    text: "Hello".into(),
+                }),
+                delta: None,
+            }),
+            Ok(opencode_backend::BackendEvent::Done),
+        ];
+        let mut app = App::new(backend);
+
+        run(&mut app, char_key('h'));
+        run(&mut app, char_key('i'));
+        let running = run(&mut app, enter_key());
+        assert!(running);
+        assert!(app.is_streaming());
+
+        run(
+            &mut app,
+            Event::Backend(opencode_backend::BackendEvent::Part {
+                part: opencode_backend::Part::Text(opencode_backend::TextPart {
+                    text: "Hello".into(),
+                }),
+                delta: None,
+            }),
+        );
+        assert_eq!(app.partial_parts().len(), 1);
+
+        run(&mut app, Event::Backend(opencode_backend::BackendEvent::Done));
+        assert!(!app.is_streaming());
+        assert_eq!(app.messages().len(), 2, "user msg + assistant msg");
+    }
+
+    #[test]
+    fn backend_error_during_stream_shows_error_and_clears_stream() {
+        let mut backend = MockBackend::default();
+        backend.prompt_events = vec![Ok(opencode_backend::BackendEvent::Error {
+            message: "connection lost".into(),
+        })];
+        let mut app = App::new(backend);
+
+        run(&mut app, char_key('h'));
+        run(&mut app, enter_key());
+        assert!(app.is_streaming());
+
+        run(
+            &mut app,
+            Event::Backend(opencode_backend::BackendEvent::Error {
+                message: "connection lost".into(),
+            }),
+        );
+        assert!(!app.is_streaming());
+        assert!(app.error().unwrap_or("").contains("connection lost"));
+    }
+
     #[test]
     fn session_creation_error_shows_error_and_stays_on_start_page() {
         let mut backend = MockBackend::default();
@@ -337,26 +521,17 @@ mod tests {
 
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
-        run(
-            &mut app,
-            Event::Key(KeyEvent {
-                scancode: Scancode::Enter,
-                modifiers: Modifiers::default(),
-            }),
-        );
+        run(&mut app, enter_key());
         assert_eq!(app.active_screen(), ScreenId::Chat);
+
+        // Complete the stream so input is accepted again
+        run(&mut app, Event::Backend(opencode_backend::BackendEvent::Done));
 
         run(&mut app, char_key('/'));
         run(&mut app, char_key('n'));
         run(&mut app, char_key('e'));
         run(&mut app, char_key('w'));
-        run(
-            &mut app,
-            Event::Key(KeyEvent {
-                scancode: Scancode::Enter,
-                modifiers: Modifiers::default(),
-            }),
-        );
+        run(&mut app, enter_key());
 
         assert_eq!(app.active_screen(), ScreenId::StartPage);
     }

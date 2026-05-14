@@ -77,7 +77,20 @@ impl PromptBar {
         self.cursor = 0;
     }
 
-    pub fn render(&self, area: Rect, frame: &mut ratatui_core::terminal::Frame, theme: &Theme) {
+    pub fn render(
+        &self,
+        area: Rect,
+        frame: &mut ratatui_core::terminal::Frame,
+        theme: &Theme,
+        is_streaming: bool,
+    ) {
+        if is_streaming {
+            Text::from("Agent is responding... (Esc to interrupt)")
+                .style(theme.text_dim)
+                .render(area, frame.buffer_mut());
+            return;
+        }
+
         let prefix = match self.input_mode() {
             InputMode::Command => "/",
             InputMode::Shell => "!",

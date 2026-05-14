@@ -12,6 +12,7 @@ mod app;
 mod chat;
 mod event;
 mod key_chord;
+mod part_renderer;
 mod prompt_bar;
 mod screen;
 mod start_page;

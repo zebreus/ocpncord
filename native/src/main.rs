@@ -5,6 +5,8 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, size,
 };
 use crossterm::{execute, queue};
+use futures::StreamExt;
+use opencode_backend::BackendEvent;
 use opencode_backend_opencode::OpenCodeBackend;
 use opencode_tui::Event;
 use opencode_tui::{App, KeyEvent, Modifiers, Scancode};
@@ -166,6 +168,21 @@ async fn main() {
             }
             _ = tick_interval.tick() => {
                 running = app.handle_event(Event::Tick).await;
+            }
+        }
+
+        if let Some(mut stream) = app.take_stream() {
+            while let Some(result) = stream.next().await {
+                let event = match result {
+                    Ok(be) => Event::Backend(be),
+                    Err(e) => Event::Backend(BackendEvent::Error {
+                        message: format!("{}", e),
+                    }),
+                };
+                running = app.handle_event(event).await;
+                if !running {
+                    break;
+                }
             }
         }
 

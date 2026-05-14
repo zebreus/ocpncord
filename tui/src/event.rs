@@ -1,10 +1,13 @@
+pub use opencode_backend::BackendEvent;
+
 /// Generic keypress event, SDL2-style scancode abstraction.
 ///
 /// The platform layer translates OS-specific input into this enum.
 /// The TUI never reads raw hardware events directly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Event {
     Key(KeyEvent),
+    Backend(BackendEvent),
     Tick,
     Quit,
 }
