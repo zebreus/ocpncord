@@ -7,13 +7,33 @@ pub trait Screen {
     fn handle_event(&mut self, event: Event) -> Action;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
     Quit,
-    Navigate(ScreenId),
+    SwitchScreen(ScreenId),
+    OpenModal(ModalId),
+    CloseModal,
+    CycleAgent,
+    Interrupt,
+    SendMessage,
+    OpenPalette,
+    ScrollUp,
+    ScrollDown,
+    ToggleDetails,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenId {
-    SessionList,
+    StartPage,
     Chat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalId {
+    SessionList,
+    Help,
+    ModelPicker,
+    CommandPalette,
+    Settings,
 }

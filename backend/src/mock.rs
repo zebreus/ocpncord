@@ -75,6 +75,8 @@ impl Backend for MockBackend {
                 created: 0,
                 updated: 0,
             },
+            slug: String::new(),
+            version: String::new(),
         };
         self.sessions.push(session.clone());
         Ok(session)
@@ -95,6 +97,8 @@ impl Backend for MockBackend {
                 created: 0,
                 updated: 0,
             },
+            slug: String::new(),
+            version: String::new(),
         })
     }
 
@@ -173,7 +177,7 @@ impl Stream for MockStream {
         if self.pos < self.events.len() {
             // Can't take from a Vec, clone instead
             let item = match &self.events[self.pos] {
-                Ok(e) => e.clone(),
+                Ok(e) => Ok(e.clone()),
                 Err(e) => Err(e.clone()),
             };
             self.pos += 1;

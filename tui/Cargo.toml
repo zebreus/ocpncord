@@ -6,6 +6,6 @@ license.workspace = true
 
 [dependencies]
 opencode-types.workspace = true
-opencode-backend = { path = "../backend" }
+opencode-backend = { path = "../backend", features = ["mock"] }
 ratatui-core.workspace = true
 futures-core.workspace = true
