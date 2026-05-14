@@ -43,6 +43,8 @@ pub struct App<B: Backend> {
     messages: Vec<LoadedMessage>,
     stream: Option<B::PromptStream>,
     active_modal: Option<Box<dyn Modal>>,
+    agents: Vec<opencode_backend::Agent>,
+    active_agent: usize,
 }
 
 impl<B: Backend> App<B> {
@@ -63,6 +65,8 @@ impl<B: Backend> App<B> {
             messages: Vec::new(),
             stream: None,
             active_modal: None,
+            agents: Vec::new(),
+            active_agent: 0,
         }
     }
 
@@ -104,6 +108,69 @@ impl<B: Backend> App<B> {
 
     pub fn take_stream(&mut self) -> Option<B::PromptStream> {
         self.stream.take()
+    }
+
+    pub fn active_agent_name(&self) -> &str {
+        self.agents
+            .get(self.active_agent)
+            .map(|a| a.name.as_str())
+            .unwrap_or("build")
+    }
+
+    pub fn cycle_agent(&mut self) {
+        if !self.agents.is_empty() {
+            self.active_agent = (self.active_agent + 1) % self.agents.len();
+        }
+    }
+
+    pub fn cycle_agent_back(&mut self) {
+        if !self.agents.is_empty() {
+            self.active_agent = self
+                .active_agent
+                .checked_sub(1)
+                .unwrap_or(self.agents.len() - 1);
+        }
+    }
+
+    pub async fn init(&mut self) {
+        match self.backend.list_agents().await {
+            Ok(agents) => {
+                self.agents = agents
+                    .into_iter()
+                    .filter(|a| matches!(a.mode, opencode_backend::AgentMode::Primary))
+                    .collect();
+            }
+            Err(_) => {}
+        }
+        if self.agents.is_empty() {
+            self.agents = vec![
+                opencode_backend::Agent {
+                    name: "build".into(),
+                    mode: opencode_backend::AgentMode::Primary,
+                    description: None,
+                    native: None,
+                    hidden: None,
+                    model: None,
+                    color: None,
+                    variant: None,
+                    prompt: None,
+                    steps: None,
+                },
+                opencode_backend::Agent {
+                    name: "plan".into(),
+                    mode: opencode_backend::AgentMode::Primary,
+                    description: None,
+                    native: None,
+                    hidden: None,
+                    model: None,
+                    color: None,
+                    variant: None,
+                    prompt: None,
+                    steps: None,
+                },
+            ];
+        }
+        self.active_agent = 0;
     }
 
     pub fn is_streaming(&self) -> bool {
@@ -149,6 +216,15 @@ impl<B: Backend> App<B> {
 
                 if let Some(action) = self.key_chord.handle(key, self.tick) {
                     return self.apply_action(Some(action)).await;
+                }
+
+                if key.scancode == crate::event::Scancode::Tab {
+                    if key.modifiers.shift {
+                        self.cycle_agent_back();
+                    } else {
+                        self.cycle_agent();
+                    }
+                    return true;
                 }
 
                 if let Some(action) = self.prompt_bar.handle_key(key) {
@@ -232,7 +308,8 @@ impl<B: Backend> App<B> {
         self.prompt_bar.clear();
         self.active_screen = ScreenId::Chat;
 
-        match self.backend.prompt(&session_id, &text, None).await {
+        let agent = self.active_agent_name().to_string();
+        match self.backend.prompt(&session_id, &text, Some(&agent)).await {
             Ok(stream) => {
                 self.stream = Some(stream);
                 self.is_streaming = true;
@@ -313,7 +390,8 @@ impl<B: Backend> App<B> {
         self.prompt_bar.clear();
         self.active_screen = ScreenId::Chat;
 
-        match self.backend.prompt(&session_id, text, None).await {
+        let agent = self.active_agent_name().to_string();
+        match self.backend.prompt(&session_id, text, Some(&agent)).await {
             Ok(stream) => {
                 self.stream = Some(stream);
                 self.is_streaming = true;
@@ -411,8 +489,13 @@ impl<B: Backend> App<B> {
                     50.min(area.width),
                     1,
                 );
-                self.prompt_bar
-                    .render(prompt_area, frame, &self.theme, self.is_streaming);
+                self.prompt_bar.render(
+                    prompt_area,
+                    frame,
+                    &self.theme,
+                    self.is_streaming,
+                    self.active_agent_name(),
+                );
             }
             ScreenId::Chat => {
                 render_chat(
@@ -425,8 +508,13 @@ impl<B: Backend> App<B> {
                 );
                 let area = frame.area();
                 let prompt_area = Rect::new(area.x, area.height.saturating_sub(1), area.width, 1);
-                self.prompt_bar
-                    .render(prompt_area, frame, &self.theme, self.is_streaming);
+                self.prompt_bar.render(
+                    prompt_area,
+                    frame,
+                    &self.theme,
+                    self.is_streaming,
+                    self.active_agent_name(),
+                );
             }
         }
 
@@ -535,6 +623,276 @@ mod tests {
         assert!(
             run(&mut app, char_key('q')),
             "q after timeout should not quit"
+        );
+    }
+
+    #[test]
+    fn init_fallback_to_default_agents_when_backend_returns_empty() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+        futures::executor::block_on(app.init());
+        assert_eq!(app.active_agent_name(), "build");
+    }
+
+    #[test]
+    fn init_loads_primary_agents_from_backend() {
+        let mut backend = MockBackend::default();
+        backend.agents = vec![opencode_backend::Agent {
+            name: "coder".into(),
+            mode: opencode_backend::AgentMode::Primary,
+            description: None,
+            native: None,
+            hidden: None,
+            model: None,
+            color: None,
+            variant: None,
+            prompt: None,
+            steps: None,
+        }];
+        let mut app = App::new(backend);
+        futures::executor::block_on(app.init());
+        assert_eq!(app.active_agent_name(), "coder");
+    }
+
+    #[test]
+    fn shift_tab_cycles_backward_through_agents() {
+        let mut backend = MockBackend::default();
+        backend.agents = vec![
+            opencode_backend::Agent {
+                name: "build".into(),
+                mode: opencode_backend::AgentMode::Primary,
+                description: None,
+                native: None,
+                hidden: None,
+                model: None,
+                color: None,
+                variant: None,
+                prompt: None,
+                steps: None,
+            },
+            opencode_backend::Agent {
+                name: "plan".into(),
+                mode: opencode_backend::AgentMode::Primary,
+                description: None,
+                native: None,
+                hidden: None,
+                model: None,
+                color: None,
+                variant: None,
+                prompt: None,
+                steps: None,
+            },
+            opencode_backend::Agent {
+                name: "coder".into(),
+                mode: opencode_backend::AgentMode::Primary,
+                description: None,
+                native: None,
+                hidden: None,
+                model: None,
+                color: None,
+                variant: None,
+                prompt: None,
+                steps: None,
+            },
+        ];
+        let mut app = App::new(backend);
+        futures::executor::block_on(app.init());
+
+        // Move to index 1 (plan)
+        run(&mut app, tab_key());
+        assert_eq!(app.active_agent_name(), "plan");
+
+        // Shift+Tab should go back to build
+        run(&mut app, shift_tab_key());
+        assert_eq!(app.active_agent_name(), "build");
+    }
+
+    fn tab_key() -> Event {
+        Event::Key(KeyEvent {
+            scancode: Scancode::Tab,
+            modifiers: Modifiers::default(),
+        })
+    }
+
+    fn shift_tab_key() -> Event {
+        Event::Key(KeyEvent {
+            scancode: Scancode::Tab,
+            modifiers: Modifiers {
+                ctrl: false,
+                shift: true,
+                alt: false,
+                meta: false,
+            },
+        })
+    }
+
+    #[test]
+    fn tab_wraps_to_first_agent_at_end_of_list() {
+        let mut backend = MockBackend::default();
+        backend.agents = vec![
+            opencode_backend::Agent {
+                name: "build".into(),
+                mode: opencode_backend::AgentMode::Primary,
+                description: None,
+                native: None,
+                hidden: None,
+                model: None,
+                color: None,
+                variant: None,
+                prompt: None,
+                steps: None,
+            },
+            opencode_backend::Agent {
+                name: "plan".into(),
+                mode: opencode_backend::AgentMode::Primary,
+                description: None,
+                native: None,
+                hidden: None,
+                model: None,
+                color: None,
+                variant: None,
+                prompt: None,
+                steps: None,
+            },
+        ];
+        let mut app = App::new(backend);
+        futures::executor::block_on(app.init());
+
+        // Tab at index 0 → index 1
+        run(&mut app, tab_key());
+        assert_eq!(app.active_agent_name(), "plan");
+        // Tab at index 1 → wraps to index 0
+        run(&mut app, tab_key());
+        assert_eq!(app.active_agent_name(), "build");
+    }
+
+    #[test]
+    fn shift_tab_wraps_to_last_agent_at_start_of_list() {
+        let mut backend = MockBackend::default();
+        backend.agents = vec![
+            opencode_backend::Agent {
+                name: "build".into(),
+                mode: opencode_backend::AgentMode::Primary,
+                description: None,
+                native: None,
+                hidden: None,
+                model: None,
+                color: None,
+                variant: None,
+                prompt: None,
+                steps: None,
+            },
+            opencode_backend::Agent {
+                name: "plan".into(),
+                mode: opencode_backend::AgentMode::Primary,
+                description: None,
+                native: None,
+                hidden: None,
+                model: None,
+                color: None,
+                variant: None,
+                prompt: None,
+                steps: None,
+            },
+        ];
+        let mut app = App::new(backend);
+        futures::executor::block_on(app.init());
+
+        // Shift+Tab at index 0 → wraps to last index
+        run(&mut app, shift_tab_key());
+        assert_eq!(app.active_agent_name(), "plan");
+    }
+
+    #[test]
+    fn tab_cycles_forward_through_agents() {
+        let mut backend = MockBackend::default();
+        backend.agents = vec![
+            opencode_backend::Agent {
+                name: "build".into(),
+                mode: opencode_backend::AgentMode::Primary,
+                description: None,
+                native: None,
+                hidden: None,
+                model: None,
+                color: None,
+                variant: None,
+                prompt: None,
+                steps: None,
+            },
+            opencode_backend::Agent {
+                name: "plan".into(),
+                mode: opencode_backend::AgentMode::Primary,
+                description: None,
+                native: None,
+                hidden: None,
+                model: None,
+                color: None,
+                variant: None,
+                prompt: None,
+                steps: None,
+            },
+        ];
+        let mut app = App::new(backend);
+        futures::executor::block_on(app.init());
+        assert_eq!(app.active_agent_name(), "build");
+
+        run(&mut app, tab_key());
+        assert_eq!(app.active_agent_name(), "plan");
+    }
+
+    #[test]
+    fn agent_name_passed_to_prompt_on_send() {
+        let mut backend = MockBackend::default();
+        backend.agents = vec![
+            opencode_backend::Agent {
+                name: "build".into(),
+                mode: opencode_backend::AgentMode::Primary,
+                description: None,
+                native: None,
+                hidden: None,
+                model: None,
+                color: None,
+                variant: None,
+                prompt: None,
+                steps: None,
+            },
+            opencode_backend::Agent {
+                name: "plan".into(),
+                mode: opencode_backend::AgentMode::Primary,
+                description: None,
+                native: None,
+                hidden: None,
+                model: None,
+                color: None,
+                variant: None,
+                prompt: None,
+                steps: None,
+            },
+        ];
+        backend.prompt_events = vec![Ok(opencode_backend::BackendEvent::Done)];
+        let mut app = App::new(backend);
+
+        futures::executor::block_on(app.init());
+        // Tab to "plan"
+        run(&mut app, tab_key());
+        assert_eq!(app.active_agent_name(), "plan");
+
+        // Send a message
+        run(&mut app, char_key('h'));
+        let still_running = run(&mut app, enter_key());
+        assert!(still_running, "app should keep running after send");
+
+        // Verify session was created
+        assert_eq!(app.backend().sessions.len(), 1, "session should be created");
+        // Verify prompt_events were consumed (prompt() was called)
+        assert!(
+            app.backend().prompt_events.is_empty(),
+            "prompt_events should be consumed by prompt()"
+        );
+        assert_eq!(
+            app.backend().last_prompt_agent.as_deref(),
+            Some("plan"),
+            "agent name should be passed to prompt()"
         );
     }
 

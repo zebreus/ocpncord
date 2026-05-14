@@ -148,7 +148,10 @@ fn translate_crossterm_event(event: crossterm::event::Event) -> Option<Event> {
 #[tokio::main]
 async fn main() {
     let backend = OpenCodeBackend::new_std("http://localhost:4096");
-    let app = App::new(backend);
+    let mut app = App::new(backend);
+
+    // Initialize agents from backend
+    app.init().await;
 
     let _ = enable_raw_mode();
     let _ = execute!(stdout(), EnterAlternateScreen);

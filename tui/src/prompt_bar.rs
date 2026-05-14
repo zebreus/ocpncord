@@ -83,7 +83,19 @@ impl PromptBar {
         frame: &mut ratatui_core::terminal::Frame,
         theme: &Theme,
         is_streaming: bool,
+        agent_name: &str,
     ) {
+        let agent_display = alloc::format!("[{}]", agent_name);
+        let agent_area = Rect::new(
+            area.right().saturating_sub(agent_display.len() as u16 + 1),
+            area.y,
+            agent_display.len() as u16,
+            1,
+        );
+        Text::from(agent_display.as_str())
+            .style(theme.agent_indicator)
+            .render(agent_area, frame.buffer_mut());
+
         if is_streaming {
             Text::from("Agent is responding... (Esc to interrupt)")
                 .style(theme.text_dim)

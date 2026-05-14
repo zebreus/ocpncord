@@ -16,6 +16,7 @@ pub struct MockBackend {
     pub event_events: Vec<Result<BackendEvent>>,
     pub text_matches: Vec<TextMatch>,
     pub fail_create_session: Option<BackendError>,
+    pub last_prompt_agent: Option<alloc::string::String>,
 }
 
 impl Default for MockBackend {
@@ -37,6 +38,7 @@ impl Default for MockBackend {
             event_events: Vec::new(),
             text_matches: Vec::new(),
             fail_create_session: None,
+            last_prompt_agent: None,
         }
     }
 }
@@ -134,8 +136,9 @@ impl Backend for MockBackend {
         &mut self,
         _id: &SessionId,
         _text: &str,
-        _agent: Option<&str>,
+        agent: Option<&str>,
     ) -> Result<Self::PromptStream> {
+        self.last_prompt_agent = agent.map(|a| a.into());
         let events = core::mem::take(&mut self.prompt_events);
         Ok(MockStream { events, pos: 0 })
     }
