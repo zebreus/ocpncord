@@ -441,7 +441,7 @@ impl<B: Backend> App<B> {
                     }
                     opencode_backend::BackendEvent::SessionDiff { .. } => {}
                     opencode_backend::BackendEvent::SessionCompacted { .. } => {}
-                    opencode_backend::BackendEvent::MessageUpdated { session_id, .. } => {
+                    opencode_backend::BackendEvent::MessageUpdated { .. } => {
                         // message.updated signals end of an assistant response — equivalent to Done
                         if self.is_streaming {
                             let parts = core::mem::take(&mut self.partial_parts);

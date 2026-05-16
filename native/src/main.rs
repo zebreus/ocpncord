@@ -1,7 +1,7 @@
 use core::convert::Infallible;
 use core::net::IpAddr;
 use std::fs::OpenOptions;
-use std::io::Write as StdWrite;
+use std::io::{stdout, Write};
 use std::sync::Mutex;
 
 use clap::Parser;
@@ -20,7 +20,6 @@ use ratatui_core::backend::Backend;
 use ratatui_core::buffer::Cell;
 use ratatui_core::layout::{Position, Size};
 use ratatui_core::terminal::Terminal;
-use std::io::{stdout, Write};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
@@ -28,7 +27,6 @@ use tokio::time::{interval, Duration};
 static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
 fn log(msg: &str) {
-    eprintln!("{msg}");
     if let Ok(mut guard) = LOG_FILE.lock() {
         if guard.is_none() {
             *guard = OpenOptions::new()
