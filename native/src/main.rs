@@ -1,12 +1,11 @@
 use core::convert::Infallible;
-use core::pin::Pin;
 
+use clap::Parser;
 use crossterm::cursor::{Hide, Show};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, size,
 };
 use crossterm::{execute, queue};
-use futures::StreamExt;
 use opencode_backend::BackendEvent;
 use opencode_backend_opencode::OpenCodeBackend;
 use opencode_tui::Event;
@@ -16,7 +15,6 @@ use ratatui_core::buffer::Cell;
 use ratatui_core::layout::{Position, Size};
 use ratatui_core::terminal::Terminal;
 use std::io::{stdout, Write};
-use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 
@@ -152,10 +150,19 @@ fn translate_crossterm_event(event: crossterm::event::Event) -> Option<Event> {
     }
 }
 
+#[derive(Parser)]
+#[command(name = "opencode-native", about = "Native TUI client for opencode")]
+struct Cli {
+    /// OpenCode server URL
+    #[arg(long = "url", default_value = "http://localhost:4096")]
+    url: String,
+}
+
 #[tokio::main]
 async fn main() {
-    let backend = OpenCodeBackend::new_std("http://localhost:4096");
-    let mut app = App::new(backend);
+     let cli = Cli::parse();
+     let backend = OpenCodeBackend::new_std(&cli.url);
+     let mut app = App::new(backend);
 
     app.init().await;
     app.initiate_sync_stream().await;
