@@ -251,19 +251,9 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             agent,
         };
         let json = serde_json::to_string(&prompt_body).map_err(parse_err)?;
-        let transport = self.transport;
-        let dns = self.dns;
-        let json2 = json.as_bytes().to_vec();
-        let url2 = url;
-        let fut: Pin<Box<dyn Future<Output = Vec<Result<BackendEvent>>>>> = Box::pin(async move {
-            // Fire-and-forget: the actual response arrives via the SSE event stream
-            // as message.part.updated / message.part.delta / message.updated events.
-            if let Err(e) = http_post_json(transport, dns, &url2, &json2).await {
-                return vec![Err(e)];
-            }
-            vec![]
-        });
-        Ok(BufferedStream::from_pending(fut))
+        // Eagerly fire the POST — the response arrives via the SSE event stream.
+        http_post_json(self.transport, self.dns, &url, json.as_bytes()).await?;
+        Ok(BufferedStream::empty())
     }
 
     async fn command(
@@ -279,17 +269,8 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             agent,
         };
         let json = serde_json::to_string(&cmd_body).map_err(parse_err)?;
-        let transport = self.transport;
-        let dns = self.dns;
-        let json2 = json.as_bytes().to_vec();
-        let url2 = url;
-        let fut: Pin<Box<dyn Future<Output = Vec<Result<BackendEvent>>>>> = Box::pin(async move {
-            if let Err(e) = http_post_json(transport, dns, &url2, &json2).await {
-                return vec![Err(e)];
-            }
-            vec![]
-        });
-        Ok(BufferedStream::from_pending(fut))
+        http_post_json(self.transport, self.dns, &url, json.as_bytes()).await?;
+        Ok(BufferedStream::empty())
     }
 
     async fn list_agents(&mut self) -> Result<Vec<Agent>> {

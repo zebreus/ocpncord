@@ -105,6 +105,16 @@ impl BufferedStream {
         }
     }
 
+    /// Create an empty stream that immediately returns `None`.
+    pub fn empty() -> Self {
+        Self {
+            source: SseSource::PreParsed {
+                events: Vec::new(),
+                pos: 0,
+            },
+        }
+    }
+
     /// Parse all SSE events from a response body bytes.
     ///
     /// Each SSE event block is separated by `\n\n`:
