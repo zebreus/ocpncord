@@ -10,6 +10,7 @@ extern crate alloc;
 
 mod app;
 mod chat;
+mod command_palette;
 mod event;
 mod key_chord;
 mod modal;
@@ -20,8 +21,9 @@ mod start_page;
 mod theme;
 
 pub use app::App;
+pub use command_palette::{CommandPaletteModal, default_commands};
 pub use event::{Event, KeyEvent, Modifiers, Scancode};
 pub use key_chord::KeyChord;
 pub use modal::Modal;
-pub use screen::{Action, ModalId, Screen, ScreenId};
+pub use screen::{Action, ModalId, Screen, ScreenId, Tab};
 pub use theme::Theme;

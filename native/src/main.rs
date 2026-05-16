@@ -15,6 +15,7 @@ use ratatui_core::buffer::Cell;
 use ratatui_core::layout::{Position, Size};
 use ratatui_core::terminal::Terminal;
 use std::io::{stdout, Write};
+use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 
 struct CrosstermBackend;
@@ -35,11 +36,17 @@ impl Backend for CrosstermBackend {
         let mut stdout = stdout();
         for (x, y, cell) in content {
             let symbol = cell.symbol();
-            if !symbol.is_empty() && symbol != " " {
+            if !symbol.is_empty() {
                 let _ = queue!(
                     stdout,
                     crossterm::cursor::MoveTo(x, y),
                     crossterm::style::Print(symbol),
+                );
+            } else {
+                let _ = queue!(
+                    stdout,
+                    crossterm::cursor::MoveTo(x, y),
+                    crossterm::style::Print(" "),
                 );
             }
         }
@@ -147,65 +154,95 @@ fn translate_crossterm_event(event: crossterm::event::Event) -> Option<Event> {
 
 #[tokio::main]
 async fn main() {
-    let backend = OpenCodeBackend::new_std("http://localhost:4096");
-    let mut app = App::new(backend);
+     let backend = OpenCodeBackend::new_std("http://localhost:4096");
+     let mut app = App::new(backend);
 
-    // Initialize agents from backend
-    app.init().await;
+     // Initialize agents from backend
+     app.init().await;
 
-    let _ = enable_raw_mode();
-    let _ = execute!(stdout(), EnterAlternateScreen);
-    let crossterm_backend = CrosstermBackend::new();
-    let mut terminal = Terminal::new(crossterm_backend).unwrap();
+     // Open sync event stream for real-time session/message updates
+     app.initiate_sync_stream().await;
 
-    let mut app = app;
-    let mut running = true;
-    let mut tick_interval = interval(Duration::from_millis(50));
+     let _ = enable_raw_mode();
+     let _ = execute!(stdout(), EnterAlternateScreen);
+     let crossterm_backend = CrosstermBackend::new();
+     let mut terminal = Terminal::new(crossterm_backend).unwrap();
 
-    while running {
-        tokio::select! {
-            maybe_event = read_crossterm_event() => {
-                if let Some(event) = maybe_event {
-                    running = app.handle_event(event).await;
-                }
-            }
-            _ = tick_interval.tick() => {
-                running = app.handle_event(Event::Tick).await;
-            }
-        }
+     // Channel for crossterm events from a single background reader task
+     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Option<Event>>();
 
-        if let Some(mut stream) = app.take_stream() {
-            while let Some(result) = stream.next().await {
-                let event = match result {
-                    Ok(be) => Event::Backend(be),
-                    Err(e) => Event::Backend(BackendEvent::Error {
-                        message: format!("{}", e),
-                    }),
-                };
-                running = app.handle_event(event).await;
-                if !running {
-                    break;
-                }
-            }
-        }
+     // Spawn a single long-lived task that reads crossterm events
+     tokio::spawn(async move {
+         loop {
+             let event = tokio::task::spawn_blocking(|| {
+                 crossterm::event::read()
+                     .ok()
+                     .and_then(translate_crossterm_event)
+             })
+             .await
+             .ok()
+             .flatten();
+             if event_tx.send(event).is_err() {
+                 break;
+             }
+         }
+     });
 
-        let _ = terminal.draw(|frame| {
-            app.render(frame);
-        });
-    }
+     let mut app = app;
+     let mut running = true;
+     let mut tick_interval = interval(Duration::from_millis(50));
 
-    let _ = execute!(stdout(), LeaveAlternateScreen);
-    let _ = disable_raw_mode();
-}
+     while running {
+         tokio::select! {
+             maybe_event = event_rx.recv() => {
+                 if let Some(Some(event)) = maybe_event {
+                     running = app.handle_event(event).await;
+                 }
+             }
+             _ = tick_interval.tick() => {
+                 running = app.handle_event(Event::Tick).await;
+             }
+         }
 
-async fn read_crossterm_event() -> Option<Event> {
-    tokio::task::spawn_blocking(|| {
-        match crossterm::event::read() {
-            Ok(event) => translate_crossterm_event(event),
-            Err(_) => None,
-        }
-    })
-    .await
-    .ok()
-    .flatten()
-}
+         // Drain prompt stream
+         if let Some(mut stream) = app.take_stream() {
+             while let Some(result) = stream.next().await {
+                 let event = match result {
+                     Ok(be) => Event::Backend(be),
+                     Err(e) => Event::Backend(BackendEvent::Error {
+                         message: format!("{}", e),
+                     }),
+                 };
+                 running = app.handle_event(event).await;
+                 if !running {
+                     break;
+                 }
+             }
+         }
+
+         // Drain sync event stream
+         if let Some(mut sync) = app.take_sync_stream() {
+             while let Some(result) = sync.next().await {
+                 let event = match result {
+                     Ok(be) => Event::Backend(be),
+                     Err(e) => Event::Backend(BackendEvent::Error {
+                         message: format!("{}", e),
+                     }),
+                 };
+                 running = app.handle_event(event).await;
+                 if !running {
+                     break;
+                 }
+             }
+             // Re-initiate sync stream for next cycle
+             app.initiate_sync_stream().await;
+         }
+
+         let _ = terminal.draw(|frame| {
+             app.render(frame);
+         });
+     }
+
+     let _ = execute!(stdout(), LeaveAlternateScreen);
+     let _ = disable_raw_mode();
+ }

@@ -14,6 +14,7 @@ pub enum InputMode {
     Command,
     Shell,
     FileRef,
+    ToolRef,
 }
 
 pub struct PromptBar {
@@ -77,6 +78,13 @@ impl PromptBar {
         self.cursor = 0;
     }
 
+    pub fn append_text(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.input.insert(self.cursor, ch);
+            self.cursor += 1;
+        }
+    }
+
     pub fn render(
         &self,
         area: Rect,
@@ -107,6 +115,7 @@ impl PromptBar {
             InputMode::Command => "/",
             InputMode::Shell => "!",
             InputMode::FileRef => "@",
+            InputMode::ToolRef => "#",
             InputMode::Normal => "> ",
         };
 

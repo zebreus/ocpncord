@@ -1,3 +1,4 @@
+use alloc::string::String;
 use crate::event::{KeyEvent, Modifiers, Scancode};
 use crate::screen::{Action, ModalId};
 
@@ -43,6 +44,9 @@ impl KeyChord {
                     self.leader_tick = Some(tick);
                     return None;
                 }
+                Scancode::Char('p') | Scancode::Char('P') => {
+                    return Some(Action::OpenPalette);
+                }
                 _ => {}
             }
         }
@@ -62,6 +66,10 @@ impl KeyChord {
             Scancode::Char('m') | Scancode::Char('M') => {
                 Some(Action::OpenModal(ModalId::ModelPicker))
             }
+            Scancode::Char('h') | Scancode::Char('H') => Some(Action::OpenModal(ModalId::Help)),
+            Scancode::Char('t') | Scancode::Char('T') => Some(Action::OpenTerminal(String::new())),
+            Scancode::Char('d') | Scancode::Char('D') => Some(Action::ToggleSidePanel),
+            Scancode::Char('o') | Scancode::Char('O') => Some(Action::ToggleSidePanel),
             _ => None,
         }
     }
@@ -182,6 +190,27 @@ mod tests {
         assert!(
             chord.leader_tick.is_some(),
             "leader should remain active after modifier"
+        );
+    }
+
+    #[test]
+    fn leader_h_opens_help_modal() {
+        let mut chord = KeyChord::new();
+        chord.handle(&ctrl('x'), 0);
+        assert_eq!(
+            chord.handle(&key('h'), 1),
+            Some(Action::OpenModal(ModalId::Help))
+        );
+        assert!(chord.leader_tick.is_none());
+    }
+
+    #[test]
+    fn leader_capital_h_also_opens_help_modal() {
+        let mut chord = KeyChord::new();
+        chord.handle(&ctrl('x'), 0);
+        assert_eq!(
+            chord.handle(&key('H'), 1),
+            Some(Action::OpenModal(ModalId::Help))
         );
     }
 

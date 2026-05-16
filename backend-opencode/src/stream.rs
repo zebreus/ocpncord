@@ -266,6 +266,21 @@ fn parse_sse_block(block: &[u8]) -> Option<Result<BackendEvent>> {
             }))),
         "server.instance.disposed" => Some(parse_json::<ServerInstanceDisposedWrap>(data)
             .map(|w| BackendEvent::ServerInstanceDisposed { directory: w.directory })),
+
+        // --- Sync event stream variants (from /global/sync-event) ---
+        "session.created.1" => Some(parse_json::<SyncSessionWrap>(data)
+            .map(|w| BackendEvent::SessionCreated { session: w.data.info })),
+        "session.updated.1" => Some(parse_json::<SyncSessionWrap>(data)
+            .map(|w| BackendEvent::SessionUpdated { session: w.data.info })),
+        "session.deleted.1" => Some(parse_json::<SyncSessionWrap>(data)
+            .map(|w| BackendEvent::SessionDeleted { session_id: w.data.session_id })),
+        "message.removed.1" => Some(parse_json::<SyncMessageRemovedWrap>(data)
+            .map(|w| BackendEvent::MessageRemoved { session_id: w.data.session_id, message_id: w.data.message_id })),
+        "message.part.updated.1" => Some(parse_json::<SyncPartWrap>(data)
+            .map(|w| BackendEvent::Part { part: w.data.part, delta: None })),
+        "message.part.removed.1" => Some(parse_json::<SyncPartRemovedWrap>(data)
+            .map(|w| BackendEvent::MessagePartRemoved { session_id: w.data.session_id, message_id: w.data.message_id, part_id: w.data.part_id })),
+
         _ => None,
     }
 }
@@ -528,6 +543,83 @@ struct ProjectUpdatedWrap {
 #[derive(Deserialize)]
 struct ServerInstanceDisposedWrap {
     directory: String,
+}
+
+// --- Sync event stream wrap types (from /global/sync-event) ---
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncSessionWrap {
+    data: SyncSessionDataWrap,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncSessionDataWrap {
+    #[serde(rename = "sessionID")]
+    session_id: opencode_backend::SessionId,
+    info: opencode_backend::Session,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncMessageWrap {
+    data: SyncMessageDataWrap,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncMessageDataWrap {
+    #[serde(rename = "sessionID")]
+    session_id: opencode_backend::SessionId,
+    info: opencode_backend::Message,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncMessageRemovedWrap {
+    data: SyncMessageRemovedDataWrap,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncMessageRemovedDataWrap {
+    #[serde(rename = "sessionID")]
+    session_id: opencode_backend::SessionId,
+    #[serde(rename = "messageID")]
+    message_id: opencode_backend::MessageId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncPartWrap {
+    data: SyncPartDataWrap,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncPartDataWrap {
+    #[serde(rename = "sessionID")]
+    session_id: opencode_backend::SessionId,
+    part: opencode_backend::Part,
+    time: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncPartRemovedWrap {
+    data: SyncPartRemovedDataWrap,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncPartRemovedDataWrap {
+    #[serde(rename = "sessionID")]
+    session_id: opencode_backend::SessionId,
+    #[serde(rename = "messageID")]
+    message_id: opencode_backend::MessageId,
+    #[serde(rename = "partID")]
+    part_id: String,
 }
 
 /// Parse a `message.part.updated` event data JSON into a `BackendEvent::Part`.

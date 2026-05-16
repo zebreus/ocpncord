@@ -1,4 +1,5 @@
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::{Event, Theme};
 use ratatui_core::terminal::Frame;
@@ -25,12 +26,27 @@ pub enum Action {
     ToggleDetails,
     LoadSession(String),
     DeleteSession(String),
+    NewSession,
+    // --- New: session lifecycle ---
+    RenameSession(String, String),   // session_id, new_title
+    AbortSession(String),            // session_id
+    SwitchToChat(String),            // session_id (load then switch)
+    // --- New: UI navigation ---
+    OpenSettings,
+    OpenTerminal(String),            // pty_id
+    CloseTerminal,
+    ToggleSidePanel,
+    SidePanelSelectTab(Tab),
+    // --- New: modal replies ---
+    ReplyPermission(String, String, PermissionReplyAction), // session_id, request_id, reply
+    ReplyQuestion(String, String, Vec<String>), // session_id, request_id, answers
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenId {
     StartPage,
     Chat,
+    Terminal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,4 +56,20 @@ pub enum ModalId {
     ModelPicker,
     CommandPalette,
     Settings,
+    PermissionApproval,
+    QuestionApproval,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Diagnostics,
+    Todos,
+    Pane,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionReplyAction {
+    Once,
+    Always,
+    Reject,
 }

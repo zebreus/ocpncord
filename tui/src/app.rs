@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec;
@@ -20,6 +21,24 @@ use ratatui_core::style::{Color, Style};
 use ratatui_core::text::Text;
 use ratatui_core::widgets::Widget;
 
+/// A toast notification displayed briefly in the top-right corner.
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub title: Option<String>,
+    pub message: String,
+    pub variant: ToastVariant,
+    pub created_at: u64,
+    pub duration: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastVariant {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
 /// A message held in memory, built from streaming Parts.
 #[derive(Debug, Clone)]
 pub struct LoadedMessage {
@@ -27,7 +46,68 @@ pub struct LoadedMessage {
     pub parts: Vec<opencode_backend::Part>,
 }
 
-/// Top-level application state.
+
+/// A single LSP diagnostic entry.
+#[derive(Debug, Clone)]
+pub struct LspDiagnostic {
+    pub message: String,
+    pub severity: Option<String>,
+    pub line: u32,
+    pub character: u32,
+}
+/// PTY terminal pane state (max 2000 lines).
+#[derive(Debug, Clone)]
+pub struct TerminalPane {
+    pub pty_id: Option<String>,
+    pub title: String,
+    pub command: String,
+    pub lines: alloc::collections::VecDeque<TermLine>,
+    pub scroll: u16,
+    pub status: opencode_backend::PtyStatus,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TermLine {
+    pub content: String,
+    pub is_error: bool,
+}
+
+impl TerminalPane {
+    pub fn new() -> Self {
+        Self {
+            pty_id: None,
+            title: String::new(),
+            command: String::new(),
+            lines: alloc::collections::VecDeque::with_capacity(2000),
+            scroll: 0,
+            status: opencode_backend::PtyStatus::Running,
+            exit_code: None,
+        }
+    }
+
+    pub fn push_line(&mut self, line: TermLine) {
+        if self.lines.len() >= 2000 {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line);
+    }
+
+    pub fn set_from_pty(&mut self, pty: &opencode_backend::Pty) {
+        self.pty_id = Some(pty.id.clone());
+        self.title = pty.title.clone();
+        self.command = pty.command.clone();
+        self.status = pty.status.clone();
+    }
+}
+
+impl Default for TerminalPane {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Top-level app state.
 pub struct App<B: Backend> {
     backend: B,
     active_screen: ScreenId,
@@ -43,9 +123,30 @@ pub struct App<B: Backend> {
     partial_parts: Vec<opencode_backend::Part>,
     messages: Vec<LoadedMessage>,
     stream: Option<B::PromptStream>,
+    sync_stream: Option<B::EventStream>,
     active_modal: Option<Box<dyn Modal>>,
     agents: Vec<opencode_backend::Agent>,
     active_agent: usize,
+    // --- New fields for full API integration ---
+    terminal: TerminalPane,
+    // Session cache for modals
+    cached_sessions: Vec<opencode_backend::Session>,
+    // Permission & Question pending queues
+    pending_permissions: alloc::collections::VecDeque<(opencode_backend::PermissionRequest, String)>,
+    pending_questions: alloc::collections::VecDeque<(opencode_backend::QuestionRequest, String)>,
+    // Toast notifications
+    toasts: alloc::collections::VecDeque<Toast>,
+    // Side panel state
+    side_panel_visible: bool,
+    side_panel_tab: crate::screen::Tab,
+    side_panel_scroll: u16,
+    // LSP diagnostics cache: file_path -> diagnostics
+    lsp_diagnostics: alloc::collections::BTreeMap<String, Vec<LspDiagnostic>>,
+    // Todo cache
+    todos: Vec<opencode_backend::Todo>,
+    // Workspace state
+    current_workspace: Option<String>,
+    current_branch: Option<String>,
 }
 
 impl<B: Backend> App<B> {
@@ -68,6 +169,19 @@ impl<B: Backend> App<B> {
             active_modal: None,
             agents: Vec::new(),
             active_agent: 0,
+            terminal: TerminalPane::new(),
+            sync_stream: None,
+            cached_sessions: Vec::new(),
+            pending_permissions: alloc::collections::VecDeque::new(),
+            pending_questions: alloc::collections::VecDeque::new(),
+            toasts: alloc::collections::VecDeque::new(),
+            side_panel_visible: false,
+            side_panel_tab: crate::screen::Tab::Diagnostics,
+            side_panel_scroll: 0,
+            lsp_diagnostics: alloc::collections::BTreeMap::new(),
+            todos: Vec::new(),
+            current_workspace: None,
+            current_branch: None,
         }
     }
 
@@ -109,6 +223,19 @@ impl<B: Backend> App<B> {
 
     pub fn take_stream(&mut self) -> Option<B::PromptStream> {
         self.stream.take()
+    }
+
+    pub fn take_sync_stream(&mut self) -> Option<B::EventStream> {
+        self.sync_stream.take()
+    }
+
+    /// Begin consuming the sync event stream.
+    pub async fn initiate_sync_stream(&mut self) {
+        if !self.sync_stream.is_some() {
+            if let Ok(stream) = self.backend.sync_events().await {
+                self.sync_stream = Some(stream);
+            }
+        }
     }
 
     pub fn active_agent_name(&self) -> &str {
@@ -238,8 +365,9 @@ impl<B: Backend> App<B> {
                 }
             }
             Event::Backend(event) => {
+                #[allow(unreachable_patterns)]
                 match event {
-                    opencode_backend::BackendEvent::Part { part, .. } => {
+                    opencode_backend::BackendEvent::Part { part, delta: _ } => {
                         self.partial_parts.push(part);
                     }
                     opencode_backend::BackendEvent::Done => {
@@ -258,6 +386,213 @@ impl<B: Backend> App<B> {
                         self.partial_parts.clear();
                         self.is_streaming = false;
                         self.stream = None;
+                    }
+                    opencode_backend::BackendEvent::SessionCreated { session } => {
+                        self.active_session = Some(session);
+                        self.active_screen = ScreenId::Chat;
+                        self.messages.clear();
+                        self.error = None;
+                    }
+                    opencode_backend::BackendEvent::SessionUpdated { session } => {
+                        if let Some(active) = &mut self.active_session {
+                            if active.id == session.id {
+                                *active = session;
+                            }
+                        }
+                    }
+                    opencode_backend::BackendEvent::SessionDeleted { .. } => {
+                        self.active_session = None;
+                        self.messages.clear();
+                        self.active_screen = ScreenId::StartPage;
+                    }
+                    opencode_backend::BackendEvent::SessionIdle { .. } => {}
+                    opencode_backend::BackendEvent::SessionError { error, .. } => {
+                        self.error = Some(alloc::format!("Session error: {:?}", error));
+                    }
+                    opencode_backend::BackendEvent::SessionDiff { .. } => {}
+                    opencode_backend::BackendEvent::SessionCompacted { .. } => {}
+                    opencode_backend::BackendEvent::MessageUpdated { .. } => {}
+                    opencode_backend::BackendEvent::MessageRemoved { .. } => {}
+                    opencode_backend::BackendEvent::MessagePartDelta { .. } => {}
+                    opencode_backend::BackendEvent::MessagePartRemoved { .. } => {}
+                    opencode_backend::BackendEvent::PermissionAsked { request } => {
+                        let sid = self.active_session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+                        self.pending_permissions.push_back((request.clone(), sid));
+                    }
+                    opencode_backend::BackendEvent::PermissionReplied { .. } => {
+                        self.pending_permissions.pop_front();
+                    }
+                    opencode_backend::BackendEvent::QuestionAsked { request } => {
+                        let sid = self.active_session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+                        self.pending_questions.push_back((request.clone(), sid));
+                    }
+                    opencode_backend::BackendEvent::QuestionRejected { .. } => {
+                        self.pending_questions.pop_front();
+                    }
+                    opencode_backend::BackendEvent::QuestionReplied { .. } => {
+                        self.pending_questions.pop_front();
+                    }
+                    opencode_backend::BackendEvent::CommandExecuted { name, arguments, .. } => {
+                        self.toasts.push_back(Toast {
+                            title: Some("Command".into()),
+                            message: alloc::format!("{name} {arguments}"),
+                            variant: ToastVariant::Info,
+                            created_at: self.tick,
+                            duration: 12,
+                        });
+                    }
+                    opencode_backend::BackendEvent::FileEdited { file } => {
+                        self.toasts.push_back(Toast {
+                            title: Some("File Edited".into()),
+                            message: file,
+                            variant: ToastVariant::Info,
+                            created_at: self.tick,
+                            duration: 8,
+                        });
+                    }
+                    opencode_backend::BackendEvent::FileWatcherUpdated { file, event } => {
+                        self.toasts.push_back(Toast {
+                            title: Some("File Watcher".into()),
+                            message: alloc::format!("{file}: {event}"),
+                            variant: ToastVariant::Info,
+                            created_at: self.tick,
+                            duration: 6,
+                        });
+                    }
+                    opencode_backend::BackendEvent::PtyCreated { info } => {
+                        self.terminal.set_from_pty(&info);
+                        self.side_panel_tab = crate::screen::Tab::Pane;
+                        self.active_screen = ScreenId::Terminal;
+                    }
+                    opencode_backend::BackendEvent::PtyUpdated { .. } => {}
+                    opencode_backend::BackendEvent::PtyDeleted { .. } => {
+                        self.active_screen = ScreenId::Chat;
+                    }
+                    opencode_backend::BackendEvent::PtyExited { exit_code, .. } => {
+                        self.terminal.status = opencode_backend::PtyStatus::Exited;
+                        self.terminal.exit_code = Some(exit_code);
+                        self.toasts.push_back(Toast {
+                            title: Some("Terminal".into()),
+                            message: alloc::format!("exit code: {exit_code}"),
+                            variant: if exit_code == 0 {
+                                ToastVariant::Success
+                            } else {
+                                ToastVariant::Error
+                            },
+                            created_at: self.tick,
+                            duration: 8,
+                        });
+                    }
+                    opencode_backend::BackendEvent::LspDiagnostics { path: _, .. } => {
+                        self.side_panel_tab = crate::screen::Tab::Diagnostics;
+                        self.side_panel_visible = true;
+                    }
+                    opencode_backend::BackendEvent::LspUpdated => {}
+                    opencode_backend::BackendEvent::McpBrowserOpenFailed { mcp_name, url } => {
+                        self.toasts.push_back(Toast {
+                            title: Some("MCP Error".into()),
+                            message: alloc::format!("{mcp_name}: {url}"),
+                            variant: ToastVariant::Error,
+                            created_at: self.tick,
+                            duration: 10,
+                        });
+                    }
+                    opencode_backend::BackendEvent::McpToolsChanged { server } => {
+                        self.toasts.push_back(Toast {
+                            title: Some("MCP Tools".into()),
+                            message: alloc::format!("Updated from {server}"),
+                            variant: ToastVariant::Info,
+                            created_at: self.tick,
+                            duration: 6,
+                        });
+                    }
+                    opencode_backend::BackendEvent::InstallationUpdateAvailable { version } => {
+                        self.toasts.push_back(Toast {
+                            title: Some("Update Available".into()),
+                            message: alloc::format!("version {version}"),
+                            variant: ToastVariant::Info,
+                            created_at: self.tick,
+                            duration: 12,
+                        });
+                    }
+                    opencode_backend::BackendEvent::InstallationUpdated { version } => {
+                        self.toasts.push_back(Toast {
+                            title: Some("Updated".into()),
+                            message: alloc::format!("now on {version}"),
+                            variant: ToastVariant::Success,
+                            created_at: self.tick,
+                            duration: 6,
+                        });
+                    }
+                    opencode_backend::BackendEvent::WorkspaceReady { name } => {
+                        self.current_workspace = Some(name);
+                    }
+                    opencode_backend::BackendEvent::WorkspaceFailed { message } => {
+                        self.error = Some(alloc::format!("Workspace error: {message}"));
+                    }
+                    opencode_backend::BackendEvent::WorktreeReady { branch, .. } => {
+                        self.current_branch = Some(branch);
+                    }
+                    opencode_backend::BackendEvent::WorktreeFailed { message } => {
+                        self.error = Some(alloc::format!("Worktree error: {message}"));
+                    }
+                    opencode_backend::BackendEvent::VcsBranchUpdated { branch } => {
+                        self.current_branch = Some(branch);
+                    }
+                    opencode_backend::BackendEvent::TodoUpdated { ref todos, .. } => {
+                        self.todos = todos.clone();
+                    }
+                    opencode_backend::BackendEvent::TuiPromptAppend { ref text } => {
+                        self.prompt_bar.append_text(text);
+                    }
+                    opencode_backend::BackendEvent::TuiCommandExecute { ref command } => {
+                        self.handle_slash_command_inner(command).await;
+                    }
+                    opencode_backend::BackendEvent::TuiToastShow {
+                        message,
+                        variant,
+                        title,
+                        duration,
+                    } => {
+                        self.toasts.push_back(Toast {
+                            title,
+                            message,
+                            variant: match variant.as_str() {
+                                "success" => ToastVariant::Success,
+                                "warning" => ToastVariant::Warning,
+                                "error" => ToastVariant::Error,
+                                _ => ToastVariant::Info,
+                            },
+                            created_at: self.tick,
+                            duration: duration.unwrap_or(6) as u64,
+                        });
+                    }
+                    opencode_backend::BackendEvent::TuiSessionSelect { ref session_id } => {
+                        self.handle_select_session(session_id).await;
+                    }
+                    opencode_backend::BackendEvent::ServerConnected => {
+                        self.toasts.push_back(Toast {
+                            title: Some("Server".into()),
+                            message: "Connected".into(),
+                            variant: ToastVariant::Success,
+                            created_at: self.tick,
+                            duration: 4,
+                        });
+                    }
+                    opencode_backend::BackendEvent::GlobalDisposed => {
+                        self.error = Some("Server disposed all instances".into());
+                    }
+                    opencode_backend::BackendEvent::ServerInstanceDisposed { directory } => {
+                        self.toasts.push_back(Toast {
+                            title: Some("Instance Disposed".into()),
+                            message: directory,
+                            variant: ToastVariant::Warning,
+                            created_at: self.tick,
+                            duration: 8,
+                        });
+                    }
+                    opencode_backend::BackendEvent::ProjectUpdated(project) => {
+                        self.current_workspace = project.name.or(self.current_workspace.clone());
                     }
                     _ => {}
                 }
@@ -327,7 +662,7 @@ impl<B: Backend> App<B> {
 
     async fn handle_slash_command(&mut self, text: &str) -> bool {
         match text {
-            "/models" => {
+            "/models" | "/settings" | "/config" => {
                 self.prompt_bar.clear();
                 let mut modal = ModelPickerModal::new();
                 match self.backend.get_config().await {
@@ -369,9 +704,37 @@ impl<B: Backend> App<B> {
                 self.active_modal = Some(Box::new(HelpModal::new()));
                 true
             }
+            "/todos" => {
+                self.side_panel_visible = true;
+                self.side_panel_tab = crate::screen::Tab::Todos;
+                true
+            }
+            "/diagnostics" => {
+                self.side_panel_visible = true;
+                self.side_panel_tab = crate::screen::Tab::Diagnostics;
+                true
+            }
+            "/pty" => {
+                self.side_panel_visible = true;
+                self.side_panel_tab = crate::screen::Tab::Pane;
+                true
+            }
+            "/abort" => {
+                if let Some(session) = &self.active_session {
+                    let _ = self.backend.abort_session(&session.id).await;
+                }
+                true
+            }
+            "/dispose" => {
+                let _ = self.backend.dispose().await;
+                true
+            }
+            "/upgrade" => {
+                let _ = self.backend.upgrade().await;
+                true
+            }
             "/exit" => false,
             _ => {
-                // Unknown command — submit as message
                 self.handle_unknown_slash_command(text).await
             }
         }
@@ -432,6 +795,77 @@ impl<B: Backend> App<B> {
         true
     }
 
+    async fn handle_slash_command_inner(&mut self, text: &str) {
+        match text {
+            "/sessions" => {
+                self.prompt_bar.clear();
+                let mut modal = SessionListModal::new();
+                match self.backend.list_sessions().await {
+                    Ok(sessions) => modal.set_sessions(sessions),
+                    Err(e) => modal.set_error(alloc::format!("{}", e)),
+                }
+                self.active_modal = Some(Box::new(modal));
+            }
+            "/models" | "/settings" | "/config" => {
+                self.prompt_bar.clear();
+                let mut modal = ModelPickerModal::new();
+                match self.backend.get_config().await {
+                    Ok(config) => modal.set_config(config),
+                    Err(e) => modal.set_error(alloc::format!("{}", e)),
+                }
+                self.active_modal = Some(Box::new(modal));
+            }
+            "/new" => {
+                match self.backend.create_session("Chat", "").await {
+                    Ok(session) => {
+                        self.active_session = Some(session);
+                    }
+                    Err(e) => {
+                        self.error = Some(alloc::format!("{}", e));
+                        return;
+                    }
+                }
+                self.prompt_bar.clear();
+                self.draft = None;
+                self.messages.clear();
+                self.active_modal = None;
+                self.active_screen = ScreenId::Chat;
+            }
+            "/help" => {
+                self.prompt_bar.clear();
+                self.active_modal = Some(Box::new(HelpModal::new()));
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_select_session(&mut self, id: &str) {
+        let session_id = id.to_string();
+        match self.backend.get_session(&session_id).await {
+            Ok(session) => {
+                self.active_session = Some(session);
+                self.active_screen = ScreenId::Chat;
+                self.messages.clear();
+                match self.backend.list_messages(&session_id).await {
+                    Ok(summaries) => {
+                        let mut messages = Vec::new();
+                        for summary in summaries {
+                            if let Ok(detail) = self.backend.get_message(&session_id, &summary.id).await {
+                                messages.push(LoadedMessage {
+                                    role: detail.info.role,
+                                    parts: detail.parts,
+                                });
+                            }
+                        }
+                        self.messages = messages;
+                    }
+                    Err(e) => self.error = Some(alloc::format!("{}", e)),
+                }
+            }
+            Err(e) => self.error = Some(alloc::format!("{}", e)),
+        }
+    }
+
 async fn apply_action(&mut self, action: Option<Action>) -> bool {
          match action {
              Some(Action::Quit) => return false,
@@ -460,15 +894,26 @@ async fn apply_action(&mut self, action: Option<Action>) -> bool {
             Some(Action::OpenModal(ModalId::Help)) => {
                 self.active_modal = Some(Box::new(HelpModal::new()));
             }
+            Some(Action::OpenModal(ModalId::Settings)) => {
+                let mut modal = ModelPickerModal::new();
+                match self.backend.get_config().await {
+                    Ok(config) => modal.set_config(config),
+                    Err(e) => modal.set_error(alloc::format!("{}", e)),
+                }
+                self.active_modal = Some(Box::new(modal));
+            }
+            Some(Action::OpenModal(ModalId::PermissionApproval)) => {}
+            Some(Action::OpenModal(ModalId::QuestionApproval)) => {}
             Some(Action::OpenModal(_)) => {}
             Some(Action::LoadSession(ref id)) => {
-                match self.backend.list_messages(id).await {
+                let session_id = id.clone();
+                match self.backend.list_messages(&session_id).await {
                     Ok(summaries) => {
                         // Load full messages
                         let mut messages = Vec::new();
                         for summary in summaries {
                             if let Ok(detail) =
-                                self.backend.get_message(id, &summary.id).await
+                                self.backend.get_message(&session_id, &summary.id).await
                             {
                                 messages.push(LoadedMessage {
                                     role: detail.info.role,
@@ -482,12 +927,12 @@ async fn apply_action(&mut self, action: Option<Action>) -> bool {
                         self.error = Some(alloc::format!("{}", e));
                     }
                 }
-                self.active_session = self.backend.get_session(id).await.ok();
+                self.active_session = self.backend.get_session(&session_id).await.ok();
                 self.active_modal = None;
                 self.active_screen = ScreenId::Chat;
             }
             Some(Action::DeleteSession(ref id)) => {
-                let _ = self.backend.delete_session(id).await;
+                let _ = self.backend.delete_session(&id).await;
                 // Re-fetch sessions and re-open modal
                 let mut modal = SessionListModal::new();
                 match self.backend.list_sessions().await {
@@ -504,6 +949,41 @@ async fn apply_action(&mut self, action: Option<Action>) -> bool {
             }
             Some(Action::ScrollDown) => {
                 self.chat.scroll = self.chat.scroll.saturating_sub(1);
+            }
+            Some(Action::ToggleSidePanel) => {
+                self.side_panel_visible = !self.side_panel_visible;
+            }
+            Some(Action::SidePanelSelectTab(tab)) => {
+                self.side_panel_tab = tab;
+                self.side_panel_scroll = 0;
+            }
+            Some(Action::OpenTerminal(_pty_id)) => {
+                self.active_screen = ScreenId::Terminal;
+            }
+            Some(Action::CloseTerminal) => {
+                self.active_screen = ScreenId::Chat;
+            }
+            Some(Action::OpenSettings) => {
+                let mut modal = ModelPickerModal::new();
+                match self.backend.get_config().await {
+                    Ok(config) => modal.set_config(config),
+                    Err(e) => modal.set_error(alloc::format!("{}", e)),
+                }
+                self.active_modal = Some(Box::new(modal));
+            }
+            Some(Action::AbortSession(ref id)) => {
+                let _ = self.backend.abort_session(id).await;
+            }
+            Some(Action::RenameSession(ref id, ref title)) => {
+                match self.backend.update_session(id, title).await {
+                    Ok(session) => {
+                        self.active_session = Some(session);
+                    }
+                    Err(e) => self.error = Some(alloc::format!("{}", e)),
+                }
+            }
+            Some(Action::SwitchToChat(ref id)) => {
+                self.handle_select_session(id).await;
             }
             _ => {}
         }
@@ -529,25 +1009,28 @@ async fn apply_action(&mut self, action: Option<Action>) -> bool {
                     self.active_agent_name(),
                 );
             }
-            ScreenId::Chat => {
-                render_chat(
-                    frame,
-                    &self.theme,
-                    &self.messages,
-                    &self.partial_parts,
-                    self.is_streaming,
-                    self.chat.scroll,
-                );
-                let area = frame.area();
-                let prompt_area = Rect::new(area.x, area.height.saturating_sub(1), area.width, 1);
-                self.prompt_bar.render(
-                    prompt_area,
-                    frame,
-                    &self.theme,
-                    self.is_streaming,
-                    self.active_agent_name(),
-                );
-            }
+ScreenId::Chat => {
+                 render_chat(
+                     frame,
+                     &self.theme,
+                     &self.messages,
+                     &self.partial_parts,
+                     self.is_streaming,
+                     self.chat.scroll,
+                 );
+                 let area = frame.area();
+                 let prompt_area = Rect::new(area.x, area.height.saturating_sub(1), area.width, 1);
+                 self.prompt_bar.render(
+                     prompt_area,
+                     frame,
+                     &self.theme,
+                     self.is_streaming,
+                     self.active_agent_name(),
+                 );
+             }
+             ScreenId::Terminal => {
+                 self.render_terminal(frame);
+             }
         }
 
         if let Some(ref err) = self.error {
@@ -559,6 +1042,144 @@ async fn apply_action(&mut self, action: Option<Action>) -> bool {
             Text::from(msg.as_str())
                 .style(self.theme.text_error)
                 .render(err_area, frame.buffer_mut());
+        }
+
+        // Render toasts (top-right corner)
+        {
+            let area = frame.area();
+            let mut toast_y = 2u16;
+            for toast in self.toasts.iter().rev().take(5) {
+                if toast_y >= area.height.saturating_sub(2) {
+                    break;
+                }
+                let style = match toast.variant {
+                    ToastVariant::Info => self.theme.toast_info,
+                    ToastVariant::Success => self.theme.toast_success,
+                    ToastVariant::Warning => self.theme.toast_warning,
+                    ToastVariant::Error => self.theme.toast_error,
+                };
+                let display = if let Some(ref title) = toast.title {
+                    alloc::format!(" {}: {} ", title, toast.message)
+                } else {
+                    alloc::format!(" {} ", toast.message)
+                };
+                let max_width = area.width.saturating_sub(4);
+                let display: String = display.chars().take(max_width as usize).collect();
+                let display_width = display.len() as u16;
+                let x = area.width.saturating_sub(display_width + 2);
+                Text::from(display)
+                    .style(style)
+                    .render(Rect::new(x, toast_y, display_width, 1), frame.buffer_mut());
+                toast_y += 1;
+            }
+        }
+
+        // Render side panel (right 30% when visible)
+        if self.side_panel_visible {
+            let area = frame.area();
+            let panel_width = (area.width as f32 * 0.3) as u16;
+            let panel_x = area.width - panel_width;
+            let panel_area = Rect::new(panel_x, area.y, panel_width, area.height);
+
+            // Background
+            frame.buffer_mut().set_style(panel_area, self.theme.side_panel_bg);
+
+            // Tab bar
+            let _tabs = ["Diagnostics", "Todos", "Terminal"];
+            let tab_labels: [&str; 3] = ["Diagnostics", "Todos", "Terminal"];
+            let mut tab_x = panel_x + 1;
+            for (i, label) in tab_labels.iter().enumerate() {
+                let is_active = match (i, self.side_panel_tab) {
+                    (0, crate::screen::Tab::Diagnostics) => true,
+                    (1, crate::screen::Tab::Todos) => true,
+                    (2, crate::screen::Tab::Pane) => true,
+                    _ => false,
+                };
+                let style = if is_active {
+                    self.theme.side_panel_tab_active
+                } else {
+                    self.theme.side_panel_tab_inactive
+                };
+                let display = alloc::format!(" {} ", label);
+                Text::from(display.as_str())
+                    .style(style)
+                    .render(Rect::new(tab_x, area.y, display.len() as u16, 1), frame.buffer_mut());
+                tab_x += display.len() as u16 + 1;
+            }
+
+            // Content area
+            let content_area = Rect::new(panel_x + 1, area.y + 1, panel_width - 2, area.height - 1);
+            match self.side_panel_tab {
+                crate::screen::Tab::Diagnostics => {
+                    if self.lsp_diagnostics.is_empty() {
+                        Text::from("No diagnostics")
+                            .style(self.theme.text_dim)
+                            .render(content_area, frame.buffer_mut());
+                    } else {
+                        let mut y = content_area.y;
+                        for (file, diags) in self.lsp_diagnostics.iter() {
+                            if y >= content_area.bottom() { break; }
+                            Text::from(file.as_str())
+                                .style(self.theme.side_panel_title)
+                                .render(Rect::new(content_area.x, y, content_area.width, 1), frame.buffer_mut());
+                            y += 1;
+                            for diag in diags.iter() {
+                                if y >= content_area.bottom() { break; }
+                                let sev = diag.severity.as_deref().unwrap_or("info");
+                                let display = alloc::format!("  [{}] {}:{} {}", sev, diag.line, diag.character, diag.message);
+                                let display: String = display.chars().take(content_area.width as usize).collect();
+                                Text::from(display.as_str())
+                                    .style(self.theme.text)
+                                    .render(Rect::new(content_area.x, y, content_area.width, 1), frame.buffer_mut());
+                                y += 1;
+                            }
+                        }
+                    }
+                }
+                crate::screen::Tab::Todos => {
+                    if self.todos.is_empty() {
+                        Text::from("No todos")
+                            .style(self.theme.text_dim)
+                            .render(content_area, frame.buffer_mut());
+                    } else {
+                        let mut y = content_area.y;
+                        for todo in self.todos.iter() {
+                            if y >= content_area.bottom() { break; }
+                            let checkbox = if todo.status == "completed" { "[x]" } else { "[ ]" };
+                            let display = alloc::format!("{} {}", checkbox, todo.content);
+                            let display: String = display.chars().take(content_area.width as usize).collect();
+                            let style = if todo.status == "completed" {
+                                self.theme.text_dim
+                            } else {
+                                self.theme.text
+                            };
+                            Text::from(display.as_str())
+                                .style(style)
+                                .render(Rect::new(content_area.x, y, content_area.width, 1), frame.buffer_mut());
+                            y += 1;
+                        }
+                    }
+                }
+                crate::screen::Tab::Pane => {
+                    // Show PTY output in side panel
+                    if self.terminal.pty_id.is_none() {
+                        Text::from("No terminal")
+                            .style(self.theme.text_dim)
+                            .render(content_area, frame.buffer_mut());
+                    } else {
+                        let mut y = content_area.y;
+                        for line in self.terminal.lines.iter().skip(self.terminal.scroll as usize) {
+                            if y >= content_area.bottom() { break; }
+                            let style = if line.is_error { self.theme.pty_error } else { self.theme.pty_output };
+                            let display: String = line.content.chars().take(content_area.width as usize).collect();
+                            Text::from(display.as_str())
+                                .style(style)
+                                .render(Rect::new(content_area.x, y, content_area.width, 1), frame.buffer_mut());
+                            y += 1;
+                        }
+                    }
+                }
+            }
         }
 
         if let Some(ref modal) = self.active_modal {
@@ -627,6 +1248,54 @@ async fn apply_action(&mut self, action: Option<Action>) -> bool {
             );
             modal.render(frame, &self.theme, content_area);
         }
+    }
+
+    fn render_terminal(&self, frame: &mut ratatui_core::terminal::Frame) {
+        let area = frame.area();
+        let pty_height = area.height.saturating_sub(1);
+
+        let start_idx = self.terminal.scroll as usize;
+        let lines: Vec<_> = self
+            .terminal
+            .lines
+            .iter()
+            .skip(start_idx)
+            .take(pty_height as usize)
+            .collect();
+
+        for (i, line) in lines.iter().enumerate() {
+            let y = area.y + i as u16;
+            let style = if line.is_error {
+                self.theme.pty_error
+            } else {
+                self.theme.pty_output
+            };
+            Text::from(line.content.as_str())
+                .style(style)
+                .render(Rect::new(area.x, y, area.width, 1), frame.buffer_mut());
+        }
+
+        let status_area = Rect::new(
+            area.x,
+            area.y + area.height - 1,
+            area.width,
+            1,
+        );
+        let status_str = format!(
+            " {} {} | {} | {} | Exit: {} ",
+            self.terminal.command,
+            self.terminal.pty_id.as_deref().unwrap_or(""),
+            if self.terminal.status == opencode_backend::PtyStatus::Running {
+                "running"
+            } else {
+                "exited"
+            },
+            self.terminal.lines.len(),
+            self.terminal.exit_code.map(|c| c.to_string()).unwrap_or_default(),
+        );
+        Text::from(status_str)
+            .style(self.theme.pty_status_bar)
+            .render(status_area, frame.buffer_mut());
     }
 }
 

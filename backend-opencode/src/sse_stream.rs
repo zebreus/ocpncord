@@ -72,10 +72,10 @@ impl Stream for TcpSseStream {
         let this = unsafe { self.get_unchecked_mut() };
 
         loop {
-            if let Some(end) = crate::stream::find_event_boundary(&this.partial) {
+            if let Some((end, sep_len)) = crate::stream::find_event_boundary(&this.partial) {
                 let block = &this.partial[..end];
                 let mut events = crate::BufferedStream::parse_sse(block);
-                this.partial.drain(..end + 2);
+                this.partial.drain(..end + sep_len);
                 if let Some(event) = events.drain(..).next() {
                     return Poll::Ready(Some(event));
                 }
