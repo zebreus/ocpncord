@@ -1,8 +1,6 @@
 use core::convert::Infallible;
 use core::net::IpAddr;
-use std::fs::OpenOptions;
 use std::io::{stdout, Write};
-use std::sync::Mutex;
 
 use clap::Parser;
 use crossterm::cursor::{Hide, Show};
@@ -23,23 +21,6 @@ use ratatui_core::terminal::Terminal;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
-
-static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
-
-fn log(msg: &str) {
-    if let Ok(mut guard) = LOG_FILE.lock() {
-        if guard.is_none() {
-            *guard = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/opencode-rust-client.log")
-                .ok();
-        }
-        if let Some(ref mut f) = *guard {
-            let _ = writeln!(f, "{msg}");
-        }
-    }
-}
 
 /// A TCP transport over tokio `TcpStream`.
 struct StdTcp;
@@ -276,20 +257,13 @@ async fn sse_background_task(
     let mut parser = SseParser::new();
 
     loop {
-        log(&format!("[SSE] connecting to {}/global/event ...", base_url));
-        match connect_and_read_sse(&base_url, &TCP, &DNS, &mut parser, &event_tx).await {
-            Ok(()) => log("[SSE] connection closed normally, reconnecting..."),
-            Err(e) => {
-                log(&format!("[SSE] error: {e}"));
-                let _ = event_tx.send(Some(Event::Backend(BackendEvent::Error {
-                    message: format!("SSE: {e}"),
-                })));
-            }
+        if let Err(e) = connect_and_read_sse(&base_url, &TCP, &DNS, &mut parser, &event_tx).await {
+            let _ = event_tx.send(Some(Event::Backend(BackendEvent::Error {
+                message: format!("SSE: {e}"),
+            })));
         }
 
-        let delay = parser.retry_ms();
-        log(&format!("[SSE] reconnecting in {delay}ms ..."));
-        tokio::time::sleep(Duration::from_millis(delay)).await;
+        tokio::time::sleep(Duration::from_millis(parser.retry_ms())).await;
     }
 }
 
@@ -357,12 +331,7 @@ async fn connect_and_read_sse(
         if n == 0 {
             return Ok(());
         }
-        let events = parser.feed(&buf[..n]);
-        log(&format!("[SSE] fed {n} bytes, got {} events", events.len()));
-        for (i, ev) in events.iter().enumerate() {
-            log(&format!("[SSE] event {i}: {ev:?}"));
-        }
-        send_events(events, event_tx);
+        send_events(parser.feed(&buf[..n]), event_tx);
     }
 }
 
@@ -373,11 +342,9 @@ fn send_events(
     for event in events {
         match event {
             Ok(ref be) => {
-                log(&format!("[SSE] sending event: {be:?}"));
                 let _ = event_tx.send(Some(Event::Backend(be.clone())));
             }
             Err(ref e) => {
-                log(&format!("[SSE] parse error: {e}"));
                 let _ = event_tx.send(Some(Event::Backend(BackendEvent::Error {
                     message: format!("SSE parse: {e}"),
                 })));
@@ -422,7 +389,7 @@ async fn main() {
     // Persistent SSE background task — all backend events flow through here
     let sse_event_tx = event_tx.clone();
     let sse_url = cli.url.clone();
-    log(&format!("[SSE] spawning background task, url={sse_url}"));
+
     tokio::spawn(async move {
         sse_background_task(sse_url, sse_event_tx).await;
     });
@@ -450,9 +417,7 @@ async fn main() {
     while running {
         tokio::select! {
             maybe_event = event_rx.recv() => {
-                if let Some(Some(ref event)) = maybe_event {
-                    log(&format!("[EVENT] received: {event:?}"));
-                }
+
                 if let Some(Some(event)) = maybe_event {
                     running = app.handle_event(event).await;
                 }

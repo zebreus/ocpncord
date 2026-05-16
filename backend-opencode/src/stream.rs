@@ -251,17 +251,9 @@ fn parse_sse_block(block: &[u8]) -> Option<Result<BackendEvent>> {
         }
         "session.status" => {
             let session_id = props.get("sessionID").and_then(|v| v.as_str())?;
-            let status_type = props
-                .get("status")
-                .and_then(|s| s.get("type"))
-                .and_then(|v| v.as_str())?;
-            if status_type == "idle" {
-                Some(Ok(BackendEvent::Done))
-            } else {
-                Some(Ok(BackendEvent::SessionIdle {
-                    session_id: session_id.to_owned(),
-                }))
-            }
+            Some(Ok(BackendEvent::SessionIdle {
+                session_id: session_id.to_owned(),
+            }))
         }
         "server.connected" => Some(Ok(BackendEvent::ServerConnected)),
         "global.disposed" => Some(Ok(BackendEvent::GlobalDisposed)),
@@ -720,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_status_idle_is_done() {
+    fn parse_session_status_idle() {
         let data = wrap_sse_data(
             "session.status",
             "{\"sessionID\":\"ses123\",\"status\":{\"type\":\"idle\"}}",
@@ -728,7 +720,12 @@ mod tests {
         let sse = format!("event: session.status\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], Ok(BackendEvent::Done)));
+        match &events[0] {
+            Ok(BackendEvent::SessionIdle { session_id }) => {
+                assert_eq!(session_id, "ses123");
+            }
+            _ => panic!("expected session.idle"),
+        }
     }
 
     #[test]
