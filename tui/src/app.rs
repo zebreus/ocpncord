@@ -443,9 +443,12 @@ impl<B: Backend> App<B> {
                         self.partial_texts.clear();
                     }
                     opencode_backend::BackendEvent::SessionCreated { session } => {
+                        let is_new = self.active_session.as_ref().map(|s| s.id != session.id).unwrap_or(true);
                         self.active_session = Some(session);
                         self.active_screen = ScreenId::Chat;
-                        self.messages.clear();
+                        if is_new {
+                            self.messages.clear();
+                        }
                         self.error = None;
                     }
                     opencode_backend::BackendEvent::SessionUpdated { session } => {
