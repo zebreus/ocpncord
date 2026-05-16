@@ -5,7 +5,7 @@ use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use opencode_backend::Backend;
+use opencode_backend::{Backend, BackendEvent};
 
 use crate::chat::{render_chat, Chat};
 use crate::command_palette::CommandPaletteModal;
@@ -221,17 +221,40 @@ impl<B: Backend> App<B> {
         self.active_session.as_ref()
     }
 
-    pub fn take_stream(&mut self) -> Option<B::PromptStream> {
-        self.stream.take()
+    /// Returns true if there is an active event stream (prompt or sync) to poll.
+    pub fn has_event_stream(&self) -> bool {
+        self.stream.is_some() || self.sync_stream.is_some()
     }
 
-    pub fn take_sync_stream(&mut self) -> Option<B::EventStream> {
-        self.sync_stream.take()
+    /// Poll the next event from whichever stream is active.
+    /// Prompt stream takes priority (it's the active conversation).
+    /// Sync stream provides background session/message updates.
+    /// Returns None when the stream is exhausted.
+    pub async fn poll_next_event(&mut self) -> Option<Result<BackendEvent, opencode_backend::BackendError>> {
+        use futures::StreamExt;
+
+        if let Some(stream) = &mut self.stream {
+            match stream.next().await {
+                Some(result) => return Some(result),
+                None => {
+                    self.stream = None;
+                }
+            }
+        }
+        if let Some(stream) = &mut self.sync_stream {
+            return stream.next().await;
+        }
+        None
     }
 
-    /// Begin consuming the sync event stream.
+    /// Replace the current prompt stream (e.g., after sending a message).
+    pub fn set_stream(&mut self, stream: B::PromptStream) {
+        self.stream = Some(stream);
+    }
+
+    /// Open the sync event stream if not already active.
     pub async fn initiate_sync_stream(&mut self) {
-        if !self.sync_stream.is_some() {
+        if self.sync_stream.is_none() {
             if let Ok(stream) = self.backend.sync_events().await {
                 self.sync_stream = Some(stream);
             }

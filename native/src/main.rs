@@ -1,4 +1,5 @@
 use core::convert::Infallible;
+use core::pin::Pin;
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::terminal::{
@@ -15,6 +16,7 @@ use ratatui_core::buffer::Cell;
 use ratatui_core::layout::{Position, Size};
 use ratatui_core::terminal::Terminal;
 use std::io::{stdout, Write};
+use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 
@@ -145,104 +147,77 @@ fn translate_crossterm_event(event: crossterm::event::Event) -> Option<Event> {
             };
             Some(Event::Key(KeyEvent { scancode, modifiers }))
         }
-        crossterm::event::Event::Resize(_w, _h) => {
-            Some(Event::Tick)
-        }
+        crossterm::event::Event::Resize(_w, _h) => Some(Event::Tick),
         _ => None,
     }
 }
 
 #[tokio::main]
 async fn main() {
-     let backend = OpenCodeBackend::new_std("http://localhost:4096");
-     let mut app = App::new(backend);
+    let backend = OpenCodeBackend::new_std("http://localhost:4096");
+    let mut app = App::new(backend);
 
-     // Initialize agents from backend
-     app.init().await;
+    app.init().await;
+    app.initiate_sync_stream().await;
 
-     // Open sync event stream for real-time session/message updates
-     app.initiate_sync_stream().await;
+    let _ = enable_raw_mode();
+    let _ = execute!(stdout(), EnterAlternateScreen);
+    let crossterm_backend = CrosstermBackend::new();
+    let mut terminal = Terminal::new(crossterm_backend).unwrap();
 
-     let _ = enable_raw_mode();
-     let _ = execute!(stdout(), EnterAlternateScreen);
-     let crossterm_backend = CrosstermBackend::new();
-     let mut terminal = Terminal::new(crossterm_backend).unwrap();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Option<Event>>();
 
-     // Channel for crossterm events from a single background reader task
-     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Option<Event>>();
+    tokio::spawn(async move {
+        loop {
+            let event = tokio::task::spawn_blocking(|| {
+                crossterm::event::read()
+                    .ok()
+                    .and_then(translate_crossterm_event)
+            })
+            .await
+            .ok()
+            .flatten();
+            if event_tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
 
-     // Spawn a single long-lived task that reads crossterm events
-     tokio::spawn(async move {
-         loop {
-             let event = tokio::task::spawn_blocking(|| {
-                 crossterm::event::read()
-                     .ok()
-                     .and_then(translate_crossterm_event)
-             })
-             .await
-             .ok()
-             .flatten();
-             if event_tx.send(event).is_err() {
-                 break;
-             }
-         }
-     });
+    let mut running = true;
+    let mut tick_interval = interval(Duration::from_millis(50));
 
-     let mut app = app;
-     let mut running = true;
-     let mut tick_interval = interval(Duration::from_millis(50));
+    while running {
+        tokio::select! {
+            maybe_event = event_rx.recv() => {
+                if let Some(Some(event)) = maybe_event {
+                    running = app.handle_event(event).await;
+                }
+            }
+            _ = tick_interval.tick() => {
+                running = app.handle_event(Event::Tick).await;
+            }
+            result = app.poll_next_event(), if app.has_event_stream() => {
+                match result {
+                    Some(Ok(be)) => {
+                        running = app.handle_event(Event::Backend(be)).await;
+                    }
+                    Some(Err(e)) => {
+                        running = app.handle_event(Event::Backend(BackendEvent::Error {
+                            message: format!("{}", e),
+                        })).await;
+                    }
+                    None => {
+                        app.initiate_sync_stream().await;
+                    }
+                }
+            }
+        }
 
-     while running {
-         tokio::select! {
-             maybe_event = event_rx.recv() => {
-                 if let Some(Some(event)) = maybe_event {
-                     running = app.handle_event(event).await;
-                 }
-             }
-             _ = tick_interval.tick() => {
-                 running = app.handle_event(Event::Tick).await;
-             }
-         }
+        let _ = terminal.draw(|frame| {
+            app.render(frame);
+        });
+    }
 
-         // Drain prompt stream
-         if let Some(mut stream) = app.take_stream() {
-             while let Some(result) = stream.next().await {
-                 let event = match result {
-                     Ok(be) => Event::Backend(be),
-                     Err(e) => Event::Backend(BackendEvent::Error {
-                         message: format!("{}", e),
-                     }),
-                 };
-                 running = app.handle_event(event).await;
-                 if !running {
-                     break;
-                 }
-             }
-         }
-
-         // Drain sync event stream
-         if let Some(mut sync) = app.take_sync_stream() {
-             while let Some(result) = sync.next().await {
-                 let event = match result {
-                     Ok(be) => Event::Backend(be),
-                     Err(e) => Event::Backend(BackendEvent::Error {
-                         message: format!("{}", e),
-                     }),
-                 };
-                 running = app.handle_event(event).await;
-                 if !running {
-                     break;
-                 }
-             }
-             // Re-initiate sync stream for next cycle
-             app.initiate_sync_stream().await;
-         }
-
-         let _ = terminal.draw(|frame| {
-             app.render(frame);
-         });
-     }
-
-     let _ = execute!(stdout(), LeaveAlternateScreen);
-     let _ = disable_raw_mode();
- }
+    let _ = execute!(stdout(), LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+}

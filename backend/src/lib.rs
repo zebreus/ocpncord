@@ -146,8 +146,8 @@ pub type Result<T> = core::result::Result<T, BackendError>;
 // --- The Backend trait ---
 
 pub trait Backend {
-    type PromptStream: Stream<Item = Result<BackendEvent>>;
-    type EventStream: Stream<Item = Result<BackendEvent>>;
+    type PromptStream: Stream<Item = Result<BackendEvent>> + Unpin;
+    type EventStream: Stream<Item = Result<BackendEvent>> + Unpin;
 
     async fn health(&mut self) -> Result<Health>;
 

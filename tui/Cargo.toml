@@ -9,6 +9,7 @@ opencode-types.workspace = true
 opencode-backend = { path = "../backend", features = ["mock"] }
 ratatui-core.workspace = true
 futures-core.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 futures = "0.3"

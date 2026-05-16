@@ -19,4 +19,5 @@ opencode-backend = { path = "backend" }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 futures-core = { version = "0.3", default-features = false, features = ["alloc"] }
 ratatui-core = { version = "0.1", default-features = false }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
