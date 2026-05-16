@@ -378,7 +378,6 @@ async fn main() {
      let mut app = App::new(backend);
 
     app.init().await;
-    app.initiate_sync_stream().await;
 
     let _ = enable_raw_mode();
     let _ = execute!(stdout(), EnterAlternateScreen);
@@ -387,12 +386,14 @@ async fn main() {
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Option<Event>>();
 
+    // Persistent SSE background task — all backend events flow through here
     let sse_event_tx = event_tx.clone();
     let sse_url = cli.url.clone();
     tokio::spawn(async move {
         sse_background_task(sse_url, sse_event_tx).await;
     });
 
+    // Keyboard input task
     tokio::spawn(async move {
         loop {
             let event = tokio::task::spawn_blocking(|| {
@@ -421,21 +422,6 @@ async fn main() {
             }
             _ = tick_interval.tick() => {
                 running = app.handle_event(Event::Tick).await;
-            }
-            result = app.poll_next_event(), if app.has_event_stream() => {
-                match result {
-                    Some(Ok(be)) => {
-                        running = app.handle_event(Event::Backend(be)).await;
-                    }
-                    Some(Err(e)) => {
-                        running = app.handle_event(Event::Backend(BackendEvent::Error {
-                            message: format!("{}", e),
-                        })).await;
-                    }
-                    None => {
-                        app.initiate_sync_stream().await;
-                    }
-                }
             }
         }
 
