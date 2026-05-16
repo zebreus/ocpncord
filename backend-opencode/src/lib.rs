@@ -133,6 +133,30 @@ async fn http_post_json<T: embedded_nal_async::TcpConnect + 'static, D: embedded
     Ok(body.to_vec())
 }
 
+/// Send a POST request and return immediately after receiving the status code.
+/// The response body is discarded — used for fire-and-forget triggers where
+/// the actual response arrives via the SSE event stream.
+async fn http_post_fire_and_forget<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + 'static>(
+    transport: &'static T,
+    dns: &'static D,
+    url: &str,
+    json: &[u8],
+) -> Result<()> {
+    let mut rx_buf = alloc::vec![0u8; RX_BUF_SIZE];
+    let mut client = HttpClient::new(transport, dns);
+    let handle = client.request(Method::POST, url).await.map_err(conn_err)?;
+    let mut handle = handle.body(json).content_type(ContentType::ApplicationJson);
+    let response = handle.send(&mut rx_buf).await.map_err(conn_err)?;
+    if !response.status.is_successful() {
+        let status = response.status.0;
+        return Err(BackendError::Api {
+            status,
+            message: alloc::format!("POST {url} failed with status {status}"),
+        });
+    }
+    Ok(())
+}
+
 /// GET the given URL and return the response body (non-blocking, own buffer).
 async fn http_get<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + 'static>(
     transport: &'static T,
@@ -251,8 +275,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             agent,
         };
         let json = serde_json::to_string(&prompt_body).map_err(parse_err)?;
-        // Eagerly fire the POST — the response arrives via the SSE event stream.
-        http_post_json(self.transport, self.dns, &url, json.as_bytes()).await?;
+        http_post_fire_and_forget(self.transport, self.dns, &url, json.as_bytes()).await?;
         Ok(BufferedStream::empty())
     }
 
@@ -269,7 +292,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             agent,
         };
         let json = serde_json::to_string(&cmd_body).map_err(parse_err)?;
-        http_post_json(self.transport, self.dns, &url, json.as_bytes()).await?;
+        http_post_fire_and_forget(self.transport, self.dns, &url, json.as_bytes()).await?;
         Ok(BufferedStream::empty())
     }
 

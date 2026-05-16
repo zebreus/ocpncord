@@ -1,6 +1,8 @@
 use core::convert::Infallible;
 use core::net::IpAddr;
+use std::fs::OpenOptions;
 use std::io::{stdout, Write};
+use std::sync::Mutex;
 
 use clap::Parser;
 use crossterm::cursor::{Hide, Show};
@@ -21,6 +23,23 @@ use ratatui_core::terminal::Terminal;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
+
+static LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+fn log(msg: &str) {
+    if let Ok(mut guard) = LOG.lock() {
+        if guard.is_none() {
+            *guard = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/opencode-rust-client.log")
+                .ok();
+        }
+        if let Some(ref mut f) = *guard {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+}
 
 /// A TCP transport over tokio `TcpStream`.
 struct StdTcp;
@@ -331,7 +350,9 @@ async fn connect_and_read_sse(
         if n == 0 {
             return Ok(());
         }
-        send_events(parser.feed(&buf[..n]), event_tx);
+        let events = parser.feed(&buf[..n]);
+        log(&format!("[SSE] fed {} bytes, got {} events", n, events.len()));
+        send_events(events, event_tx);
     }
 }
 
@@ -342,9 +363,11 @@ fn send_events(
     for event in events {
         match event {
             Ok(ref be) => {
+                log(&format!("[SSE] sending: {be:?}"));
                 let _ = event_tx.send(Some(Event::Backend(be.clone())));
             }
             Err(ref e) => {
+                log(&format!("[SSE] parse error: {e}"));
                 let _ = event_tx.send(Some(Event::Backend(BackendEvent::Error {
                     message: format!("SSE parse: {e}"),
                 })));
@@ -417,7 +440,9 @@ async fn main() {
     while running {
         tokio::select! {
             maybe_event = event_rx.recv() => {
-
+                if let Some(Some(ref event)) = maybe_event {
+                    log(&format!("[DEBUG] event: {event:?}"));
+                }
                 if let Some(Some(event)) = maybe_event {
                     running = app.handle_event(event).await;
                 }

@@ -85,6 +85,8 @@ impl PromptBar {
         }
     }
 
+    const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
     pub fn render(
         &self,
         area: Rect,
@@ -92,6 +94,7 @@ impl PromptBar {
         theme: &Theme,
         is_streaming: bool,
         agent_name: &str,
+        tick: u64,
     ) {
         let agent_display = alloc::format!("[{}]", agent_name);
         let agent_area = Rect::new(
@@ -105,7 +108,9 @@ impl PromptBar {
             .render(agent_area, frame.buffer_mut());
 
         if is_streaming {
-            Text::from("Agent is responding... (Esc to interrupt)")
+            let spinner = Self::SPINNER[(tick as usize / 3) % Self::SPINNER.len()];
+            let msg = alloc::format!("{spinner} Agent is responding... (Esc to interrupt)");
+            Text::from(msg.as_str())
                 .style(theme.text_dim)
                 .render(area, frame.buffer_mut());
             return;

@@ -442,7 +442,6 @@ impl<B: Backend> App<B> {
                     opencode_backend::BackendEvent::SessionDiff { .. } => {}
                     opencode_backend::BackendEvent::SessionCompacted { .. } => {}
                     opencode_backend::BackendEvent::MessageUpdated { .. } => {
-                        // message.updated signals end of an assistant response — equivalent to Done
                         if self.is_streaming {
                             let parts = core::mem::take(&mut self.partial_parts);
                             if !parts.is_empty() {
@@ -459,7 +458,15 @@ impl<B: Backend> App<B> {
                     opencode_backend::BackendEvent::MessageRemoved { .. } => {}
                     opencode_backend::BackendEvent::MessagePartUpdated { ref part, .. } => {
                         if self.is_streaming {
-                            self.partial_parts.push(part.clone());
+                            match part {
+                                opencode_backend::Part::StepStart(_) => {
+                                    self.partial_parts.push(part.clone());
+                                }
+                                _ if !self.partial_parts.is_empty() => {
+                                    self.partial_parts.push(part.clone());
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     opencode_backend::BackendEvent::MessagePartDelta { part_id, field, delta, .. } if field == "text" && self.is_streaming => {
@@ -715,9 +722,6 @@ impl<B: Backend> App<B> {
         let agent = self.active_agent_name().to_string();
         match self.backend.prompt(&session_id, &text, Some(&agent)).await {
             Ok(_stream) => {
-                // Fire-and-forget: the POST triggers the AI, response arrives via SSE event stream.
-                // Don't set self.stream — we stay in streaming mode and collect parts from
-                // MessagePartUpdated / MessagePartDelta / MessageUpdated events on the sync stream.
                 self.is_streaming = true;
                 self.partial_parts = Vec::new();
                 self.partial_texts.clear();
@@ -1078,6 +1082,7 @@ async fn apply_action(&mut self, action: Option<Action>) -> bool {
                     &self.theme,
                     self.is_streaming,
                     self.active_agent_name(),
+                    self.tick,
                 );
             }
 ScreenId::Chat => {
@@ -1097,6 +1102,7 @@ ScreenId::Chat => {
                      &self.theme,
                      self.is_streaming,
                      self.active_agent_name(),
+                     self.tick,
                  );
              }
              ScreenId::Terminal => {
