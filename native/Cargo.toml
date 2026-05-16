@@ -11,10 +11,12 @@ path = "src/main.rs"
 [dependencies]
 opencode-types.workspace = true
 opencode-backend = { path = "../backend" }
-opencode-backend-opencode = { path = "../backend-opencode", features = ["std"] }
+opencode-backend-opencode = { path = "../backend-opencode" }
 opencode-tui = { path = "../tui" }
 ratatui-core = { workspace = true, features = ["std"] }
 crossterm = "0.28"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
+embedded-nal-async = "0.9"
+embedded-io-async = { version = "0.7", features = ["std"] }

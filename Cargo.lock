@@ -673,6 +673,7 @@ version = "0.1.0"
 dependencies = [
  "embedded-io-async",
  "embedded-nal-async",
+ "futures",
  "futures-core",
  "opencode-backend",
  "opencode-types",
@@ -688,6 +689,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "crossterm",
+ "embedded-io-async",
+ "embedded-nal-async",
  "futures",
  "opencode-backend",
  "opencode-backend-opencode",

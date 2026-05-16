@@ -1,25 +1,24 @@
-#![cfg_attr(not(any(feature = "std", test)), no_std)]
+#![cfg_attr(not(test), no_std)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![allow(async_fn_in_trait)]
 
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use core::future::Future;
+use core::pin::Pin;
 use opencode_backend::*;
 use reqwless::client::HttpClient;
 use reqwless::headers::ContentType;
 use reqwless::request::{Method, RequestBuilder};
-#[cfg(feature = "std")]
-pub mod std_transport;
-#[cfg(feature = "std")]
-mod sse_stream;
 
 mod stream;
-pub use stream::BufferedStream;
-#[cfg(feature = "std")]
-pub use sse_stream::TcpSseStream;
+pub use stream::{BufferedStream, SseParser};
 
 const RX_BUF_SIZE: usize = 65536;
 
@@ -51,16 +50,6 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
     }
 }
 
-/// Convenience constructor for native (std) targets.
-#[cfg(feature = "std")]
-impl OpenCodeBackend<std_transport::StdTcp, std_transport::StdDns> {
-    pub fn new_std(base_url: &str) -> Self {
-        static TCP: std_transport::StdTcp = std_transport::StdTcp;
-        static DNS: std_transport::StdDns = std_transport::StdDns;
-        Self::new(base_url, &TCP, &DNS)
-    }
-}
-
 // --- Error helpers ---
 
 fn conn_err(e: impl fmt::Display) -> BackendError {
@@ -83,12 +72,11 @@ fn api_err(status: u16, body: &[u8]) -> BackendError {
     }
 }
 
-// --- Helper: send + check status + return body ---
+// --- Helper: send + check status + return body (blocking within the async fn) ---
 
 impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + 'static>
     OpenCodeBackend<T, D>
 {
-    /// Send a request with optional JSON body, check status, return owned body bytes.
     async fn send_get_body(
         &mut self,
         method: Method,
@@ -119,6 +107,49 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             Ok(body.to_vec())
         }
     }
+}
+
+// --- Non-blocking HTTP POST for streaming endpoints (allocates own buffer) ---
+
+/// POST JSON to the given URL and return the response body.
+/// Allocates its own rx buffer so it can be used in a boxed future without `&mut` access.
+async fn http_post_json<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + 'static>(
+    transport: &'static T,
+    dns: &'static D,
+    url: &str,
+    json: &[u8],
+) -> Result<Vec<u8>> {
+    let mut rx_buf = alloc::vec![0u8; RX_BUF_SIZE];
+    let mut client = HttpClient::new(transport, dns);
+    let handle = client.request(Method::POST, url).await.map_err(conn_err)?;
+    let mut handle = handle.body(json).content_type(ContentType::ApplicationJson);
+    let response = handle.send(&mut rx_buf).await.map_err(conn_err)?;
+    if !response.status.is_successful() {
+        let status = response.status.0;
+        let b = response.body().read_to_end().await.map_err(conn_err)?;
+        return Err(api_err(status, b));
+    }
+    let body = response.body().read_to_end().await.map_err(conn_err)?;
+    Ok(body.to_vec())
+}
+
+/// GET the given URL and return the response body (non-blocking, own buffer).
+async fn http_get<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + 'static>(
+    transport: &'static T,
+    dns: &'static D,
+    url: &str,
+) -> Result<Vec<u8>> {
+    let mut rx_buf = alloc::vec![0u8; RX_BUF_SIZE];
+    let mut client = HttpClient::new(transport, dns);
+    let mut handle = client.request(Method::GET, url).await.map_err(conn_err)?;
+    let response = handle.send(&mut rx_buf).await.map_err(conn_err)?;
+    if !response.status.is_successful() {
+        let status = response.status.0;
+        let b = response.body().read_to_end().await.map_err(conn_err)?;
+        return Err(api_err(status, b));
+    }
+    let body = response.body().read_to_end().await.map_err(conn_err)?;
+    Ok(body.to_vec())
 }
 
 // --- Backend trait implementation ---
@@ -220,11 +251,19 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             agent,
         };
         let json = serde_json::to_string(&prompt_body).map_err(parse_err)?;
-        let raw = self
-            .send_get_body(Method::POST, &url, Some(json.as_bytes()))
-            .await?;
-        let events = BufferedStream::parse_sse(&raw);
-        Ok(BufferedStream::new(events))
+        let transport = self.transport;
+        let dns = self.dns;
+        let json2 = json.as_bytes().to_vec();
+        let url2 = url;
+        let fut: Pin<Box<dyn Future<Output = Vec<Result<BackendEvent>>>>> = Box::pin(async move {
+            // Fire-and-forget: the actual response arrives via the SSE event stream
+            // as message.part.updated / message.part.delta / message.updated events.
+            if let Err(e) = http_post_json(transport, dns, &url2, &json2).await {
+                return vec![Err(e)];
+            }
+            vec![]
+        });
+        Ok(BufferedStream::from_pending(fut))
     }
 
     async fn command(
@@ -240,11 +279,17 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             agent,
         };
         let json = serde_json::to_string(&cmd_body).map_err(parse_err)?;
-        let raw = self
-            .send_get_body(Method::POST, &url, Some(json.as_bytes()))
-            .await?;
-        let events = BufferedStream::parse_sse(&raw);
-        Ok(BufferedStream::new(events))
+        let transport = self.transport;
+        let dns = self.dns;
+        let json2 = json.as_bytes().to_vec();
+        let url2 = url;
+        let fut: Pin<Box<dyn Future<Output = Vec<Result<BackendEvent>>>>> = Box::pin(async move {
+            if let Err(e) = http_post_json(transport, dns, &url2, &json2).await {
+                return vec![Err(e)];
+            }
+            vec![]
+        });
+        Ok(BufferedStream::from_pending(fut))
     }
 
     async fn list_agents(&mut self) -> Result<Vec<Agent>> {
@@ -271,16 +316,16 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
     async fn subscribe(&mut self) -> Result<Self::EventStream> {
         let url = alloc::format!("{}/global/event", self.base_url);
-        #[cfg(not(feature = "std"))]
-        {
-            let raw = self.send_get_body(Method::GET, &url, None).await?;
-            let events = BufferedStream::parse_sse(&raw);
-            return Ok(BufferedStream::new(events));
-        }
-        #[cfg(feature = "std")]
-        {
-            return crate::TcpSseStream::connect(&url).await;
-        }
+        let transport = self.transport;
+        let dns = self.dns;
+        let url2 = url;
+        let fut: Pin<Box<dyn Future<Output = Vec<Result<BackendEvent>>>>> = Box::pin(async move {
+            match http_get(transport, dns, &url2).await {
+                Ok(raw) => BufferedStream::parse_sse(&raw),
+                Err(e) => vec![Err(e)],
+            }
+        });
+        Ok(BufferedStream::from_pending(fut))
     }
 
     async fn get_config(&mut self) -> Result<Config> {
@@ -303,16 +348,16 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
     async fn sync_events(&mut self) -> Result<Self::EventStream> {
         let url = alloc::format!("{}/global/sync-event", self.base_url);
-        #[cfg(not(feature = "std"))]
-        {
-            let raw = self.send_get_body(Method::GET, &url, None).await?;
-            let events = BufferedStream::parse_sse(&raw);
-            return Ok(BufferedStream::new(events));
-        }
-        #[cfg(feature = "std")]
-        {
-            return crate::TcpSseStream::connect(&url).await;
-        }
+        let transport = self.transport;
+        let dns = self.dns;
+        let url2 = url;
+        let fut: Pin<Box<dyn Future<Output = Vec<Result<BackendEvent>>>>> = Box::pin(async move {
+            match http_get(transport, dns, &url2).await {
+                Ok(raw) => BufferedStream::parse_sse(&raw),
+                Err(e) => vec![Err(e)],
+            }
+        });
+        Ok(BufferedStream::from_pending(fut))
     }
 
     async fn set_config(&mut self, config: &Config) -> Result<Config> {

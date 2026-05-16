@@ -1,4 +1,5 @@
 use core::convert::Infallible;
+use core::net::IpAddr;
 
 use clap::Parser;
 use crossterm::cursor::{Hide, Show};
@@ -6,8 +7,10 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, size,
 };
 use crossterm::{execute, queue};
+use embedded_io_async::{ErrorType, Read};
+use embedded_nal_async::{AddrType, Dns, TcpConnect};
 use opencode_backend::BackendEvent;
-use opencode_backend_opencode::OpenCodeBackend;
+use opencode_backend_opencode::{OpenCodeBackend, SseParser};
 use opencode_tui::Event;
 use opencode_tui::{App, KeyEvent, Modifiers, Scancode};
 use ratatui_core::backend::Backend;
@@ -15,8 +18,90 @@ use ratatui_core::buffer::Cell;
 use ratatui_core::layout::{Position, Size};
 use ratatui_core::terminal::Terminal;
 use std::io::{stdout, Write};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
+
+/// A TCP transport over tokio `TcpStream`.
+struct StdTcp;
+
+impl TcpConnect for StdTcp {
+    type Error = std::io::Error;
+    type Connection<'a> = StdTcpStream;
+
+    async fn connect<'a>(
+        &'a self,
+        remote: core::net::SocketAddr,
+    ) -> Result<Self::Connection<'a>, Self::Error> {
+        let stream = tokio::net::TcpStream::connect(remote).await?;
+        Ok(StdTcpStream(stream))
+    }
+}
+
+/// A DNS resolver over tokio.
+struct StdDns;
+
+impl Dns for StdDns {
+    type Error = std::io::Error;
+
+    async fn get_host_by_name(
+        &self,
+        host: &str,
+        addr_type: AddrType,
+    ) -> Result<IpAddr, Self::Error> {
+        let addrs = tokio::net::lookup_host((host, 0)).await?;
+        let addrs: Vec<std::net::SocketAddr> = addrs.collect();
+        let addr = match addr_type {
+            AddrType::IPv4 => addrs.iter().find(|a| a.is_ipv4()),
+            AddrType::IPv6 => addrs.iter().find(|a| a.is_ipv6()),
+            AddrType::Either => addrs
+                .iter()
+                .find(|a| a.is_ipv4())
+                .or_else(|| addrs.iter().find(|a| a.is_ipv6())),
+        };
+        match addr {
+            Some(a) => Ok(a.ip()),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no address found for host",
+            )),
+        }
+    }
+
+    async fn get_host_by_address(
+        &self,
+        _addr: IpAddr,
+        _result: &mut [u8],
+    ) -> Result<usize, Self::Error> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "reverse DNS not supported",
+        ))
+    }
+}
+
+/// Wraps a tokio `TcpStream` to implement `embedded-io-async` traits.
+struct StdTcpStream(tokio::net::TcpStream);
+
+impl ErrorType for StdTcpStream {
+    type Error = std::io::Error;
+}
+
+impl Read for StdTcpStream {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        self.0.read(buf).await
+    }
+}
+
+impl embedded_io_async::Write for StdTcpStream {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        self.0.write(buf).await
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        self.0.flush().await
+    }
+}
 
 struct CrosstermBackend;
 
@@ -158,10 +243,138 @@ struct Cli {
     url: String,
 }
 
+// --- Persistent SSE background task ---
+
+/// Background task that maintains a persistent SSE connection to /global/event.
+/// Reconnects automatically with Last-Event-ID tracking.
+async fn sse_background_task(
+    base_url: String,
+    event_tx: mpsc::UnboundedSender<Option<Event>>,
+) {
+    static TCP: StdTcp = StdTcp;
+    static DNS: StdDns = StdDns;
+
+    let mut parser = SseParser::new();
+
+    loop {
+        if let Err(e) = connect_and_read_sse(&base_url, &TCP, &DNS, &mut parser, &event_tx).await {
+            let _ = event_tx.send(Some(Event::Backend(BackendEvent::Error {
+                message: format!("SSE: {e}"),
+            })));
+        }
+
+        tokio::time::sleep(Duration::from_millis(parser.retry_ms())).await;
+    }
+}
+
+/// Connect to /global/event, send HTTP request, read SSE events in a loop.
+async fn connect_and_read_sse(
+    base_url: &str,
+    _tcp: &'static StdTcp,
+    dns: &'static StdDns,
+    parser: &mut SseParser,
+    event_tx: &mpsc::UnboundedSender<Option<Event>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let url = format!("{}/global/event", base_url.trim_end_matches('/'));
+    let (host, port, path) = parse_http_url(&url)?;
+
+    let addr = dns.get_host_by_name(&host, AddrType::Either).await?;
+    let socket_addr = std::net::SocketAddr::new(addr, port);
+    let mut stream = tokio::net::TcpStream::connect(socket_addr).await?;
+
+    let mut request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n",
+        path, host,
+    );
+    let last_id = parser.last_event_id();
+    if !last_id.is_empty() {
+        request.push_str(&format!("Last-Event-ID: {}\r\n", last_id));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await?;
+
+    let mut buf = vec![0u8; 8192];
+    let mut pos = 0;
+
+    loop {
+        let n = stream.read(&mut buf[pos..]).await?;
+        if n == 0 {
+            return Err("connection closed during headers".into());
+        }
+        pos += n;
+        if let Some(header_end) = buf[..pos].windows(4).position(|w| w == b"\r\n\r\n") {
+            let status_end = buf[..pos]
+                .iter()
+                .position(|&b| b == b'\r')
+                .unwrap_or(pos);
+            let status_line =
+                core::str::from_utf8(&buf[..status_end]).map_err(|_| "invalid utf-8")?;
+            if !status_line.contains("200") {
+                return Err(format!("non-200 response: {status_line}").into());
+            }
+
+            let body_start = header_end + 4;
+            if body_start < pos {
+                send_events(parser.feed(&buf[body_start..pos]), event_tx);
+            }
+            break;
+        }
+        if pos >= buf.len() {
+            buf.resize(buf.len() * 2, 0);
+        }
+    }
+
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        send_events(parser.feed(&buf[..n]), event_tx);
+    }
+}
+
+fn send_events(
+    events: Vec<core::result::Result<opencode_backend::BackendEvent, opencode_backend::BackendError>>,
+    event_tx: &mpsc::UnboundedSender<Option<Event>>,
+) {
+    for event in events {
+        match event {
+            Ok(be) => {
+                let _ = event_tx.send(Some(Event::Backend(be)));
+            }
+            Err(e) => {
+                let _ = event_tx.send(Some(Event::Backend(BackendEvent::Error {
+                    message: format!("SSE parse: {e}"),
+                })));
+            }
+        }
+    }
+}
+
+fn parse_http_url(url: &str) -> core::result::Result<(String, u16, String), Box<dyn std::error::Error>> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let (host_part, path) = match rest.split_once('/') {
+        Some((h, p)) => (h, format!("/{}", p)),
+        None => (rest, String::new()),
+    };
+    let (host, port) = match host_part.split_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(80)),
+        None => (host_part.to_string(), 80u16),
+    };
+    Ok((host, port, path))
+}
+
 #[tokio::main]
 async fn main() {
      let cli = Cli::parse();
-     let backend = OpenCodeBackend::new_std(&cli.url);
+     static TCP: StdTcp = StdTcp;
+     static DNS: StdDns = StdDns;
+     let backend = OpenCodeBackend::new(&cli.url, &TCP, &DNS);
      let mut app = App::new(backend);
 
     app.init().await;
@@ -173,6 +386,12 @@ async fn main() {
     let mut terminal = Terminal::new(crossterm_backend).unwrap();
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Option<Event>>();
+
+    let sse_event_tx = event_tx.clone();
+    let sse_url = cli.url.clone();
+    tokio::spawn(async move {
+        sse_background_task(sse_url, sse_event_tx).await;
+    });
 
     tokio::spawn(async move {
         loop {

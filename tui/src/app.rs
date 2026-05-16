@@ -121,6 +121,8 @@ pub struct App<B: Backend> {
     error: Option<String>,
     is_streaming: bool,
     partial_parts: Vec<opencode_backend::Part>,
+    /// Accumulated delta text per part_id for real-time streaming.
+    partial_texts: alloc::collections::BTreeMap<String, String>,
     messages: Vec<LoadedMessage>,
     stream: Option<B::PromptStream>,
     sync_stream: Option<B::EventStream>,
@@ -164,6 +166,7 @@ impl<B: Backend> App<B> {
             error: None,
             is_streaming: false,
             partial_parts: Vec::new(),
+            partial_texts: alloc::collections::BTreeMap::new(),
             messages: Vec::new(),
             stream: None,
             active_modal: None,
@@ -238,6 +241,7 @@ impl<B: Backend> App<B> {
                 Some(result) => return Some(result),
                 None => {
                     self.stream = None;
+                    self.is_streaming = false;
                 }
             }
         }
@@ -403,12 +407,15 @@ impl<B: Backend> App<B> {
                         }
                         self.is_streaming = false;
                         self.stream = None;
+                        self.partial_texts.clear();
+                        self.partial_texts.clear();
                     }
                     opencode_backend::BackendEvent::Error { message } => {
                         self.error = Some(message);
                         self.partial_parts.clear();
                         self.is_streaming = false;
                         self.stream = None;
+                        self.partial_texts.clear();
                     }
                     opencode_backend::BackendEvent::SessionCreated { session } => {
                         self.active_session = Some(session);
@@ -434,8 +441,45 @@ impl<B: Backend> App<B> {
                     }
                     opencode_backend::BackendEvent::SessionDiff { .. } => {}
                     opencode_backend::BackendEvent::SessionCompacted { .. } => {}
-                    opencode_backend::BackendEvent::MessageUpdated { .. } => {}
+                    opencode_backend::BackendEvent::MessageUpdated { session_id, .. } => {
+                        // message.updated signals end of an assistant response — equivalent to Done
+                        if self.is_streaming {
+                            let parts = core::mem::take(&mut self.partial_parts);
+                            if !parts.is_empty() {
+                                self.messages.push(LoadedMessage {
+                                    role: opencode_backend::MessageRole::Assistant,
+                                    parts,
+                                });
+                            }
+                            self.is_streaming = false;
+                            self.stream = None;
+                            self.partial_texts.clear();
+                        }
+                    }
                     opencode_backend::BackendEvent::MessageRemoved { .. } => {}
+                    opencode_backend::BackendEvent::MessagePartUpdated { ref part, .. } => {
+                        if self.is_streaming {
+                            self.partial_parts.push(part.clone());
+                        }
+                    }
+                    opencode_backend::BackendEvent::MessagePartDelta { part_id, field, delta, .. } if field == "text" && self.is_streaming => {
+                        let acc = self.partial_texts.entry(part_id).or_default();
+                        acc.push_str(&delta);
+                        let new_part = opencode_backend::Part::Text(opencode_backend::TextPart {
+                            text: acc.clone(),
+                        });
+                        let replaced = self.partial_parts.iter_mut().rev().find_map(|p| {
+                            if matches!(p, opencode_backend::Part::Text(_)) {
+                                *p = new_part.clone();
+                                Some(())
+                            } else {
+                                None
+                            }
+                        });
+                        if replaced.is_none() {
+                            self.partial_parts.push(new_part);
+                        }
+                    }
                     opencode_backend::BackendEvent::MessagePartDelta { .. } => {}
                     opencode_backend::BackendEvent::MessagePartRemoved { .. } => {}
                     opencode_backend::BackendEvent::PermissionAsked { request } => {
@@ -670,10 +714,13 @@ impl<B: Backend> App<B> {
 
         let agent = self.active_agent_name().to_string();
         match self.backend.prompt(&session_id, &text, Some(&agent)).await {
-            Ok(stream) => {
-                self.stream = Some(stream);
+            Ok(_stream) => {
+                // Fire-and-forget: the POST triggers the AI, response arrives via SSE event stream.
+                // Don't set self.stream — we stay in streaming mode and collect parts from
+                // MessagePartUpdated / MessagePartDelta / MessageUpdated events on the sync stream.
                 self.is_streaming = true;
                 self.partial_parts = Vec::new();
+                self.partial_texts.clear();
             }
             Err(e) => {
                 self.error = Some(alloc::format!("{}", e));
@@ -795,10 +842,10 @@ impl<B: Backend> App<B> {
 
         let agent = self.active_agent_name().to_string();
         match self.backend.prompt(&session_id, text, Some(&agent)).await {
-            Ok(stream) => {
-                self.stream = Some(stream);
+            Ok(_stream) => {
                 self.is_streaming = true;
                 self.partial_parts = Vec::new();
+                self.partial_texts.clear();
             }
             Err(e) => {
                 self.error = Some(alloc::format!("{}", e));
@@ -815,6 +862,7 @@ impl<B: Backend> App<B> {
         self.stream = None;
         self.is_streaming = false;
         self.partial_parts.clear();
+        self.partial_texts.clear();
         true
     }
 

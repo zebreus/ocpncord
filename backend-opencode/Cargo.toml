@@ -12,20 +12,13 @@ serde.workspace = true
 serde_json.workspace = true
 reqwless = { version = "0.14", default-features = false }
 embedded-io-async = "0.7"
+embedded-nal-async = "0.9"
 
-[dependencies.tokio]
-version = "1"
-features = ["net", "io-util"]
-optional = true
-
-[dependencies.embedded-nal-async]
-version = "0.9"
-optional = true
-
-[features]
-std = ["dep:tokio", "dep:embedded-nal-async", "embedded-io-async/std"]
-default = ["std"]
+[dev-dependencies]
+futures.workspace = true
+embedded-nal-async = "0.9"
+embedded-io-async = { version = "0.7", features = ["std"] }
 
 [dev-dependencies.tokio]
 version = "1"
-features = ["macros", "rt-multi-thread"]
+features = ["macros", "rt-multi-thread", "time", "net", "io-util"]
