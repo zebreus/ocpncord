@@ -340,6 +340,10 @@ impl<B: Backend> App<B> {
         &self.messages
     }
 
+    pub fn tick(&self) -> u64 {
+        self.tick
+    }
+
     /// Returns `false` when the application should quit.
     pub async fn handle_event(&mut self, event: Event) -> bool {
         match event {

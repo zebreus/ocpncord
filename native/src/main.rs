@@ -452,6 +452,7 @@ async fn main() {
             }
         }
 
+        log(&format!("[RENDER] screen={:?} is_streaming={} partial_parts={} messages={} tick={}", app.active_screen(), app.is_streaming(), app.partial_parts().len(), app.messages().len(), app.tick()));
         let _ = terminal.draw(|frame| {
             app.render(frame);
         });
