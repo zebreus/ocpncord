@@ -412,7 +412,28 @@ impl<B: Backend> App<B> {
                         self.is_streaming = false;
                         self.stream = None;
                         self.partial_texts.clear();
-                        self.partial_texts.clear();
+
+                        // REST API fallback: fetch all messages to fill in any
+                        // that SSE events might have missed.
+                        if let Some(ref session) = self.active_session.clone() {
+                            let session_id = session.id.clone();
+                            if let Ok(summaries) = self.backend.list_messages(&session_id).await {
+                                let mut api_messages: Vec<LoadedMessage> = Vec::new();
+                                for summary in &summaries {
+                                    if let Ok(detail) = self.backend.get_message(&session_id, &summary.id).await {
+                                        api_messages.push(LoadedMessage {
+                                            role: detail.info.role,
+                                            parts: detail.parts,
+                                        });
+                                    }
+                                }
+                                if !api_messages.is_empty()
+                                    && api_messages.len() >= self.messages.len()
+                                {
+                                    self.messages = api_messages;
+                                }
+                            }
+                        }
                     }
                     opencode_backend::BackendEvent::Error { message } => {
                         self.error = Some(message);
@@ -462,15 +483,7 @@ impl<B: Backend> App<B> {
                     opencode_backend::BackendEvent::MessageRemoved { .. } => {}
                     opencode_backend::BackendEvent::MessagePartUpdated { ref part, .. } => {
                         if self.is_streaming {
-                            match part {
-                                opencode_backend::Part::StepStart(_) => {
-                                    self.partial_parts.push(part.clone());
-                                }
-                                _ if !self.partial_parts.is_empty() => {
-                                    self.partial_parts.push(part.clone());
-                                }
-                                _ => {}
-                            }
+                            self.partial_parts.push(part.clone());
                         }
                     }
                     opencode_backend::BackendEvent::MessagePartDelta { part_id, field, delta, .. } if field == "text" && self.is_streaming => {
@@ -724,13 +737,18 @@ impl<B: Backend> App<B> {
         self.active_screen = ScreenId::Chat;
 
         let agent = self.active_agent_name().to_string();
+
+        // Set streaming BEFORE the POST so SSE events received during the
+        // HTTP round-trip are not dropped (they arrive via the persistent
+        // /global/event connection and check is_streaming).
+        self.is_streaming = true;
+        self.partial_parts = Vec::new();
+        self.partial_texts.clear();
+
         match self.backend.prompt(&session_id, &text, Some(&agent)).await {
-            Ok(_stream) => {
-                self.is_streaming = true;
-                self.partial_parts = Vec::new();
-                self.partial_texts.clear();
-            }
+            Ok(_stream) => {}
             Err(e) => {
+                self.is_streaming = false;
                 self.error = Some(alloc::format!("{}", e));
             }
         }
@@ -849,13 +867,15 @@ impl<B: Backend> App<B> {
         self.active_screen = ScreenId::Chat;
 
         let agent = self.active_agent_name().to_string();
+
+        self.is_streaming = true;
+        self.partial_parts = Vec::new();
+        self.partial_texts.clear();
+
         match self.backend.prompt(&session_id, text, Some(&agent)).await {
-            Ok(_stream) => {
-                self.is_streaming = true;
-                self.partial_parts = Vec::new();
-                self.partial_texts.clear();
-            }
+            Ok(_stream) => {}
             Err(e) => {
+                self.is_streaming = false;
                 self.error = Some(alloc::format!("{}", e));
             }
         }
@@ -1779,6 +1799,130 @@ mod tests {
         run(&mut app, Event::Backend(opencode_backend::BackendEvent::Done));
         assert!(!app.is_streaming());
         assert_eq!(app.messages().len(), 2, "user msg + assistant msg");
+    }
+
+    /// Test that the real SSE event path (MessagePartUpdated + Done) works.
+    /// The SSE background task emits MessagePartUpdated (not Part), which
+    /// requires is_streaming to be true.
+    #[test]
+    fn sse_message_part_updated_accumulates_when_streaming() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        // Type and send a message to enter streaming mode
+        run(&mut app, char_key('h'));
+        run(&mut app, char_key('i'));
+        run(&mut app, enter_key());
+        assert!(app.is_streaming(), "should be streaming after send");
+
+        // Simulate SSE: MessagePartUpdated with a text part
+        run(
+            &mut app,
+            Event::Backend(opencode_backend::BackendEvent::MessagePartUpdated {
+                session_id: "ses1".into(),
+                part: opencode_backend::Part::Text(opencode_backend::TextPart {
+                    text: "Hello from assistant".into(),
+                }),
+            }),
+        );
+        assert_eq!(
+            app.partial_parts().len(),
+            1,
+            "MessagePartUpdated should push to partial_parts when streaming"
+        );
+
+        // Simulate SSE: Done
+        run(&mut app, Event::Backend(opencode_backend::BackendEvent::Done));
+        assert!(!app.is_streaming());
+        assert_eq!(app.messages().len(), 2, "user msg + assistant msg");
+        assert!(
+            matches!(app.messages()[1].role, opencode_backend::MessageRole::Assistant),
+            "second message should be from assistant"
+        );
+    }
+
+    /// Test that MessagePartDelta accumulates text during streaming.
+    #[test]
+    fn sse_message_part_delta_accumulates_text_when_streaming() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        // Send message to enter streaming mode
+        run(&mut app, char_key('h'));
+        run(&mut app, char_key('i'));
+        run(&mut app, enter_key());
+        assert!(app.is_streaming());
+
+        // Simulate SSE: MessagePartDelta with text chunks (no initial MessagePartUpdated)
+        run(
+            &mut app,
+            Event::Backend(opencode_backend::BackendEvent::MessagePartDelta {
+                session_id: "ses1".into(),
+                message_id: "msg1".into(),
+                part_id: "prt1".into(),
+                field: "text".into(),
+                delta: "Hello ".into(),
+            }),
+        );
+        assert_eq!(
+            app.partial_parts().len(),
+            1,
+            "first delta should create a text part"
+        );
+
+        run(
+            &mut app,
+            Event::Backend(opencode_backend::BackendEvent::MessagePartDelta {
+                session_id: "ses1".into(),
+                message_id: "msg1".into(),
+                part_id: "prt1".into(),
+                field: "text".into(),
+                delta: "world".into(),
+            }),
+        );
+        assert_eq!(
+            app.partial_parts().len(),
+            1,
+            "second delta should update existing text part, not add a new one"
+        );
+
+        // Verify the accumulated text
+        match &app.partial_parts()[0] {
+            opencode_backend::Part::Text(tp) => {
+                assert_eq!(tp.text, "Hello world");
+            }
+            _ => panic!("expected text part"),
+        }
+
+        // Finalize
+        run(&mut app, Event::Backend(opencode_backend::BackendEvent::Done));
+        assert!(!app.is_streaming());
+        assert_eq!(app.messages().len(), 2);
+    }
+
+    /// Test that MessagePartUpdated is IGNORED when NOT streaming.
+    #[test]
+    fn sse_message_part_updated_ignored_when_not_streaming() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        // NOT streaming — just sitting on the start page
+        assert!(!app.is_streaming());
+
+        run(
+            &mut app,
+            Event::Backend(opencode_backend::BackendEvent::MessagePartUpdated {
+                session_id: "ses1".into(),
+                part: opencode_backend::Part::Text(opencode_backend::TextPart {
+                    text: "Stale event".into(),
+                }),
+            }),
+        );
+        assert_eq!(
+            app.partial_parts().len(),
+            0,
+            "parts should NOT accumulate when not streaming"
+        );
     }
 
     #[test]

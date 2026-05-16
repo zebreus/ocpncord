@@ -442,6 +442,9 @@ async fn main() {
             maybe_event = event_rx.recv() => {
                 if let Some(Some(ref event)) = maybe_event {
                     log(&format!("[DEBUG] event: {event:?}"));
+                    if matches!(event, Event::Backend(BackendEvent::Done)) {
+                        log(&format!("[DEBUG] Done received — is_streaming={} partial_parts={} messages={}", app.is_streaming(), app.partial_parts().len(), app.messages().len()));
+                    }
                 }
                 if let Some(Some(event)) = maybe_event {
                     running = app.handle_event(event).await;

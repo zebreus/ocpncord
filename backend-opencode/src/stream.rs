@@ -205,9 +205,21 @@ fn parse_json<'a, T: Deserialize<'a>>(data: &'a str) -> core::result::Result<T, 
 
 /// Parse a single SSE block into a `BackendEvent`.
 ///
-/// The SSE `data:` field contains a JSON envelope:
+/// The SSE `data:` field can contain one of three formats:
+///
+/// **Bus event (GlobalEvent) format** — emitted by `BusEvent`s (e.g. `message.part.delta`):
 /// ```json
-/// {"directory": "/path", "payload": {"type": "message.part.updated", "properties": {...}}}
+/// {"directory": "/path", "payload": {"type": "message.part.delta", "properties": {...}}}
+/// ```
+///
+/// **Sync event format** — emitted by `SyncEvent`s (e.g. `message.part.updated`, `session.created`):
+/// ```json
+/// {"directory": "/path", "payload": {"type": "sync", "syncEvent": {"type": "message.part.updated.1", "data": {...}}}}
+/// ```
+///
+/// **Flat (Event) format** — used in `sync_events` HTTP responses:
+/// ```json
+/// {"type": "message.part.updated", "properties": {...}}
 /// ```
 fn parse_sse_block(block: &[u8]) -> Option<Result<BackendEvent>> {
     let text = core::str::from_utf8(block).ok()?;
@@ -224,15 +236,31 @@ fn parse_sse_block(block: &[u8]) -> Option<Result<BackendEvent>> {
         return None;
     }
 
-    // Parse the outer envelope: {"directory": "...", "payload": {"type": "...", "properties": {...}}}
     let value: serde_json::Value = parse_json::<serde_json::Value>(data).ok()?;
-    let payload = value.get("payload")?;
+
+    // Try nested GlobalEvent format first; fall back to flat Event format.
+    let payload = value.get("payload").unwrap_or(&value);
     let event_type = payload.get("type").and_then(|v| v.as_str())?;
-    let props = payload.get("properties")?;
+
+    // SyncEvents arrive wrapped: { type: "sync", syncEvent: { type: "event.type.version", data: {...} } }
+    // Unwrap to the inner event type and use `syncEvent.data` as properties.
+    let (event_type, props) = if event_type == "sync" {
+        let sync_event = payload.get("syncEvent")?;
+        let inner_type = sync_event.get("type").and_then(|v| v.as_str())?;
+        // Strip the version suffix (e.g. "message.part.updated.1" → "message.part.updated")
+        let inner_type = inner_type
+            .rsplit_once('.')
+            .map_or(inner_type, |(base, _)| base);
+        let inner_data = sync_event.get("data")?;
+        (inner_type, inner_data)
+    } else {
+        let props = payload.get("properties")?;
+        (event_type, props)
+    };
 
     match event_type {
         "message.part.updated" => parse_part_updated_value(props),
-        "message.updated" => Some(Ok(BackendEvent::Done)),
+        "message.updated" => parse_message_updated_value(props),
         "session.idle" => {
             let session_id = props.get("sessionID").and_then(|v| v.as_str())?;
             Some(Ok(BackendEvent::SessionIdle {
@@ -600,12 +628,44 @@ fn parse_sync_session_event(
     }
 }
 
+/// Parse a `message.updated` event into the appropriate `BackendEvent`.
+///
+/// Only assistant messages produce `BackendEvent::Done` (which finalizes the
+/// streaming response).  The server emits `message.updated` for **every**
+/// message — including the user's.  The user's `message.updated` arrives
+/// *before* the assistant even starts processing, so treating it as `Done`
+/// would prematurely reset `is_streaming` and cause all subsequent assistant
+/// parts to be silently dropped.
+fn parse_message_updated_value(props: &serde_json::Value) -> Option<Result<BackendEvent>> {
+    let info = props.get("info")?;
+    let role = info.get("role").and_then(|v| v.as_str()).unwrap_or("");
+
+    if role == "assistant" {
+        // Assistant message finalized — this is the real "done" signal.
+        Some(Ok(BackendEvent::Done))
+    } else {
+        // User or unknown message — ignore. Do NOT emit Done.
+        None
+    }
+}
+
 /// Parse a `message.part.updated` event data JSON into a `BackendEvent::Part`.
+///
+/// The `sessionID` may be at `properties.sessionID` (sync format) or
+/// inside the `part` object at `properties.part.sessionID` (live SSE format).
 fn parse_part_updated_value(props: &serde_json::Value) -> Option<Result<BackendEvent>> {
-    let session_id = props.get("sessionID").and_then(|v| v.as_str())?;
     let part = props
         .get("part")
         .and_then(|v| serde_json::from_value(v.clone()).ok())?;
+    let session_id = props
+        .get("sessionID")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            props
+                .get("part")
+                .and_then(|p| p.get("sessionID"))
+                .and_then(|v| v.as_str())
+        })?;
     Some(Ok(BackendEvent::MessagePartUpdated {
         session_id: session_id.to_owned(),
         part,
@@ -652,12 +712,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_done_event() {
+    fn parse_done_event_for_assistant_message() {
         let data = wrap_sse_data("message.updated", "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"summary\":null,\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}");
         let sse = format!("event: message.updated\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], Ok(BackendEvent::Done)));
+    }
+
+    /// User message.updated MUST NOT produce Done — it arrives before the
+    /// assistant even starts, and emitting Done would reset is_streaming.
+    #[test]
+    fn parse_user_message_updated_does_not_produce_done() {
+        let data = wrap_sse_data("message.updated", "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"user\",\"time\":{\"created\":0},\"agent\":\"build\",\"model\":{\"providerID\":\"anthropic\",\"modelID\":\"claude-sonnet\"}}}");
+        let sse = format!("event: message.updated\ndata: {data}\n\n");
+        let events = BufferedStream::parse_sse(sse.as_bytes());
+        assert_eq!(
+            events.len(),
+            0,
+            "user message.updated should NOT produce any event"
+        );
     }
 
     #[test]
@@ -932,5 +1006,127 @@ mod tests {
     fn parse_no_events_for_empty_body() {
         let events = BufferedStream::parse_sse(b"");
         assert!(events.is_empty());
+    }
+
+    // --- SyncEvent format tests ---
+    // SyncEvents arrive wrapped: { type: "sync", syncEvent: { type: "event.type.version", data: {...} } }
+
+    /// Helper to wrap event data in the SyncEvent envelope (as sent by the real server).
+    fn wrap_sync_event(event_type: &str, version: u32, data_json: &str) -> String {
+        format!(
+            "{{\"directory\":\"/tmp\",\"payload\":{{\"type\":\"sync\",\"syncEvent\":{{\"type\":\"{event_type}.{version}\",\"id\":\"evt_test\",\"seq\":0,\"aggregateID\":\"ses1\",\"data\":{data_json}}}}}}}"
+        )
+    }
+
+    #[test]
+    fn parse_sync_message_part_updated_text() {
+        let data = wrap_sync_event(
+            "message.part.updated",
+            1,
+            "{\"sessionID\":\"ses1\",\"part\":{\"id\":\"prt1\",\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"type\":\"text\",\"text\":\"Hello from sync\"},\"time\":0}",
+        );
+        let sse = format!("event: message\ndata: {data}\n\n");
+        let events = BufferedStream::parse_sse(sse.as_bytes());
+        assert_eq!(events.len(), 1, "sync event should be parsed");
+        match &events[0] {
+            Ok(BackendEvent::MessagePartUpdated { session_id, part }) => {
+                assert_eq!(session_id, "ses1");
+                assert!(matches!(part, opencode_backend::Part::Text(_)));
+            }
+            other => panic!("expected MessagePartUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sync_message_updated_as_done() {
+        let data = wrap_sync_event(
+            "message.updated",
+            1,
+            "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"summary\":null,\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}",
+        );
+        let sse = format!("event: message\ndata: {data}\n\n");
+        let events = BufferedStream::parse_sse(sse.as_bytes());
+        assert_eq!(
+            events.len(),
+            1,
+            "sync message.updated should be parsed as Done"
+        );
+        assert!(matches!(events[0], Ok(BackendEvent::Done)));
+    }
+
+    #[test]
+    fn parse_sync_session_created() {
+        let data = wrap_sync_event(
+            "session.created",
+            1,
+            "{\"sessionID\":\"ses123\",\"info\":{\"id\":\"ses123\",\"title\":\"Test\",\"projectID\":\"proj1\",\"directory\":\"/tmp\",\"slug\":\"\",\"version\":\"1\",\"time\":{\"created\":0,\"updated\":0}}}",
+        );
+        let sse = format!("event: message\ndata: {data}\n\n");
+        let events = BufferedStream::parse_sse(sse.as_bytes());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Ok(BackendEvent::SessionCreated { session }) => {
+                assert_eq!(session.id, "ses123");
+            }
+            other => panic!("expected SessionCreated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sync_message_part_removed() {
+        let data = wrap_sync_event(
+            "message.part.removed",
+            1,
+            "{\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"partID\":\"prt1\"}",
+        );
+        let sse = format!("event: message\ndata: {data}\n\n");
+        let events = BufferedStream::parse_sse(sse.as_bytes());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Ok(BackendEvent::MessagePartRemoved {
+                session_id,
+                message_id,
+                part_id,
+            }) => {
+                assert_eq!(session_id, "ses1");
+                assert_eq!(message_id, "msg1");
+                assert_eq!(part_id, "prt1");
+            }
+            other => panic!("expected MessagePartRemoved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sync_and_bus_events_interleaved() {
+        // Real server sends sync events for SyncEvents and bus events for BusEvents.
+        // Both should parse correctly.
+        let sync = wrap_sync_event(
+            "message.part.updated",
+            1,
+            "{\"sessionID\":\"ses1\",\"part\":{\"id\":\"prt1\",\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"type\":\"text\",\"text\":\"One\"},\"time\":0}",
+        );
+        let bus = wrap_sse_data(
+            "message.part.delta",
+            "{\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"partID\":\"prt1\",\"field\":\"text\",\"delta\":\" world\"}",
+        );
+        let done = wrap_sync_event(
+            "message.updated",
+            1,
+            "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"summary\":null,\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}",
+        );
+        let sse = format!(
+            "event: message\ndata: {sync}\n\nevent: message\ndata: {bus}\n\nevent: message\ndata: {done}\n\n"
+        );
+        let events = BufferedStream::parse_sse(sse.as_bytes());
+        assert_eq!(events.len(), 3, "all three events should parse");
+        assert!(matches!(
+            events[0],
+            Ok(BackendEvent::MessagePartUpdated { .. })
+        ));
+        assert!(matches!(
+            events[1],
+            Ok(BackendEvent::MessagePartDelta { .. })
+        ));
+        assert!(matches!(events[2], Ok(BackendEvent::Done)));
     }
 }
