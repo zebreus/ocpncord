@@ -377,8 +377,11 @@ impl<B: Backend> App<B> {
                     return true;
                 }
 
-                if self.is_streaming {
+if self.is_streaming {
                     if key.scancode == Scancode::Escape {
+                        return self.handle_interrupt().await;
+                    }
+                    if key.scancode == Scancode::Char('c') && key.modifiers.ctrl {
                         return self.handle_interrupt().await;
                     }
                     return true;
@@ -482,7 +485,7 @@ impl<B: Backend> App<B> {
                     ocpncord_backend::BackendEvent::SessionDiff { .. } => {}
                     ocpncord_backend::BackendEvent::SessionCompacted { .. } => {}
                     ocpncord_backend::BackendEvent::MessageUpdated { .. } => {
-                        if self.is_streaming {
+                if self.is_streaming {
                             let parts = core::mem::take(&mut self.partial_parts);
                             if !parts.is_empty() {
                                 self.messages.push(LoadedMessage {
@@ -2550,5 +2553,29 @@ mod tests {
         // Left side (chat area) should have content
         let has_prompt = buf.content().iter().any(|c| c.symbol() == ">");
         assert!(has_prompt, "start page prompt should be visible");
+    }
+
+    #[test]
+    fn ctrl_c_during_streaming_interrupts_not_quits() {
+        let mut backend = MockBackend::default();
+        backend.prompt_events = vec![
+            Ok(ocpncord_backend::BackendEvent::Part {
+                part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                    text: "streaming".into(),
+                }),
+                delta: None,
+            }),
+            Ok(ocpncord_backend::BackendEvent::Done),
+        ];
+        let mut app = App::new(backend);
+        futures::executor::block_on(app.init());
+
+        run(&mut app, char_key('h'));
+        run(&mut app, enter_key());
+        assert!(app.is_streaming(), "should be streaming after send");
+
+        let running = run(&mut app, ctrl('c'));
+        assert!(running, "ctrl+c during streaming should interrupt, not quit");
+        assert!(!app.is_streaming(), "streaming should be stopped");
     }
 }
