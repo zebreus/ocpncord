@@ -1,5 +1,5 @@
 ---
-name: test-ocpncord-tui
+name: ocpncord-tui
 description: Python toolkit for LLM agents to start, stop, inspect, and interact with the Rust TUI application running in tmux. Covers lifecycle management, keystroke injection, screenshot capture, and log retrieval.
 ---
 
@@ -11,16 +11,16 @@ A collection of seven Python scripts that let LLM agents drive the `ocpncord-nat
 
 | Script | Description | CLI usage | Prints on success | Prints on failure |
 |---|---|---|---|---|
-| `test-ocpncord-tui-start.py` | Create tmux session, start OpenCode server, then start TUI | `./test-ocpncord-tui-start.py` | `TUI started (PID 12345), OpenCode server started at http://localhost:7774` | `ERROR: ...` (non-zero exit) |
-| `test-ocpncord-tui-stop.py` | Kill both processes, kill tmux session, remove all temp files | `./test-ocpncord-tui-stop.py` | `Stopped` | `ERROR: ...` (non-zero exit) |
-| `test-ocpncord-tui-status.py` | Check tmux session, TUI PID, and OpenCode HTTP endpoint | `./test-ocpncord-tui-status.py` | `TUI: RUNNING` / `OPENCODE: RUNNING` | Always exits 0 |
-| `test-ocpncord-tui-screenshot.py` | Capture tmux pane content as screenshot | `./test-ocpncord-tui-screenshot.py` | (pane text content) | `ERROR: ...` (non-zero exit) |
-| `test-ocpncord-tui-input.py` | Send keystrokes to the TUI via tmux send-keys | `./test-ocpncord-tui-input.py --keys "hello<Enter>"` | `Sent: hello<Enter>` | `ERROR: ...` (non-zero exit) |
-| `test-ocpncord-tui-input.py` (tests) | Run parser unit tests | `./test-ocpncord-tui-input.py --test` | `OK` (55 tests) | `FAILED` |
-| `test-ocpncord-tui-logs-opencode.py` | Print `/tmp/opencode.log` to stdout | `./test-ocpncord-tui-logs-opencode.py` | (file contents) | `ERROR: log file not found at /tmp/opencode.log` (non-zero exit) |
-| `test-ocpncord-tui-logs-tui.py` | Print `/tmp/ocpncord.log` (TUI debug log) to stdout | `./test-ocpncord-tui-logs-tui.py` | (file contents) | `ERROR: log file not found at /tmp/ocpncord.log` (non-zero exit) |
+| `ocpncord-tui-start.py` | Create tmux session, start OpenCode server, then start TUI | `./ocpncord-tui-start.py` | `TUI started (PID 12345), OpenCode server started at http://localhost:7774` | `ERROR: ...` (non-zero exit) |
+| `ocpncord-tui-stop.py` | Kill both processes, kill tmux session, remove all temp files | `./ocpncord-tui-stop.py` | `Stopped` | `ERROR: ...` (non-zero exit) |
+| `ocpncord-tui-status.py` | Check tmux session, TUI PID, and OpenCode HTTP endpoint | `./ocpncord-tui-status.py` | `TUI: RUNNING` / `OPENCODE: RUNNING` | Always exits 0 |
+| `ocpncord-tui-screenshot.py` | Capture tmux pane content as screenshot | `./ocpncord-tui-screenshot.py` | (pane text content) | `ERROR: ...` (non-zero exit) |
+| `ocpncord-tui-input.py` | Send keystrokes to the TUI via tmux send-keys | `./ocpncord-tui-input.py --keys "hello<Enter>"` | `Sent: hello<Enter>` | `ERROR: ...` (non-zero exit) |
+| `ocpncord-tui-input.py` (tests) | Run parser unit tests | `./ocpncord-tui-input.py --test` | `OK` (55 tests) | `FAILED` |
+| `ocpncord-tui-logs-opencode.py` | Print `/tmp/opencode.log` to stdout | `./ocpncord-tui-logs-opencode.py` | (file contents) | `ERROR: log file not found at /tmp/opencode.log` (non-zero exit) |
+| `ocpncord-tui-logs-tui.py` | Print `/tmp/ocpncord.log` (TUI debug log) to stdout | `./ocpncord-tui-logs-tui.py` | (file contents) | `ERROR: log file not found at /tmp/ocpncord.log` (non-zero exit) |
 
-## key syntax for `test-ocpncord-tui-input.py`
+## key syntax for `ocpncord-tui-input.py`
 
 Recognized key names for `<...>`:
 
@@ -46,12 +46,12 @@ Examples:
 
 ## Recommended usage sequence
 
-1. `test-ocpncord-tui-start.py` — start both services
-2. `test-ocpncord-tui-status.py` — confirm everything is running
-3. `test-ocpncord-tui-screenshot.py` — baseline screenshot
-4. `test-ocpncord-tui-input.py --keys "..."` — interact with the TUI
-5. `test-ocpncord-tui-screenshot.py` — compare after-interaction state
-6. `test-ocpncord-tui-stop.py` — shut down and clean up
+1. `ocpncord-tui-start.py` — start both services
+2. `ocpncord-tui-status.py` — confirm everything is running
+3. `ocpncord-tui-screenshot.py` — baseline screenshot
+4. `ocpncord-tui-input.py --keys "..."` — interact with the TUI
+5. `ocpncord-tui-screenshot.py` — compare after-interaction state
+6. `ocpncord-tui-stop.py` — shut down and clean up
 
 ## Important notes
 
