@@ -1204,8 +1204,17 @@ ScreenId::Chat => {
             let panel_x = area.width - panel_width;
             let panel_area = Rect::new(panel_x, area.y, panel_width, area.height);
 
-            // Background
-            frame.buffer_mut().set_style(panel_area, self.theme.side_panel_bg);
+            // Background — clear stale symbols and set panel colour
+            let buf = frame.buffer_mut();
+            let panel_style = self.theme.side_panel_bg;
+            for y in panel_area.top()..panel_area.bottom() {
+                for x in panel_area.left()..panel_area.right() {
+                    if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                        cell.set_symbol(" ");
+                        cell.set_style(panel_style);
+                    }
+                }
+            }
 
             // Tab bar
             let _tabs = ["Diagnostics", "Todos", "Terminal"];
@@ -2507,4 +2516,39 @@ mod tests {
         assert!(has_help, "terminal should show a helpful message when no PTY");
     }
 
+    #[test]
+    fn side_panel_clears_background_chat_symbols() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        // Toggle side panel on (while on start page, which has the logo)
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('d'));
+        assert!(app.side_panel_visible, "side panel should be visible");
+
+        // Render and check panel area
+        let test_backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // The side panel occupies the right 30%. For 80-wide: x=56..79.
+        let panel_x = 56u16;
+        let has_block_in_panel = buf.content().iter().enumerate().any(|(i, c)| {
+            if c.symbol() == "█" {
+                let pos = buf.pos_of(i);
+                pos.0 >= panel_x
+            } else {
+                false
+            }
+        });
+        assert!(
+            !has_block_in_panel,
+            "side panel area should not contain logo block characters"
+        );
+
+        // Left side (chat area) should have content
+        let has_prompt = buf.content().iter().any(|c| c.symbol() == ">");
+        assert!(has_prompt, "start page prompt should be visible");
+    }
 }
