@@ -4,7 +4,7 @@
 import argparse
 import sys
 
-LOG_FILE = "/tmp/opencode-rust-client.log"
+LOG_FILE = "/tmp/ocpncord.log"
 
 
 def main():

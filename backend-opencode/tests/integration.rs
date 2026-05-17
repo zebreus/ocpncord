@@ -9,8 +9,8 @@ use core::result::Result as CoreResult;
 use embedded_io_async::{ErrorType, Read};
 use embedded_nal_async::{AddrType, Dns, TcpConnect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use opencode_backend::*;
-use opencode_backend_opencode::OpenCodeBackend;
+use ocpncord_backend::*;
+use ocpncord_backend_opencode::OpenCodeBackend;
 
 // --- Transport types (mirror opencode-native) ---
 
@@ -217,7 +217,7 @@ async fn prompt_and_messages() {
     // Consume the stream until Done to let the server complete processing
     while let Some(event) = stream.next().await {
         match event {
-            Ok(opencode_backend::BackendEvent::Done) => break,
+            Ok(ocpncord_backend::BackendEvent::Done) => break,
             Ok(_) => {}
             Err(e) => panic!("unexpected error in prompt stream: {e}"),
         }
@@ -251,7 +251,7 @@ async fn send_command() {
     // Consume the stream until Done
     while let Some(event) = stream.next().await {
         match event {
-            Ok(opencode_backend::BackendEvent::Done) => break,
+            Ok(ocpncord_backend::BackendEvent::Done) => break,
             Ok(_) => {}
             Err(e) => panic!("unexpected error in command stream: {e}"),
         }

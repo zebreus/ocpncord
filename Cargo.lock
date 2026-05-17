@@ -654,29 +654,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa07b0722c63805057dec824444fdc814bdfd30d1c782a3a8f63bbcf67c4ed1c"
 
 [[package]]
-name = "once_cell_polyfill"
-version = "1.70.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
-
-[[package]]
-name = "opencode-backend"
+name = "ocpncord-backend"
 version = "0.1.0"
 dependencies = [
  "futures-core",
- "opencode-types",
+ "ocpncord-types",
 ]
 
 [[package]]
-name = "opencode-backend-opencode"
+name = "ocpncord-backend-opencode"
 version = "0.1.0"
 dependencies = [
  "embedded-io-async",
  "embedded-nal-async",
  "futures",
  "futures-core",
- "opencode-backend",
- "opencode-types",
+ "ocpncord-backend",
+ "ocpncord-types",
  "reqwless",
  "serde",
  "serde_json",
@@ -684,7 +678,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "opencode-native"
+name = "ocpncord-native"
 version = "0.1.0"
 dependencies = [
  "clap",
@@ -693,32 +687,38 @@ dependencies = [
  "embedded-nal-async",
  "futures",
  "log",
- "opencode-backend",
- "opencode-backend-opencode",
- "opencode-tui",
- "opencode-types",
+ "ocpncord-backend",
+ "ocpncord-backend-opencode",
+ "ocpncord-tui",
+ "ocpncord-types",
  "ratatui-core",
  "tokio",
 ]
 
 [[package]]
-name = "opencode-tui"
+name = "ocpncord-tui"
 version = "0.1.0"
 dependencies = [
  "futures",
  "futures-core",
  "log",
- "opencode-backend",
- "opencode-types",
+ "ocpncord-backend",
+ "ocpncord-types",
  "ratatui-core",
 ]
 
 [[package]]
-name = "opencode-types"
+name = "ocpncord-types"
 version = "0.1.0"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "once_cell_polyfill"
+version = "1.70.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "p256"

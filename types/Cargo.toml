@@ -1,5 +1,5 @@
 [package]
-name = "opencode-types"
+name = "ocpncord-types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

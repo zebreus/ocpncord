@@ -21,7 +21,7 @@ Add the Model picker modal so that users can see available models and switch the
 - [ ] Model picker displays a note that model selection is read-only in MVP
 - [ ] Model list is scrollable
 - [ ] Escape closes the modal
-- [ ] `cargo test -p opencode-tui` passes with tests for model picker rendering with MockBackend config
+- [ ] `cargo test -p ocpncord-tui` passes with tests for model picker rendering with MockBackend config
 
 ## Blocked by
 

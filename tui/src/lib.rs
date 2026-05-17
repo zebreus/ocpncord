@@ -1,7 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
-//! Platform-agnostic TUI for the opencode client.
+//! Platform-agnostic TUI for the ocpncord client.
 //!
 //! Built on `ratatui-core` widgets. Renders via Crossterm on desktop
 //! and via mousefood on embedded hardware.

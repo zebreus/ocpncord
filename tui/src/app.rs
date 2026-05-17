@@ -5,7 +5,7 @@ use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use opencode_backend::{Backend, BackendEvent};
+use ocpncord_backend::{Backend, BackendEvent};
 
 use crate::chat::{render_chat, Chat};
 use crate::command_palette::CommandPaletteModal;
@@ -42,8 +42,8 @@ pub enum ToastVariant {
 /// A message held in memory, built from streaming Parts.
 #[derive(Debug, Clone)]
 pub struct LoadedMessage {
-    pub role: opencode_backend::MessageRole,
-    pub parts: Vec<opencode_backend::Part>,
+    pub role: ocpncord_backend::MessageRole,
+    pub parts: Vec<ocpncord_backend::Part>,
 }
 
 
@@ -63,7 +63,7 @@ pub struct TerminalPane {
     pub command: String,
     pub lines: alloc::collections::VecDeque<TermLine>,
     pub scroll: u16,
-    pub status: opencode_backend::PtyStatus,
+    pub status: ocpncord_backend::PtyStatus,
     pub exit_code: Option<i32>,
 }
 
@@ -81,7 +81,7 @@ impl TerminalPane {
             command: String::new(),
             lines: alloc::collections::VecDeque::with_capacity(2000),
             scroll: 0,
-            status: opencode_backend::PtyStatus::Running,
+            status: ocpncord_backend::PtyStatus::Running,
             exit_code: None,
         }
     }
@@ -93,7 +93,7 @@ impl TerminalPane {
         self.lines.push_back(line);
     }
 
-    pub fn set_from_pty(&mut self, pty: &opencode_backend::Pty) {
+    pub fn set_from_pty(&mut self, pty: &ocpncord_backend::Pty) {
         self.pty_id = Some(pty.id.clone());
         self.title = pty.title.clone();
         self.command = pty.command.clone();
@@ -116,26 +116,26 @@ pub struct App<B: Backend> {
     tick: u64,
     prompt_bar: PromptBar,
     chat: Chat,
-    active_session: Option<opencode_backend::Session>,
+    active_session: Option<ocpncord_backend::Session>,
     draft: Option<String>,
     error: Option<String>,
     is_streaming: bool,
-    partial_parts: Vec<opencode_backend::Part>,
+    partial_parts: Vec<ocpncord_backend::Part>,
     /// Accumulated delta text per part_id for real-time streaming.
     partial_texts: alloc::collections::BTreeMap<String, String>,
     messages: Vec<LoadedMessage>,
     stream: Option<B::PromptStream>,
     sync_stream: Option<B::EventStream>,
     active_modal: Option<Box<dyn Modal>>,
-    agents: Vec<opencode_backend::Agent>,
+    agents: Vec<ocpncord_backend::Agent>,
     active_agent: usize,
     // --- New fields for full API integration ---
     terminal: TerminalPane,
     // Session cache for modals
-    cached_sessions: Vec<opencode_backend::Session>,
+    cached_sessions: Vec<ocpncord_backend::Session>,
     // Permission & Question pending queues
-    pending_permissions: alloc::collections::VecDeque<(opencode_backend::PermissionRequest, String)>,
-    pending_questions: alloc::collections::VecDeque<(opencode_backend::QuestionRequest, String)>,
+    pending_permissions: alloc::collections::VecDeque<(ocpncord_backend::PermissionRequest, String)>,
+    pending_questions: alloc::collections::VecDeque<(ocpncord_backend::QuestionRequest, String)>,
     // Toast notifications
     toasts: alloc::collections::VecDeque<Toast>,
     // Side panel state
@@ -145,7 +145,7 @@ pub struct App<B: Backend> {
     // LSP diagnostics cache: file_path -> diagnostics
     lsp_diagnostics: alloc::collections::BTreeMap<String, Vec<LspDiagnostic>>,
     // Todo cache
-    todos: Vec<opencode_backend::Todo>,
+    todos: Vec<ocpncord_backend::Todo>,
     // Workspace state
     current_workspace: Option<String>,
     current_branch: Option<String>,
@@ -220,7 +220,7 @@ impl<B: Backend> App<B> {
         self.error.as_deref()
     }
 
-    pub fn active_session(&self) -> Option<&opencode_backend::Session> {
+    pub fn active_session(&self) -> Option<&ocpncord_backend::Session> {
         self.active_session.as_ref()
     }
 
@@ -237,7 +237,7 @@ impl<B: Backend> App<B> {
     /// Prompt stream takes priority (it's the active conversation).
     /// Sync stream provides background session/message updates.
     /// Returns None when the stream is exhausted.
-    pub async fn poll_next_event(&mut self) -> Option<Result<BackendEvent, opencode_backend::BackendError>> {
+    pub async fn poll_next_event(&mut self) -> Option<Result<BackendEvent, ocpncord_backend::BackendError>> {
         use futures::StreamExt;
 
         if let Some(stream) = &mut self.stream {
@@ -300,16 +300,16 @@ impl<B: Backend> App<B> {
             Ok(agents) => {
                 self.agents = agents
                     .into_iter()
-                    .filter(|a| matches!(a.mode, opencode_backend::AgentMode::Primary))
+                    .filter(|a| matches!(a.mode, ocpncord_backend::AgentMode::Primary))
                     .collect();
             }
             Err(_) => {}
         }
         if self.agents.is_empty() {
             self.agents = vec![
-                opencode_backend::Agent {
+                ocpncord_backend::Agent {
                     name: "build".into(),
-                    mode: opencode_backend::AgentMode::Primary,
+                    mode: ocpncord_backend::AgentMode::Primary,
                     description: None,
                     native: None,
                     hidden: None,
@@ -319,9 +319,9 @@ impl<B: Backend> App<B> {
                     prompt: None,
                     steps: None,
                 },
-                opencode_backend::Agent {
+                ocpncord_backend::Agent {
                     name: "plan".into(),
-                    mode: opencode_backend::AgentMode::Primary,
+                    mode: ocpncord_backend::AgentMode::Primary,
                     description: None,
                     native: None,
                     hidden: None,
@@ -340,7 +340,7 @@ impl<B: Backend> App<B> {
         self.is_streaming
     }
 
-    pub fn partial_parts(&self) -> &[opencode_backend::Part] {
+    pub fn partial_parts(&self) -> &[ocpncord_backend::Part] {
         &self.partial_parts
     }
 
@@ -406,10 +406,10 @@ impl<B: Backend> App<B> {
             Event::Backend(event) => {
                 #[allow(unreachable_patterns)]
                 match event {
-                    opencode_backend::BackendEvent::Part { part, delta: _ } => {
+                    ocpncord_backend::BackendEvent::Part { part, delta: _ } => {
                         self.partial_parts.push(part);
                     }
-                    opencode_backend::BackendEvent::Done => {
+                    ocpncord_backend::BackendEvent::Done => {
                         self.is_streaming = false;
                         self.stream = None;
                         self.partial_texts.clear();
@@ -437,14 +437,14 @@ impl<B: Backend> App<B> {
                             }
                         }
                     }
-                    opencode_backend::BackendEvent::Error { message } => {
+                    ocpncord_backend::BackendEvent::Error { message } => {
                         self.error = Some(message);
                         self.partial_parts.clear();
                         self.is_streaming = false;
                         self.stream = None;
                         self.partial_texts.clear();
                     }
-                    opencode_backend::BackendEvent::SessionCreated { session } => {
+                    ocpncord_backend::BackendEvent::SessionCreated { session } => {
                         let is_new = self.active_session.as_ref().map(|s| s.id != session.id).unwrap_or(true);
                         self.active_session = Some(session);
                         self.active_screen = ScreenId::Chat;
@@ -453,30 +453,30 @@ impl<B: Backend> App<B> {
                         }
                         self.error = None;
                     }
-                    opencode_backend::BackendEvent::SessionUpdated { session } => {
+                    ocpncord_backend::BackendEvent::SessionUpdated { session } => {
                         if let Some(active) = &mut self.active_session {
                             if active.id == session.id {
                                 *active = session;
                             }
                         }
                     }
-                    opencode_backend::BackendEvent::SessionDeleted { .. } => {
+                    ocpncord_backend::BackendEvent::SessionDeleted { .. } => {
                         self.active_session = None;
                         self.messages.clear();
                         self.active_screen = ScreenId::StartPage;
                     }
-                    opencode_backend::BackendEvent::SessionIdle { .. } => {}
-                    opencode_backend::BackendEvent::SessionError { error, .. } => {
+                    ocpncord_backend::BackendEvent::SessionIdle { .. } => {}
+                    ocpncord_backend::BackendEvent::SessionError { error, .. } => {
                         self.error = Some(alloc::format!("Session error: {:?}", error));
                     }
-                    opencode_backend::BackendEvent::SessionDiff { .. } => {}
-                    opencode_backend::BackendEvent::SessionCompacted { .. } => {}
-                    opencode_backend::BackendEvent::MessageUpdated { .. } => {
+                    ocpncord_backend::BackendEvent::SessionDiff { .. } => {}
+                    ocpncord_backend::BackendEvent::SessionCompacted { .. } => {}
+                    ocpncord_backend::BackendEvent::MessageUpdated { .. } => {
                         if self.is_streaming {
                             let parts = core::mem::take(&mut self.partial_parts);
                             if !parts.is_empty() {
                                 self.messages.push(LoadedMessage {
-                                    role: opencode_backend::MessageRole::Assistant,
+                                    role: ocpncord_backend::MessageRole::Assistant,
                                     parts,
                                 });
                             }
@@ -485,22 +485,22 @@ impl<B: Backend> App<B> {
                             self.partial_texts.clear();
                         }
                     }
-                    opencode_backend::BackendEvent::MessageRemoved { .. } => {}
-                    opencode_backend::BackendEvent::MessagePartUpdated { session_id, ref part } => {
+                    ocpncord_backend::BackendEvent::MessageRemoved { .. } => {}
+                    ocpncord_backend::BackendEvent::MessagePartUpdated { session_id, ref part } => {
                         if self.active_session.as_ref().map(|s| s.id.as_str()) == Some(session_id.as_str()) {
                             self.partial_parts.push(part.clone());
                         }
                     }
-                    opencode_backend::BackendEvent::MessagePartDelta { ref session_id, part_id, field, delta, .. } if field == "text"
+                    ocpncord_backend::BackendEvent::MessagePartDelta { ref session_id, part_id, field, delta, .. } if field == "text"
                         && self.active_session.as_ref().map(|s| s.id.as_str()) == Some(session_id.as_str()) =>
                     {
                         let acc = self.partial_texts.entry(part_id).or_default();
                         acc.push_str(&delta);
-                        let new_part = opencode_backend::Part::Text(opencode_backend::TextPart {
+                        let new_part = ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
                             text: acc.clone(),
                         });
                         let replaced = self.partial_parts.iter_mut().rev().find_map(|p| {
-                            if matches!(p, opencode_backend::Part::Text(_)) {
+                            if matches!(p, ocpncord_backend::Part::Text(_)) {
                                 *p = new_part.clone();
                                 Some(())
                             } else {
@@ -511,26 +511,26 @@ impl<B: Backend> App<B> {
                             self.partial_parts.push(new_part);
                         }
                     }
-                    opencode_backend::BackendEvent::MessagePartDelta { .. } => {}
-                    opencode_backend::BackendEvent::MessagePartRemoved { .. } => {}
-                    opencode_backend::BackendEvent::PermissionAsked { request } => {
+                    ocpncord_backend::BackendEvent::MessagePartDelta { .. } => {}
+                    ocpncord_backend::BackendEvent::MessagePartRemoved { .. } => {}
+                    ocpncord_backend::BackendEvent::PermissionAsked { request } => {
                         let sid = self.active_session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
                         self.pending_permissions.push_back((request.clone(), sid));
                     }
-                    opencode_backend::BackendEvent::PermissionReplied { .. } => {
+                    ocpncord_backend::BackendEvent::PermissionReplied { .. } => {
                         self.pending_permissions.pop_front();
                     }
-                    opencode_backend::BackendEvent::QuestionAsked { request } => {
+                    ocpncord_backend::BackendEvent::QuestionAsked { request } => {
                         let sid = self.active_session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
                         self.pending_questions.push_back((request.clone(), sid));
                     }
-                    opencode_backend::BackendEvent::QuestionRejected { .. } => {
+                    ocpncord_backend::BackendEvent::QuestionRejected { .. } => {
                         self.pending_questions.pop_front();
                     }
-                    opencode_backend::BackendEvent::QuestionReplied { .. } => {
+                    ocpncord_backend::BackendEvent::QuestionReplied { .. } => {
                         self.pending_questions.pop_front();
                     }
-                    opencode_backend::BackendEvent::CommandExecuted { name, arguments, .. } => {
+                    ocpncord_backend::BackendEvent::CommandExecuted { name, arguments, .. } => {
                         self.toasts.push_back(Toast {
                             title: Some("Command".into()),
                             message: alloc::format!("{name} {arguments}"),
@@ -539,7 +539,7 @@ impl<B: Backend> App<B> {
                             duration: 12,
                         });
                     }
-                    opencode_backend::BackendEvent::FileEdited { file } => {
+                    ocpncord_backend::BackendEvent::FileEdited { file } => {
                         self.toasts.push_back(Toast {
                             title: Some("File Edited".into()),
                             message: file,
@@ -548,7 +548,7 @@ impl<B: Backend> App<B> {
                             duration: 8,
                         });
                     }
-                    opencode_backend::BackendEvent::FileWatcherUpdated { file, event } => {
+                    ocpncord_backend::BackendEvent::FileWatcherUpdated { file, event } => {
                         self.toasts.push_back(Toast {
                             title: Some("File Watcher".into()),
                             message: alloc::format!("{file}: {event}"),
@@ -557,17 +557,17 @@ impl<B: Backend> App<B> {
                             duration: 6,
                         });
                     }
-                    opencode_backend::BackendEvent::PtyCreated { info } => {
+                    ocpncord_backend::BackendEvent::PtyCreated { info } => {
                         self.terminal.set_from_pty(&info);
                         self.side_panel_tab = crate::screen::Tab::Pane;
                         self.active_screen = ScreenId::Terminal;
                     }
-                    opencode_backend::BackendEvent::PtyUpdated { .. } => {}
-                    opencode_backend::BackendEvent::PtyDeleted { .. } => {
+                    ocpncord_backend::BackendEvent::PtyUpdated { .. } => {}
+                    ocpncord_backend::BackendEvent::PtyDeleted { .. } => {
                         self.active_screen = ScreenId::Chat;
                     }
-                    opencode_backend::BackendEvent::PtyExited { exit_code, .. } => {
-                        self.terminal.status = opencode_backend::PtyStatus::Exited;
+                    ocpncord_backend::BackendEvent::PtyExited { exit_code, .. } => {
+                        self.terminal.status = ocpncord_backend::PtyStatus::Exited;
                         self.terminal.exit_code = Some(exit_code);
                         self.toasts.push_back(Toast {
                             title: Some("Terminal".into()),
@@ -581,12 +581,12 @@ impl<B: Backend> App<B> {
                             duration: 8,
                         });
                     }
-                    opencode_backend::BackendEvent::LspDiagnostics { path: _, .. } => {
+                    ocpncord_backend::BackendEvent::LspDiagnostics { path: _, .. } => {
                         self.side_panel_tab = crate::screen::Tab::Diagnostics;
                         self.side_panel_visible = true;
                     }
-                    opencode_backend::BackendEvent::LspUpdated => {}
-                    opencode_backend::BackendEvent::McpBrowserOpenFailed { mcp_name, url } => {
+                    ocpncord_backend::BackendEvent::LspUpdated => {}
+                    ocpncord_backend::BackendEvent::McpBrowserOpenFailed { mcp_name, url } => {
                         self.toasts.push_back(Toast {
                             title: Some("MCP Error".into()),
                             message: alloc::format!("{mcp_name}: {url}"),
@@ -595,7 +595,7 @@ impl<B: Backend> App<B> {
                             duration: 10,
                         });
                     }
-                    opencode_backend::BackendEvent::McpToolsChanged { server } => {
+                    ocpncord_backend::BackendEvent::McpToolsChanged { server } => {
                         self.toasts.push_back(Toast {
                             title: Some("MCP Tools".into()),
                             message: alloc::format!("Updated from {server}"),
@@ -604,7 +604,7 @@ impl<B: Backend> App<B> {
                             duration: 6,
                         });
                     }
-                    opencode_backend::BackendEvent::InstallationUpdateAvailable { version } => {
+                    ocpncord_backend::BackendEvent::InstallationUpdateAvailable { version } => {
                         self.toasts.push_back(Toast {
                             title: Some("Update Available".into()),
                             message: alloc::format!("version {version}"),
@@ -613,7 +613,7 @@ impl<B: Backend> App<B> {
                             duration: 12,
                         });
                     }
-                    opencode_backend::BackendEvent::InstallationUpdated { version } => {
+                    ocpncord_backend::BackendEvent::InstallationUpdated { version } => {
                         self.toasts.push_back(Toast {
                             title: Some("Updated".into()),
                             message: alloc::format!("now on {version}"),
@@ -622,31 +622,31 @@ impl<B: Backend> App<B> {
                             duration: 6,
                         });
                     }
-                    opencode_backend::BackendEvent::WorkspaceReady { name } => {
+                    ocpncord_backend::BackendEvent::WorkspaceReady { name } => {
                         self.current_workspace = Some(name);
                     }
-                    opencode_backend::BackendEvent::WorkspaceFailed { message } => {
+                    ocpncord_backend::BackendEvent::WorkspaceFailed { message } => {
                         self.error = Some(alloc::format!("Workspace error: {message}"));
                     }
-                    opencode_backend::BackendEvent::WorktreeReady { branch, .. } => {
+                    ocpncord_backend::BackendEvent::WorktreeReady { branch, .. } => {
                         self.current_branch = Some(branch);
                     }
-                    opencode_backend::BackendEvent::WorktreeFailed { message } => {
+                    ocpncord_backend::BackendEvent::WorktreeFailed { message } => {
                         self.error = Some(alloc::format!("Worktree error: {message}"));
                     }
-                    opencode_backend::BackendEvent::VcsBranchUpdated { branch } => {
+                    ocpncord_backend::BackendEvent::VcsBranchUpdated { branch } => {
                         self.current_branch = Some(branch);
                     }
-                    opencode_backend::BackendEvent::TodoUpdated { ref todos, .. } => {
+                    ocpncord_backend::BackendEvent::TodoUpdated { ref todos, .. } => {
                         self.todos = todos.clone();
                     }
-                    opencode_backend::BackendEvent::TuiPromptAppend { ref text } => {
+                    ocpncord_backend::BackendEvent::TuiPromptAppend { ref text } => {
                         self.prompt_bar.append_text(text);
                     }
-                    opencode_backend::BackendEvent::TuiCommandExecute { ref command } => {
+                    ocpncord_backend::BackendEvent::TuiCommandExecute { ref command } => {
                         self.handle_slash_command_inner(command).await;
                     }
-                    opencode_backend::BackendEvent::TuiToastShow {
+                    ocpncord_backend::BackendEvent::TuiToastShow {
                         message,
                         variant,
                         title,
@@ -665,10 +665,10 @@ impl<B: Backend> App<B> {
                             duration: duration.unwrap_or(6) as u64,
                         });
                     }
-                    opencode_backend::BackendEvent::TuiSessionSelect { ref session_id } => {
+                    ocpncord_backend::BackendEvent::TuiSessionSelect { ref session_id } => {
                         self.handle_select_session(session_id).await;
                     }
-                    opencode_backend::BackendEvent::ServerConnected => {
+                    ocpncord_backend::BackendEvent::ServerConnected => {
                         self.toasts.push_back(Toast {
                             title: Some("Server".into()),
                             message: "Connected".into(),
@@ -677,10 +677,10 @@ impl<B: Backend> App<B> {
                             duration: 4,
                         });
                     }
-                    opencode_backend::BackendEvent::GlobalDisposed => {
+                    ocpncord_backend::BackendEvent::GlobalDisposed => {
                         self.error = Some("Server disposed all instances".into());
                     }
-                    opencode_backend::BackendEvent::ServerInstanceDisposed { directory } => {
+                    ocpncord_backend::BackendEvent::ServerInstanceDisposed { directory } => {
                         self.toasts.push_back(Toast {
                             title: Some("Instance Disposed".into()),
                             message: directory,
@@ -689,7 +689,7 @@ impl<B: Backend> App<B> {
                             duration: 8,
                         });
                     }
-                    opencode_backend::BackendEvent::ProjectUpdated(project) => {
+                    ocpncord_backend::BackendEvent::ProjectUpdated(project) => {
                         self.current_workspace = project.name.or(self.current_workspace.clone());
                     }
                     _ => {}
@@ -733,8 +733,8 @@ impl<B: Backend> App<B> {
             .unwrap_or_default();
 
         self.messages.push(LoadedMessage {
-            role: opencode_backend::MessageRole::User,
-            parts: vec![opencode_backend::Part::Text(opencode_backend::TextPart {
+            role: ocpncord_backend::MessageRole::User,
+            parts: vec![ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
                 text: text.clone(),
             })],
         });
@@ -863,8 +863,8 @@ impl<B: Backend> App<B> {
             .unwrap_or_default();
 
         self.messages.push(LoadedMessage {
-            role: opencode_backend::MessageRole::User,
-            parts: vec![opencode_backend::Part::Text(opencode_backend::TextPart {
+            role: ocpncord_backend::MessageRole::User,
+            parts: vec![ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
                 text: text.into(),
             })],
         });
@@ -1393,7 +1393,7 @@ ScreenId::Chat => {
             " {} {} | {} | {} | Exit: {} ",
             self.terminal.command,
             self.terminal.pty_id.as_deref().unwrap_or(""),
-            if self.terminal.status == opencode_backend::PtyStatus::Running {
+            if self.terminal.status == ocpncord_backend::PtyStatus::Running {
                 "running"
             } else {
                 "exited"
@@ -1411,7 +1411,7 @@ ScreenId::Chat => {
 mod tests {
     use super::*;
     use crate::event::{KeyEvent, Modifiers, Scancode};
-    use opencode_backend::mock::MockBackend;
+    use ocpncord_backend::mock::MockBackend;
     use ratatui_core::backend::TestBackend;
     use ratatui_core::terminal::Terminal;
 
@@ -1499,9 +1499,9 @@ mod tests {
     #[test]
     fn init_loads_primary_agents_from_backend() {
         let mut backend = MockBackend::default();
-        backend.agents = vec![opencode_backend::Agent {
+        backend.agents = vec![ocpncord_backend::Agent {
             name: "coder".into(),
-            mode: opencode_backend::AgentMode::Primary,
+            mode: ocpncord_backend::AgentMode::Primary,
             description: None,
             native: None,
             hidden: None,
@@ -1520,9 +1520,9 @@ mod tests {
     fn shift_tab_cycles_backward_through_agents() {
         let mut backend = MockBackend::default();
         backend.agents = vec![
-            opencode_backend::Agent {
+            ocpncord_backend::Agent {
                 name: "build".into(),
-                mode: opencode_backend::AgentMode::Primary,
+                mode: ocpncord_backend::AgentMode::Primary,
                 description: None,
                 native: None,
                 hidden: None,
@@ -1532,9 +1532,9 @@ mod tests {
                 prompt: None,
                 steps: None,
             },
-            opencode_backend::Agent {
+            ocpncord_backend::Agent {
                 name: "plan".into(),
-                mode: opencode_backend::AgentMode::Primary,
+                mode: ocpncord_backend::AgentMode::Primary,
                 description: None,
                 native: None,
                 hidden: None,
@@ -1544,9 +1544,9 @@ mod tests {
                 prompt: None,
                 steps: None,
             },
-            opencode_backend::Agent {
+            ocpncord_backend::Agent {
                 name: "coder".into(),
-                mode: opencode_backend::AgentMode::Primary,
+                mode: ocpncord_backend::AgentMode::Primary,
                 description: None,
                 native: None,
                 hidden: None,
@@ -1592,9 +1592,9 @@ mod tests {
     fn tab_wraps_to_first_agent_at_end_of_list() {
         let mut backend = MockBackend::default();
         backend.agents = vec![
-            opencode_backend::Agent {
+            ocpncord_backend::Agent {
                 name: "build".into(),
-                mode: opencode_backend::AgentMode::Primary,
+                mode: ocpncord_backend::AgentMode::Primary,
                 description: None,
                 native: None,
                 hidden: None,
@@ -1604,9 +1604,9 @@ mod tests {
                 prompt: None,
                 steps: None,
             },
-            opencode_backend::Agent {
+            ocpncord_backend::Agent {
                 name: "plan".into(),
-                mode: opencode_backend::AgentMode::Primary,
+                mode: ocpncord_backend::AgentMode::Primary,
                 description: None,
                 native: None,
                 hidden: None,
@@ -1632,9 +1632,9 @@ mod tests {
     fn shift_tab_wraps_to_last_agent_at_start_of_list() {
         let mut backend = MockBackend::default();
         backend.agents = vec![
-            opencode_backend::Agent {
+            ocpncord_backend::Agent {
                 name: "build".into(),
-                mode: opencode_backend::AgentMode::Primary,
+                mode: ocpncord_backend::AgentMode::Primary,
                 description: None,
                 native: None,
                 hidden: None,
@@ -1644,9 +1644,9 @@ mod tests {
                 prompt: None,
                 steps: None,
             },
-            opencode_backend::Agent {
+            ocpncord_backend::Agent {
                 name: "plan".into(),
-                mode: opencode_backend::AgentMode::Primary,
+                mode: ocpncord_backend::AgentMode::Primary,
                 description: None,
                 native: None,
                 hidden: None,
@@ -1669,9 +1669,9 @@ mod tests {
     fn tab_cycles_forward_through_agents() {
         let mut backend = MockBackend::default();
         backend.agents = vec![
-            opencode_backend::Agent {
+            ocpncord_backend::Agent {
                 name: "build".into(),
-                mode: opencode_backend::AgentMode::Primary,
+                mode: ocpncord_backend::AgentMode::Primary,
                 description: None,
                 native: None,
                 hidden: None,
@@ -1681,9 +1681,9 @@ mod tests {
                 prompt: None,
                 steps: None,
             },
-            opencode_backend::Agent {
+            ocpncord_backend::Agent {
                 name: "plan".into(),
-                mode: opencode_backend::AgentMode::Primary,
+                mode: ocpncord_backend::AgentMode::Primary,
                 description: None,
                 native: None,
                 hidden: None,
@@ -1706,9 +1706,9 @@ mod tests {
     fn agent_name_passed_to_prompt_on_send() {
         let mut backend = MockBackend::default();
         backend.agents = vec![
-            opencode_backend::Agent {
+            ocpncord_backend::Agent {
                 name: "build".into(),
-                mode: opencode_backend::AgentMode::Primary,
+                mode: ocpncord_backend::AgentMode::Primary,
                 description: None,
                 native: None,
                 hidden: None,
@@ -1718,9 +1718,9 @@ mod tests {
                 prompt: None,
                 steps: None,
             },
-            opencode_backend::Agent {
+            ocpncord_backend::Agent {
                 name: "plan".into(),
-                mode: opencode_backend::AgentMode::Primary,
+                mode: ocpncord_backend::AgentMode::Primary,
                 description: None,
                 native: None,
                 hidden: None,
@@ -1731,7 +1731,7 @@ mod tests {
                 steps: None,
             },
         ];
-        backend.prompt_events = vec![Ok(opencode_backend::BackendEvent::Done)];
+        backend.prompt_events = vec![Ok(ocpncord_backend::BackendEvent::Done)];
         let mut app = App::new(backend);
 
         futures::executor::block_on(app.init());
@@ -1776,13 +1776,13 @@ mod tests {
     fn send_message_starts_stream_and_accumulates_parts() {
         let mut backend = MockBackend::default();
         backend.prompt_events = vec![
-            Ok(opencode_backend::BackendEvent::Part {
-                part: opencode_backend::Part::Text(opencode_backend::TextPart {
+            Ok(ocpncord_backend::BackendEvent::Part {
+                part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
                     text: "Hello".into(),
                 }),
                 delta: None,
             }),
-            Ok(opencode_backend::BackendEvent::Done),
+            Ok(ocpncord_backend::BackendEvent::Done),
         ];
         let mut app = App::new(backend);
 
@@ -1794,8 +1794,8 @@ mod tests {
 
         run(
             &mut app,
-            Event::Backend(opencode_backend::BackendEvent::Part {
-                part: opencode_backend::Part::Text(opencode_backend::TextPart {
+            Event::Backend(ocpncord_backend::BackendEvent::Part {
+                part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
                     text: "Hello".into(),
                 }),
                 delta: None,
@@ -1803,7 +1803,7 @@ mod tests {
         );
         assert_eq!(app.partial_parts().len(), 1);
 
-        run(&mut app, Event::Backend(opencode_backend::BackendEvent::Done));
+        run(&mut app, Event::Backend(ocpncord_backend::BackendEvent::Done));
         assert!(!app.is_streaming());
         // Done no longer flushes partial_parts to messages; the REST API
         // fallback populates messages when the server has persisted them.
@@ -1828,9 +1828,9 @@ mod tests {
         // Simulate SSE: MessagePartUpdated with a text part
         run(
             &mut app,
-            Event::Backend(opencode_backend::BackendEvent::MessagePartUpdated {
+            Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
                 session_id: "mock-session-id".into(),
-                part: opencode_backend::Part::Text(opencode_backend::TextPart {
+                part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
                     text: "Hello from assistant".into(),
                 }),
             }),
@@ -1842,7 +1842,7 @@ mod tests {
         );
 
         // Simulate SSE: Done
-        run(&mut app, Event::Backend(opencode_backend::BackendEvent::Done));
+        run(&mut app, Event::Backend(ocpncord_backend::BackendEvent::Done));
         assert!(!app.is_streaming());
         assert_eq!(app.messages().len(), 1, "only user msg (no flush on Done)");
         assert_eq!(app.partial_parts().len(), 1, "content stays in partial_parts for rendering");
@@ -1863,7 +1863,7 @@ mod tests {
         // Simulate SSE: MessagePartDelta with text chunks (no initial MessagePartUpdated)
         run(
             &mut app,
-            Event::Backend(opencode_backend::BackendEvent::MessagePartDelta {
+            Event::Backend(ocpncord_backend::BackendEvent::MessagePartDelta {
                 session_id: "mock-session-id".into(),
                 message_id: "msg1".into(),
                 part_id: "prt1".into(),
@@ -1879,7 +1879,7 @@ mod tests {
 
         run(
             &mut app,
-            Event::Backend(opencode_backend::BackendEvent::MessagePartDelta {
+            Event::Backend(ocpncord_backend::BackendEvent::MessagePartDelta {
                 session_id: "mock-session-id".into(),
                 message_id: "msg1".into(),
                 part_id: "prt1".into(),
@@ -1895,14 +1895,14 @@ mod tests {
 
         // Verify the accumulated text
         match &app.partial_parts()[0] {
-            opencode_backend::Part::Text(tp) => {
+            ocpncord_backend::Part::Text(tp) => {
                 assert_eq!(tp.text, "Hello world");
             }
             _ => panic!("expected text part"),
         }
 
         // Finalize
-        run(&mut app, Event::Backend(opencode_backend::BackendEvent::Done));
+        run(&mut app, Event::Backend(ocpncord_backend::BackendEvent::Done));
         assert!(!app.is_streaming());
         assert_eq!(app.messages().len(), 1, "only user msg (no flush on Done)");
         assert_eq!(app.partial_parts().len(), 1, "content stays in partial_parts for rendering");
@@ -1919,9 +1919,9 @@ mod tests {
 
         run(
             &mut app,
-            Event::Backend(opencode_backend::BackendEvent::MessagePartUpdated {
+            Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
                 session_id: "ses1".into(),
-                part: opencode_backend::Part::Text(opencode_backend::TextPart {
+                part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
                     text: "Stale event".into(),
                 }),
             }),
@@ -1936,7 +1936,7 @@ mod tests {
     #[test]
     fn backend_error_during_stream_shows_error_and_clears_stream() {
         let mut backend = MockBackend::default();
-        backend.prompt_events = vec![Ok(opencode_backend::BackendEvent::Error {
+        backend.prompt_events = vec![Ok(ocpncord_backend::BackendEvent::Error {
             message: "connection lost".into(),
         })];
         let mut app = App::new(backend);
@@ -1947,7 +1947,7 @@ mod tests {
 
         run(
             &mut app,
-            Event::Backend(opencode_backend::BackendEvent::Error {
+            Event::Backend(ocpncord_backend::BackendEvent::Error {
                 message: "connection lost".into(),
             }),
         );
@@ -1958,7 +1958,7 @@ mod tests {
     #[test]
     fn session_creation_error_shows_error_and_stays_on_start_page() {
         let mut backend = MockBackend::default();
-        backend.fail_create_session = Some(opencode_backend::BackendError::Api {
+        backend.fail_create_session = Some(ocpncord_backend::BackendError::Api {
             status: 500,
             message: "server error".into(),
         });
@@ -2027,14 +2027,14 @@ mod tests {
         assert_eq!(app.backend().sessions.len(), 0);
     }
 
-    fn make_session(id: &str, title: &str) -> opencode_backend::Session {
-        opencode_backend::Session {
+    fn make_session(id: &str, title: &str) -> ocpncord_backend::Session {
+        ocpncord_backend::Session {
             id: id.into(),
             title: title.into(),
             project_id: "p1".into(),
             directory: "/".into(),
             parent_id: None,
-            time: opencode_backend::SessionTime {
+            time: ocpncord_backend::SessionTime {
                 created: 0,
                 updated: 0,
             },
@@ -2188,7 +2188,7 @@ mod tests {
     #[test]
     fn unknown_slash_command_submits_as_message() {
         let mut backend = MockBackend::default();
-        backend.prompt_events = vec![Ok(opencode_backend::BackendEvent::Done)];
+        backend.prompt_events = vec![Ok(ocpncord_backend::BackendEvent::Done)];
         let mut app = App::new(backend);
 
         run(&mut app, char_key('/'));
@@ -2220,7 +2220,7 @@ mod tests {
         assert_eq!(app.active_screen(), ScreenId::Chat);
 
         // Complete the stream so input is accepted again
-        run(&mut app, Event::Backend(opencode_backend::BackendEvent::Done));
+        run(&mut app, Event::Backend(ocpncord_backend::BackendEvent::Done));
 
         let session_count_before = app.backend().sessions.len();
 

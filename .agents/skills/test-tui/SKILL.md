@@ -5,7 +5,7 @@ description: Python toolkit for LLM agents to start, stop, inspect, and interact
 
 # Test TUI Toolkit
 
-A collection of seven Python scripts that let LLM agents drive the `opencode-native` Rust TUI application inside a tmux session. Use these scripts when you need to start/stop the TUI, send keystrokes, capture screenshots, or inspect logs — without touching tmux directly.
+A collection of seven Python scripts that let LLM agents drive the `ocpncord-native` Rust TUI application inside a tmux session. Use these scripts when you need to start/stop the TUI, send keystrokes, capture screenshots, or inspect logs — without touching tmux directly.
 
 ## Script reference
 
@@ -17,7 +17,7 @@ A collection of seven Python scripts that let LLM agents drive the `opencode-nat
 | `test-tui-screenshot.py` | Capture tmux pane content as screenshot | `./test-tui-screenshot.py` | (pane text content) | `ERROR: ...` (non-zero exit) |
 | `test-tui-input.py` | Send keystrokes to the TUI via tmux send-keys | `./test-tui-input.py --keys "hello<Enter>"` | `Sent: hello<Enter>` | `ERROR: ...` (non-zero exit) |
 | `test-tui-logs-opencode.py` | Print `/tmp/opencode.log` to stdout | `./test-tui-logs-opencode.py` | (file contents) | `ERROR: log file not found at /tmp/opencode.log` (non-zero exit) |
-| `test-tui-logs-tui.py` | Print `/tmp/opencode-rust-client.log` (TUI debug log) to stdout | `./test-tui-logs-tui.py` | (file contents) | `ERROR: log file not found at /tmp/opencode-rust-client.log` (non-zero exit) |
+| `test-tui-logs-tui.py` | Print `/tmp/ocpncord.log` (TUI debug log) to stdout | `./test-tui-logs-tui.py` | (file contents) | `ERROR: log file not found at /tmp/ocpncord.log` (non-zero exit) |
 
 ## key syntax for `test-tui-input.py`
 
@@ -52,8 +52,8 @@ Examples: `--keys "hello<Enter>"` types "hello" and presses Enter. `--keys "<C-x
 - **Agents must never interact with tmux directly.** Use these scripts as the sole interface.
 - **Log files:**
   - `/tmp/opencode.log` — OpenCode server stdout/stderr
-  - `/tmp/opencode-rust-client.log` — TUI internal debug log (from `log!()` calls in `native/src/main.rs`)
+  - `/tmp/ocpncord.log` — TUI internal debug log (from `log!()` calls in `native/src/main.rs`)
 - **Screenshots:** Uses `tmux capture-pane` to capture the visible pane content as plain text.
 - **PID files:** `/tmp/tui.pid` and `/tmp/opencode.pid`
-- **The TUI binary** is `opencode-native`. The start script uses `cargo run` from the repo root, so compilation happens automatically.
+- **The TUI binary** is `ocpncord-native`. The start script uses `cargo run` from the repo root, so compilation happens automatically.
 - **`opencode serve`** (no `r` at the end) is the correct subcommand. Do not use `opencode server`.

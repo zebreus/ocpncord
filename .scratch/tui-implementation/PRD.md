@@ -6,7 +6,7 @@ Created: 2026-05-14
 
 ## Problem Statement
 
-The opencode Rust client has a working Backend trait, a fully functional HTTP backend implementation (14/14 integration tests passing), and a platform-agnostic types crate. What it does not have is a usable terminal UI. The TUI crate exists as a stub — an `App` struct that holds a `Screen` enum, a `Screen` trait with `render()/handle_event()`, and platform-agnostic `Event` types. The native binary prints "starting..." and exits.
+ocpncord has a working Backend trait, a fully functional HTTP backend implementation (14/14 integration tests passing), and a platform-agnostic types crate. What it does not have is a usable terminal UI. The TUI crate exists as a stub — an `App` struct that holds a `Screen` enum, a `Screen` trait with `render()/handle_event()`, and platform-agnostic `Event` types. The native binary prints "starting..." and exits.
 
 Without a TUI, the client is unusable. Users cannot see sessions, send prompts, view streaming responses, or interact with the agent in any way. The server protocol works; the client is missing the last mile.
 
@@ -269,7 +269,7 @@ pub enum Action {
 ### Principles
 
 - Test external behaviour, not implementation details. Do not assert on internal field values of widgets. Assert on what the user sees (rendered output) or what the app does (Actions returned).
-- The `MockBackend` (feature `mock` on `opencode-backend`) provides canned data. Use it for all TUI tests to avoid server dependency.
+- The `MockBackend` (feature `mock` on `ocpncord-backend`) provides canned data. Use it for all TUI tests to avoid server dependency.
 - Render tests should snapshot rendered ratatui `Buffer` output where feasible, but cover the most important state transitions with assertion tests first.
 
 ### Modules to test
@@ -283,11 +283,11 @@ pub enum Action {
 ### Prior art
 
 - `opencode-backend` mock module at `backend/src/mock.rs` — existing `MockBackend` used in tests. Follow the same pattern for TUI tests.
-- `backend-opencode` integration tests at `backend-opencode/tests/integration.rs` — shows how `Backend` trait is exercised end-to-end (though TUI tests use mocking, not a real server).
+- `ocpncord-backend-opencode` integration tests at `ocpncord-backend-opencode/tests/integration.rs` — shows how `Backend` trait is exercised end-to-end (though TUI tests use mocking, not a real server).
 
 ### What not to test (in this phase)
 
-- No end-to-end tests requiring a real server — those live in `backend-opencode/tests/` and are existing.
+- No end-to-end tests requiring a real server — those live in `ocpncord-backend-opencode/tests/` and are existing.
 - No visual snapshot tests for the full terminal output — the ratatui rendering pipeline makes these fragile. Test widget-level logic instead.
 - No performance/benchmark tests.
 
@@ -312,7 +312,7 @@ pub enum Action {
 ## Further Notes
 
 - The `Screen` trait's `render()` already accepts `&Theme` — this was added as part of the theme module implementation. The `ScreenId::SessionList` variant should be removed (sessions are now a modal) and replaced with `ScreenId::StartPage`.
-- The `Event::Backend(BackendEvent)` variant needs to be added to `tui/src/event.rs`. The `BackendEvent` type is available via the `opencode_backend` crate (re-exported in `tui`).
+- The `Event::Backend(BackendEvent)` variant needs to be added to `tui/src/event.rs`. The `BackendEvent` type is available via the `ocpncord_backend` crate (re-exported in `tui`).
 - The `native/src/main.rs` binary is the only non-`no_std` crate. It owns the crossterm terminal setup, the event translation layer (crossterm → `tui::Event::Key`), and the tokio event loop. All widget logic lives in `tui/`.
 - The existing `Action` enum only has `None`, `Quit`, `Navigate(ScreenId)`. It needs the full set of semantic actions listed above.
 - Implementation order recommendation: (1) Event variants + Action enum, (2) KeyChord, (3) PromptBar, (4) PartRenderer, (5) StartPage, (6) Chat + message list, (7) Modal trait + session list modal, (8) Wire App + event loop in native.

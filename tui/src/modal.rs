@@ -16,7 +16,7 @@ pub trait Modal {
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use opencode_backend::{Config, Session};
+use ocpncord_backend::{Config, Session};
 use ratatui_core::text::Text;
 use ratatui_core::widgets::Widget;
 
@@ -372,7 +372,7 @@ mod tests {
 
     #[test]
     fn model_picker_shows_model_from_config() {
-        use opencode_backend::Config;
+        use ocpncord_backend::Config;
         let mut modal = ModelPickerModal::new();
         modal.set_config(Config {
             model: Some("gpt-4".into()),
@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn model_picker_shows_readonly_notice() {
-        use opencode_backend::Config;
+        use ocpncord_backend::Config;
         let mut modal = ModelPickerModal::new();
         modal.set_config(Config {
             model: Some("gpt-4".into()),
@@ -574,13 +574,16 @@ mod tests {
 // --- Permission approval modal ---
 
 pub struct PermissionModal {
-    request: opencode_backend::PermissionRequest,
+    request: ocpncord_backend::PermissionRequest,
     selected: usize,
 }
 
 impl PermissionModal {
-    pub fn new(request: opencode_backend::PermissionRequest) -> Self {
-        Self { request, selected: 0 }
+    pub fn new(request: ocpncord_backend::PermissionRequest) -> Self {
+        Self {
+            request,
+            selected: 0,
+        }
     }
 }
 
@@ -590,16 +593,20 @@ impl Modal for PermissionModal {
             .style(theme.dialog_title)
             .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
         let display = alloc::format!("Permission: {}", self.request.permission);
-        Text::from(display.as_str())
-            .style(theme.text)
-            .render(Rect::new(area.x, area.y + 2, area.width, 1), frame.buffer_mut());
+        Text::from(display.as_str()).style(theme.text).render(
+            Rect::new(area.x, area.y + 2, area.width, 1),
+            frame.buffer_mut(),
+        );
         if !self.request.patterns.is_empty() {
-            Text::from("Patterns:")
-                .style(theme.text_dim)
-                .render(Rect::new(area.x, area.y + 3, area.width, 1), frame.buffer_mut());
+            Text::from("Patterns:").style(theme.text_dim).render(
+                Rect::new(area.x, area.y + 3, area.width, 1),
+                frame.buffer_mut(),
+            );
             for (i, pattern) in self.request.patterns.iter().enumerate() {
                 let y = area.y + 4 + i as u16;
-                if y >= area.bottom() { break; }
+                if y >= area.bottom() {
+                    break;
+                }
                 let display = alloc::format!("  {pattern}");
                 Text::from(display.as_str())
                     .style(theme.text)
@@ -609,49 +616,71 @@ impl Modal for PermissionModal {
         let buttons = ["Allow Once", "Allow Always", "Deny"];
         let btn_y = area.y + area.height - 2;
         for (i, label) in buttons.iter().enumerate() {
-            let style = if i == self.selected { theme.dialog_button_focused } else { theme.dialog_button };
+            let style = if i == self.selected {
+                theme.dialog_button_focused
+            } else {
+                theme.dialog_button
+            };
             let display = alloc::format!("  {label}  ");
-            Text::from(display.as_str())
-                .style(style)
-                .render(Rect::new(area.x + (i as u16 * 16), btn_y, display.len() as u16, 1), frame.buffer_mut());
+            Text::from(display.as_str()).style(style).render(
+                Rect::new(area.x + (i as u16 * 16), btn_y, display.len() as u16, 1),
+                frame.buffer_mut(),
+            );
         }
     }
 
     fn handle_event(&mut self, event: Event) -> Action {
         match event {
             Event::Key(ref ke) => match ke.scancode {
-                Scancode::Left => { self.selected = self.selected.saturating_sub(1); Action::None }
-                Scancode::Right => { self.selected = (self.selected + 1).min(2); Action::None }
+                Scancode::Left => {
+                    self.selected = self.selected.saturating_sub(1);
+                    Action::None
+                }
+                Scancode::Right => {
+                    self.selected = (self.selected + 1).min(2);
+                    Action::None
+                }
                 Scancode::Enter => {
                     let reply = match self.selected {
                         0 => crate::screen::PermissionReplyAction::Once,
                         1 => crate::screen::PermissionReplyAction::Always,
                         _ => crate::screen::PermissionReplyAction::Reject,
                     };
-                    Action::ReplyPermission(self.request.session_id.clone(), self.request.id.clone(), reply)
+                    Action::ReplyPermission(
+                        self.request.session_id.clone(),
+                        self.request.id.clone(),
+                        reply,
+                    )
                 }
                 Scancode::Escape => Action::CloseModal,
                 _ => Action::None,
-            }
+            },
             _ => Action::None,
         }
     }
 
-    fn title(&self) -> &str { "Permission Request" }
+    fn title(&self) -> &str {
+        "Permission Request"
+    }
 }
 
 // --- Question modal ---
 
 pub struct QuestionModal {
-    request: opencode_backend::QuestionRequest,
+    request: ocpncord_backend::QuestionRequest,
     current_q: usize,
     selected: usize,
     custom_input: String,
 }
 
 impl QuestionModal {
-    pub fn new(request: opencode_backend::QuestionRequest) -> Self {
-        Self { request, current_q: 0, selected: 0, custom_input: String::new() }
+    pub fn new(request: ocpncord_backend::QuestionRequest) -> Self {
+        Self {
+            request,
+            current_q: 0,
+            selected: 0,
+            custom_input: String::new(),
+        }
     }
 }
 
@@ -663,14 +692,26 @@ impl Modal for QuestionModal {
         if let Some(qinfo) = self.request.questions.get(self.current_q) {
             Text::from(qinfo.header.as_str())
                 .style(theme.text_accent)
-                .render(Rect::new(area.x, area.y + 2, area.width, 1), frame.buffer_mut());
+                .render(
+                    Rect::new(area.x, area.y + 2, area.width, 1),
+                    frame.buffer_mut(),
+                );
             Text::from(qinfo.question.as_str())
                 .style(theme.text)
-                .render(Rect::new(area.x, area.y + 3, area.width, 1), frame.buffer_mut());
+                .render(
+                    Rect::new(area.x, area.y + 3, area.width, 1),
+                    frame.buffer_mut(),
+                );
             for (i, opt) in qinfo.options.iter().enumerate() {
                 let y = area.y + 5 + i as u16;
-                if y >= area.bottom() { break; }
-                let style = if i == self.selected { theme.dialog_button_focused } else { theme.dialog_button };
+                if y >= area.bottom() {
+                    break;
+                }
+                let style = if i == self.selected {
+                    theme.dialog_button_focused
+                } else {
+                    theme.dialog_button
+                };
                 let display = alloc::format!("  {} - {}", opt.label, opt.description);
                 Text::from(display.as_str())
                     .style(style)
@@ -682,24 +723,44 @@ impl Modal for QuestionModal {
     fn handle_event(&mut self, event: Event) -> Action {
         match event {
             Event::Key(ref ke) => match ke.scancode {
-                Scancode::Up => { self.selected = self.selected.saturating_sub(1); Action::None }
+                Scancode::Up => {
+                    self.selected = self.selected.saturating_sub(1);
+                    Action::None
+                }
                 Scancode::Down => {
-                    let max = self.request.questions.get(self.current_q).map(|q| q.options.len().saturating_sub(1)).unwrap_or(0);
+                    let max = self
+                        .request
+                        .questions
+                        .get(self.current_q)
+                        .map(|q| q.options.len().saturating_sub(1))
+                        .unwrap_or(0);
                     self.selected = (self.selected + 1).min(max);
                     Action::None
                 }
                 Scancode::Enter => {
                     let answer = if let Some(qinfo) = self.request.questions.get(self.current_q) {
-                        if let Some(opt) = qinfo.options.get(self.selected) { opt.label.clone() } else { String::new() }
-                    } else { String::new() };
-                    Action::ReplyQuestion(self.request.session_id.clone(), self.request.id.clone(), alloc::vec::Vec::from([answer]))
+                        if let Some(opt) = qinfo.options.get(self.selected) {
+                            opt.label.clone()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    Action::ReplyQuestion(
+                        self.request.session_id.clone(),
+                        self.request.id.clone(),
+                        alloc::vec::Vec::from([answer]),
+                    )
                 }
                 Scancode::Escape => Action::CloseModal,
                 _ => Action::None,
-            }
+            },
             _ => Action::None,
         }
     }
 
-    fn title(&self) -> &str { "Question" }
+    fn title(&self) -> &str {
+        "Question"
+    }
 }

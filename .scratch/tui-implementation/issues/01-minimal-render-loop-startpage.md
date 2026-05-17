@@ -25,7 +25,7 @@ This slice cuts through every layer:
 - [ ] `Ctrl+X Q` quits the application and restores the terminal
 - [ ] `Ctrl+C` also quits the application
 - [ ] `cargo check --workspace` passes
-- [ ] `cargo test -p opencode-tui` passes with at least basic tests for KeyChord (direct binding, leader+chord, timeout)
+- [ ] `cargo test -p ocpncord-tui` passes with at least basic tests for KeyChord (direct binding, leader+chord, timeout)
 
 ## Blocked by
 

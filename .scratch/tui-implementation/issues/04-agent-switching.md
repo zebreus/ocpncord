@@ -26,7 +26,7 @@ Add agent awareness to the TUI so that users can switch between primary agents (
 - [ ] Agent name is passed to `Backend::prompt()` when sending a message
 - [ ] If `list_agents()` fails, defaults to `["build", "plan"]` with a warning only
 - [ ] If agent list is empty, indicator shows "build"
-- [ ] `cargo test -p opencode-tui` passes with tests for:
+- [ ] `cargo test -p ocpncord-tui` passes with tests for:
   - Agent cycling logic
   - Agent parameter passed through to prompt()
   - MockBackend returns agent list, TUI uses it

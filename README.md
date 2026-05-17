@@ -1,6 +1,6 @@
-# OpenCode Rust Client
+# ocpncord
 
-`no_std`+`alloc` Rust client for [opencode](https://opencode.ai), the AI coding agent.
+`no_std`+`alloc` ocpncord TUI client for [opencode](https://opencode.ai), the AI coding agent.
 
 Connects to a running `opencode serve` instance over HTTP. Targets desktop (tokio + crossterm) and embedded terminals with a TUI display.
 
@@ -8,11 +8,11 @@ Connects to a running `opencode serve` instance over HTTP. Targets desktop (toki
 
 | Crate | Role | `no_std` | Publishable |
 |---|---|---|---|
-| [`opencode-types`](./types/) | Pure data types, serde, JSON contract types | yes | yes |
-| [`opencode-backend`](./backend/) | `Backend` trait + streaming types + mock backend | yes | yes |
-| [`opencode-backend-opencode`](./backend-opencode/) | HTTP implementation via reqwless over any TCP transport | yes (opt-in `std`) | — |
-| [`opencode-tui`](./tui/) | Ratatui widgets, platform-agnostic key events | yes | — |
-| [`opencode-native`](./native/) | Binary: tokio + crossterm | no | — |
+| [`ocpncord-types`](./types/) | Pure data types, serde, JSON contract types | yes | yes |
+| [`ocpncord-backend`](./backend/) | `Backend` trait + streaming types + mock backend | yes | yes |
+| [`ocpncord-backend-opencode`](./backend-opencode/) | HTTP implementation via reqwless over any TCP transport | yes (opt-in `std`) | — |
+| [`ocpncord-tui`](./tui/) | Ratatui widgets, platform-agnostic key events | yes | — |
+| [`ocpncord-native`](./native/) | Binary: tokio + crossterm | no | — |
 
 ## Quick start
 
@@ -21,14 +21,14 @@ Connects to a running `opencode serve` instance over HTTP. Targets desktop (toki
 opencode serve --port 4096
 
 # run the TUI (another terminal)
-cargo run -p opencode-native
+cargo run -p ocpncord-native
 ```
 
 The native binary defaults to `http://localhost:4096`.
 
 ## Architecture
 
-The `Backend` trait in `opencode-backend` abstracts the opencode server protocol. The TUI depends only on this trait — it never imports `opencode-backend-opencode` directly. This lets you test the TUI with `MockBackend` (feature `mock`) or swap in a different transport for embedded targets.
+The `Backend` trait in `ocpncord-backend` abstracts the opencode server protocol. The TUI depends only on this trait — it never imports `ocpncord-backend-opencode` directly. This lets you test the TUI with `MockBackend` (feature `mock`) or swap in a different transport for embedded targets.
 
 ```
                     ┌──────────┐
@@ -36,14 +36,14 @@ The `Backend` trait in `opencode-backend` abstracts the opencode server protocol
                     └────┬─────┘
                          │
               ┌──────────┴──────────┐
-              │    opencode-tui     │  (ratatui widgets, no_std)
+               │    ocpncord-tui     │  (ratatui widgets, no_std)
               └──────────┬──────────┘
                          │
               ┌──────────┴──────────┐
-              │  opencode-backend   │  (Backend trait, no_std)
+               │  ocpncord-backend   │  (Backend trait, no_std)
               └──────────┬──────────┘
                     ┌────┴────┐
-                    │  HTTP   │   (opencode-backend-opencode)
+                    │  HTTP   │   (ocpncord-backend-opencode)
                     │  Mock   │   (backend mock feature, for tests)
                     └─────────┘
 ```
@@ -52,13 +52,13 @@ The `Backend` trait in `opencode-backend` abstracts the opencode server protocol
 
 ```toml
 # pure types (serde, no_std)
-opencode-types = { git = "https://github.com/anomalyco/opencode-rust-client" }
+ocpncord-types = { git = "https://github.com/zebreus/ocpncord" }
 
 # Backend trait + streaming types (futures-core, no_std)
-opencode-backend = { git = "..." }
+ocpncord-backend = { git = "..." }
 
 # HTTP backend (reqwless, no_std without "std" feature)
-opencode-backend-opencode = { git = "...", default-features = false }
+ocpncord-backend-opencode = { git = "...", default-features = false }
 ```
 
 ## Status

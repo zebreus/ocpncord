@@ -41,11 +41,11 @@ This is the heart of the TUI experience:
 - [ ] Chat auto-scrolls as new content arrives
 - [ ] Escape interrupts a running stream and aborts via `Backend::abort_session()`
 - [ ] PromptBar shows "Agent is responding..." during streaming and is non-interactive
-- [ ] `cargo test -p opencode-tui` passes with tests for:
+- [ ] `cargo test -p ocpncord-tui` passes with tests for:
   - PartRenderer: every Part variant produces correctly styled output
   - App stream handling: Part → partial_parts, Done → commit, Error → display
   - Interrupt flow with MockBackend
-- [ ] `cargo test -p opencode-backend` still passes (no regressions in backend crate)
+- [ ] `cargo test -p ocpncord-backend` still passes (no regressions in backend crate)
 
 ## Blocked by
 

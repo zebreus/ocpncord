@@ -24,7 +24,7 @@ Add the Help modal so that users can open a reference of available slash command
 - [ ] Help modal lists input prefix modes
 - [ ] Content is scrollable if it exceeds the modal area
 - [ ] Escape closes the modal
-- [ ] `cargo test -p opencode-tui` passes with tests for help modal rendering
+- [ ] `cargo test -p ocpncord-tui` passes with tests for help modal rendering
 
 ## Blocked by
 

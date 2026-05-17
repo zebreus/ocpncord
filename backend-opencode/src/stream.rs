@@ -6,7 +6,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use futures_core::Stream;
-use opencode_backend::{BackendError, BackendEvent, Result};
+use ocpncord_backend::{BackendError, BackendEvent, Result};
 use serde::Deserialize;
 
 /// Incremental SSE parser for streaming responses.
@@ -549,7 +549,7 @@ fn parse_sse_block(block: &[u8]) -> Option<Result<BackendEvent>> {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_owned());
             Some(Ok(BackendEvent::ProjectUpdated(
-                opencode_backend::Project {
+                ocpncord_backend::Project {
                     id: id.to_owned(),
                     worktree: worktree.to_owned(),
                     name,
@@ -691,7 +691,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             Ok(BackendEvent::MessagePartUpdated { part, .. }) => {
-                assert!(matches!(part, opencode_backend::Part::Text(_)));
+                assert!(matches!(part, ocpncord_backend::Part::Text(_)));
             }
             _ => panic!("expected text part"),
         }
@@ -705,7 +705,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             Ok(BackendEvent::MessagePartUpdated { part, .. }) => {
-                assert!(matches!(part, opencode_backend::Part::Tool(_)));
+                assert!(matches!(part, ocpncord_backend::Part::Tool(_)));
             }
             _ => panic!("expected tool part"),
         }
@@ -1031,7 +1031,7 @@ mod tests {
         match &events[0] {
             Ok(BackendEvent::MessagePartUpdated { session_id, part }) => {
                 assert_eq!(session_id, "ses1");
-                assert!(matches!(part, opencode_backend::Part::Text(_)));
+                assert!(matches!(part, ocpncord_backend::Part::Text(_)));
             }
             other => panic!("expected MessagePartUpdated, got {other:?}"),
         }

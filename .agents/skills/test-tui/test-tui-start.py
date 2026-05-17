@@ -13,7 +13,7 @@ REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
 PID_FILE_TUI = "/tmp/tui.pid"
 PID_FILE_OPENCODE = "/tmp/opencode.pid"
 LOG_OPENCODE = "/tmp/opencode.log"
-LOG_TUI_INTERNAL = "/tmp/opencode-rust-client.log"
+LOG_TUI_INTERNAL = "/tmp/ocpncord.log"
 WORKDIR_FILE = "/tmp/opencode_workdir"
 SESSION = "tui_session"
 URL = "http://localhost:7774"
@@ -148,7 +148,7 @@ def main():
     tui_pid = None
     for _ in range(100):
         result = subprocess.run(
-            ["pgrep", "-f", "opencode-native", "-n"],
+            ["pgrep", "-f", "ocpncord-native", "-n"],
             capture_output=True, text=True,
         )
         if result.returncode == 0 and result.stdout.strip():

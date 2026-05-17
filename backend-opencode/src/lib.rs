@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
-use opencode_backend::*;
+use ocpncord_backend::*;
 use reqwless::client::HttpClient;
 use reqwless::headers::ContentType;
 use reqwless::request::{Method, RequestBuilder};
@@ -204,7 +204,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
     async fn create_session(&mut self, title: &str, cwd: &str) -> Result<Session> {
         let url = alloc::format!("{}/session", self.base_url);
-        let body = opencode_types::CreateSessionBody { title, directory: cwd };
+        let body = ocpncord_types::CreateSessionBody { title, directory: cwd };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
         let body = self
             .send_get_body(Method::POST, &url, Some(json.as_bytes()))
@@ -220,7 +220,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
     async fn update_session(&mut self, id: &SessionId, title: &str) -> Result<Session> {
         let url = alloc::format!("{}/session/{id}", self.base_url);
-        let body = opencode_types::UpdateSessionBody { title };
+        let body = ocpncord_types::UpdateSessionBody { title };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
         let body = self
             .send_get_body(Method::PATCH, &url, Some(json.as_bytes()))
@@ -267,8 +267,8 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         agent: Option<&str>,
     ) -> Result<Self::PromptStream> {
         let url = alloc::format!("{}/session/{id}/message", self.base_url);
-        let prompt_body = opencode_types::PromptBody {
-            parts: &[opencode_types::TextPartBody {
+        let prompt_body = ocpncord_types::PromptBody {
+            parts: &[ocpncord_types::TextPartBody {
                 type_: "text",
                 text,
             }],
@@ -286,7 +286,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         agent: Option<&str>,
     ) -> Result<Self::PromptStream> {
         let url = alloc::format!("{}/session/{id}/command", self.base_url);
-        let cmd_body = opencode_types::CommandBody {
+        let cmd_body = ocpncord_types::CommandBody {
             command: text,
             arguments: "",
             agent,
@@ -340,7 +340,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
     async fn set_auth(&mut self, provider: &str, api_key: &str) -> Result<()> {
         let url = alloc::format!("{}/auth/{provider}", self.base_url);
-        let body = opencode_types::AuthBody {
+        let body = ocpncord_types::AuthBody {
             type_: "api",
             key: api_key,
         };
@@ -366,7 +366,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
     async fn set_config(&mut self, config: &Config) -> Result<Config> {
         let url = alloc::format!("{}/config", self.base_url);
-        let body = opencode_types::ConfigBody {
+        let body = ocpncord_types::ConfigBody {
             model: config.model.as_deref(),
             username: config.username.as_deref(),
         };
@@ -391,7 +391,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
     async fn log(&mut self, level: &str, message: &str) -> Result<()> {
         let url = alloc::format!("{}/log", self.base_url);
-        let body = opencode_types::LogBody { level, message };
+        let body = ocpncord_types::LogBody { level, message };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
         self.send_get_body(Method::POST, &url, Some(json.as_bytes()))
             .await?;

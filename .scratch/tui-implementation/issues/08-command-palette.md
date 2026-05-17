@@ -32,7 +32,7 @@ This mirrors the `Ctrl+P` command palette from the official opencode TUI.
 - [ ] Enter executes the selected command (same Action as triggering the command normally)
 - [ ] Escape closes the palette without executing
 - [ ] All MVP commands are listed with their slash command and keybinding
-- [ ] `cargo test -p opencode-tui` passes with tests for palette filtering and command execution
+- [ ] `cargo test -p ocpncord-tui` passes with tests for palette filtering and command execution
 
 ## Blocked by
 

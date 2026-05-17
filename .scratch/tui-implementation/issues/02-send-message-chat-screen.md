@@ -29,7 +29,7 @@ This is the core interaction flow. It cuts through:
 - [ ] A new session is created via `Backend::create_session()` on first message
 - [ ] If session creation fails, a red error is shown and the user stays on StartPage
 - [ ] `/new` on Chat screen creates a fresh session and resets the view
-- [ ] `cargo test -p opencode-tui` passes with tests for:
+- [ ] `cargo test -p ocpncord-tui` passes with tests for:
   - PromptBar character entry, backspace, prefix detection
   - App session auto-creation flow with MockBackend
   - Screen transition on message submit

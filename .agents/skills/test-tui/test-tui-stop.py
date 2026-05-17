@@ -18,7 +18,7 @@ TEMP_FILES = [
     "/tmp/opencode.pid",
     "/tmp/tui.log",
     "/tmp/opencode.log",
-    "/tmp/opencode-rust-client.log",
+    "/tmp/ocpncord.log",
     "/tmp/opencode_workdir",
 ]
 

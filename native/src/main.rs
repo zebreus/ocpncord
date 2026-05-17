@@ -15,10 +15,10 @@ use crossterm::terminal::{
 use crossterm::{execute, queue};
 use embedded_io_async::{ErrorType, Read};
 use embedded_nal_async::{AddrType, Dns, TcpConnect};
-use opencode_backend::BackendEvent;
-use opencode_backend_opencode::{OpenCodeBackend, SseParser};
-use opencode_tui::Event;
-use opencode_tui::{App, KeyEvent, Modifiers, Scancode};
+use ocpncord_backend::BackendEvent;
+use ocpncord_backend_opencode::{OpenCodeBackend, SseParser};
+use ocpncord_tui::Event;
+use ocpncord_tui::{App, KeyEvent, Modifiers, Scancode};
 use ratatui_core::backend::Backend;
 use ratatui_core::buffer::Cell;
 use ratatui_core::layout::{Position, Size};
@@ -42,7 +42,7 @@ impl Log for TuiLogger {
                 *guard = OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open("/tmp/opencode-rust-client.log")
+                    .open("/tmp/ocpncord.log")
                     .ok();
             }
             if let Some(ref mut f) = *guard {
@@ -288,7 +288,7 @@ fn translate_crossterm_event(event: crossterm::event::Event) -> Option<Event> {
 }
 
 #[derive(Parser)]
-#[command(name = "opencode-native", about = "Native TUI client for opencode")]
+#[command(name = "ocpncord-native", about = "ocpncord — native TUI client for opencode")]
 struct Cli {
     /// OpenCode server URL
     #[arg(long = "url", default_value = "http://localhost:4096")]
@@ -394,7 +394,7 @@ async fn connect_and_read_sse(
 }
 
 fn send_events(
-    events: Vec<core::result::Result<opencode_backend::BackendEvent, opencode_backend::BackendError>>,
+    events: Vec<core::result::Result<ocpncord_backend::BackendEvent, ocpncord_backend::BackendError>>,
     event_tx: &mpsc::UnboundedSender<Option<Event>>,
 ) {
     for event in events {

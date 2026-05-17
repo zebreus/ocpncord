@@ -9,34 +9,34 @@ use crate::theme::Theme;
 ///
 /// - `show_details`: when `false`, reasoning and tool parts render as a single collapsed line.
 pub fn render_part<'a>(
-    part: &'a opencode_backend::Part,
+    part: &'a ocpncord_backend::Part,
     theme: &'a Theme,
     show_details: bool,
 ) -> Vec<Line<'a>> {
     match part {
-        opencode_backend::Part::Text(tp) => {
+        ocpncord_backend::Part::Text(tp) => {
             vec![Line::from(tp.text.as_str()).style(theme.part_text)]
         }
-        opencode_backend::Part::Reasoning(rp) => {
+        ocpncord_backend::Part::Reasoning(rp) => {
             if show_details {
                 vec![Line::from(rp.text.as_str()).style(theme.part_reasoning)]
             } else {
                 vec![Line::from("reasoning hidden").style(theme.text_dim)]
             }
         }
-        opencode_backend::Part::Tool(tp) => {
+        ocpncord_backend::Part::Tool(tp) => {
             let (icon, style) = match &tp.state {
-                opencode_backend::ToolState::Pending { .. } => ("...", theme.part_tool_idle),
-                opencode_backend::ToolState::Running { .. } => (">>>", theme.part_tool_running),
-                opencode_backend::ToolState::Completed { .. } => ("[ok]", theme.part_tool_done),
-                opencode_backend::ToolState::Error { .. } => ("[!!]", theme.part_tool_error),
+                ocpncord_backend::ToolState::Pending { .. } => ("...", theme.part_tool_idle),
+                ocpncord_backend::ToolState::Running { .. } => (">>>", theme.part_tool_running),
+                ocpncord_backend::ToolState::Completed { .. } => ("[ok]", theme.part_tool_done),
+                ocpncord_backend::ToolState::Error { .. } => ("[!!]", theme.part_tool_error),
             };
             if show_details {
                 let summary = match &tp.state {
-                    opencode_backend::ToolState::Completed { output, .. } => {
+                    ocpncord_backend::ToolState::Completed { output, .. } => {
                         alloc::format!("{icon} {} - done: {output}", tp.tool)
                     }
-                    opencode_backend::ToolState::Error { error, .. } => {
+                    ocpncord_backend::ToolState::Error { error, .. } => {
                         alloc::format!("{icon} {} - error: {error}", tp.tool)
                     }
                     _ => alloc::format!("{icon} {}", tp.tool),
@@ -46,41 +46,48 @@ pub fn render_part<'a>(
                 vec![Line::from(alloc::format!("{icon} {}", tp.tool)).style(style)]
             }
         }
-        opencode_backend::Part::StepStart(sp) => {
+        ocpncord_backend::Part::StepStart(sp) => {
             let text = match &sp.snapshot {
                 Some(s) => alloc::format!("--- step start - {s} ---"),
                 None => "--- step start ---".into(),
             };
             vec![Line::from(text).style(theme.part_step_divider)]
         }
-        opencode_backend::Part::StepFinish(fp) => {
+        ocpncord_backend::Part::StepFinish(fp) => {
             let text = match &fp.reason {
                 Some(r) => alloc::format!("--- step finish - {r} ---"),
                 None => "--- step finish ---".into(),
             };
             vec![Line::from(text).style(theme.part_step_divider)]
         }
-        opencode_backend::Part::File(fp) => {
+        ocpncord_backend::Part::File(fp) => {
             let label = fp.filename.as_deref().unwrap_or(&fp.url);
             vec![Line::from(alloc::format!("[file] {label}")).style(theme.part_text)]
         }
-        opencode_backend::Part::Snapshot(sp) => {
+        ocpncord_backend::Part::Snapshot(sp) => {
             vec![Line::from(alloc::format!("[snapshot] {}", sp.snapshot)).style(theme.text_dim)]
         }
-        opencode_backend::Part::Patch(pp) => {
-            vec![Line::from(alloc::format!("[patch] {} files", pp.files.len())).style(theme.text_dim)]
+        ocpncord_backend::Part::Patch(pp) => {
+            vec![
+                Line::from(alloc::format!("[patch] {} files", pp.files.len()))
+                    .style(theme.text_dim),
+            ]
         }
-        opencode_backend::Part::Agent(ap) => {
+        ocpncord_backend::Part::Agent(ap) => {
             vec![Line::from(alloc::format!("[agent] {}", ap.name)).style(theme.text_dim)]
         }
-        opencode_backend::Part::Subtask(st) => {
+        ocpncord_backend::Part::Subtask(st) => {
             vec![Line::from(alloc::format!("[subtask] {}", st.description)).style(theme.text_dim)]
         }
-        opencode_backend::Part::Retry(rp) => {
+        ocpncord_backend::Part::Retry(rp) => {
             vec![Line::from(alloc::format!("[retry #{}]", rp.attempt)).style(theme.text_dim)]
         }
-        opencode_backend::Part::Compaction(cp) => {
-            let label = if cp.overflow == Some(true) { "compaction (overflow)" } else { "compaction" };
+        ocpncord_backend::Part::Compaction(cp) => {
+            let label = if cp.overflow == Some(true) {
+                "compaction (overflow)"
+            } else {
+                "compaction"
+            };
             vec![Line::from(label).style(theme.text_dim)]
         }
     }
@@ -89,7 +96,7 @@ pub fn render_part<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opencode_backend::*;
+    use ocpncord_backend::*;
 
     #[test]
     fn text_part_renders_with_part_text_style() {
@@ -165,7 +172,7 @@ mod tests {
                 output: "found 3 matches".into(),
                 title: "grep".into(),
                 metadata: alloc::collections::BTreeMap::new(),
-                time: opencode_backend::ToolTimeCompleted { start: 0, end: 1 },
+                time: ocpncord_backend::ToolTimeCompleted { start: 0, end: 1 },
                 attachments: Vec::new(),
             },
         });
@@ -183,7 +190,7 @@ mod tests {
                 input: alloc::collections::BTreeMap::new(),
                 error: "timeout".into(),
                 metadata: None,
-                time: opencode_backend::ToolTimeCompleted { start: 0, end: 1 },
+                time: ocpncord_backend::ToolTimeCompleted { start: 0, end: 1 },
             },
         });
         let lines = render_part(&part, &theme, true);

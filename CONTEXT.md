@@ -1,6 +1,6 @@
-# OpenCode Rust Client
+# ocpncord
 
-A `no_std`+`alloc` Rust client for the opencode AI coding agent. Connects to a running opencode server over HTTP. Runs on embedded hardware with a TUI display, and natively on desktop for testing.
+A `no_std`+`alloc` ocpncord TUI client for the opencode AI coding agent. Connects to a running opencode server over HTTP. Runs on embedded hardware with a TUI display, and natively on desktop for testing.
 
 ## Language
 
@@ -13,7 +13,7 @@ A named configuration on the server that defines a mode (`primary`/`subagent`/`a
 _Avoid_: Mode (deprecated term for this concept)
 
 **Backend**:
-The Rust trait in the `backend` crate that abstracts the Agent protocol. Implementations include `backend-opencode` (HTTP) and mocks used in tests.
+The Rust trait in the `backend` crate that abstracts the Agent protocol. Implementations include `ocpncord-backend-opencode` (HTTP) and mocks used in tests.
 _Avoid_: Client, transport
 
 **BackendEvent**:
@@ -72,7 +72,7 @@ The primary interaction screen. Shows a scrollable list of **Messages** (user + 
 - A **Message** contains zero or more **Parts**
 - **Prompt** and **Command** both yield a **PromptStream**
 - The **EventStream** is a separate out-of-band channel for server-side events
-- The **Backend** trait is implemented by `backend-opencode` for the real **Agent**
+- The **Backend** trait is implemented by `ocpncord-backend-opencode` for the real **Agent**
 - The `types` crate holds pure data types and is publishable independently
 
 ## Workspace layout
@@ -80,7 +80,7 @@ The primary interaction screen. Shows a scrollable list of **Messages** (user + 
 ```
 types/          — pure data types, serde, no_std+alloc, publishable
 backend/        — Backend trait, data types, streaming types, no_std+alloc
-backend-opencode/ — HTTP implementation of Backend using reqwless
+ocpncord-backend-opencode/ — HTTP implementation of Backend using reqwless
 tui/            — Ratatui widgets, no_std via mousefood, std via Crossterm
 native/         — Binary: tokio + Crossterm, the only binary crate
 ```
@@ -88,7 +88,7 @@ native/         — Binary: tokio + Crossterm, the only binary crate
 ## Example dialogue
 
 > **Dev:** "Does the TUI know the Agent is an opencode server?"
-> **Domain expert:** "No — the TUI only imports the Backend trait. The fact that it's an opencode server is an implementation detail of `backend-opencode`."
+> **Domain expert:** "No — the TUI only imports the Backend trait. The fact that it's an opencode server is an implementation detail of `ocpncord-backend-opencode`."
 
 > **Dev:** "Should I use `subscribe()` to get streaming responses?"
 > **Domain expert:** "No — streaming responses come from `prompt()`, which returns a `PromptStream`. The `EventStream` from `subscribe()` is for out-of-band events like session creation from another client."

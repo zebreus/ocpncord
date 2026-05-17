@@ -36,7 +36,7 @@ Add the modal overlay system and the Session list modal so that users can browse
 - [ ] `/new` creates a new session and switches to Chat
 - [ ] Session list shows a loading state while fetching
 - [ ] Unknown `/` commands are submitted as regular messages to the agent
-- [ ] `cargo test -p opencode-tui` passes with tests for:
+- [ ] `cargo test -p ocpncord-tui` passes with tests for:
   - Modal trait implementation
   - Session list rendering with MockBackend (sessions present, empty, error states)
   - Session selection loads messages correctly

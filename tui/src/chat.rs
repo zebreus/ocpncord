@@ -15,7 +15,7 @@ pub fn render_chat(
     frame: &mut ratatui_core::terminal::Frame,
     theme: &Theme,
     messages: &[LoadedMessage],
-    partial_parts: &[opencode_backend::Part],
+    partial_parts: &[ocpncord_backend::Part],
     is_streaming: bool,
     _scroll: u16,
 ) {
@@ -112,7 +112,7 @@ impl Screen for Chat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opencode_backend::*;
+    use ocpncord_backend::*;
     use ratatui_core::backend::TestBackend;
     use ratatui_core::terminal::Terminal;
 

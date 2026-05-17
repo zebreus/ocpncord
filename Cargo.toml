@@ -14,8 +14,8 @@ edition = "2021"
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
-opencode-types = { path = "types" }
-opencode-backend = { path = "backend" }
+ocpncord-types = { path = "types" }
+ocpncord-backend = { path = "backend" }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 futures-core = { version = "0.3", default-features = false, features = ["alloc"] }
 ratatui-core = { version = "0.1", default-features = false }
