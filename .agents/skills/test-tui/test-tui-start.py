@@ -68,7 +68,7 @@ def main():
     parser.parse_args()
 
     if pid_alive(PID_FILE_TUI) and pid_alive(PID_FILE_OPENCODE):
-        print("Both services already running")
+        print("Already Running")
         return 0
 
     cleanup()
@@ -163,10 +163,7 @@ def main():
         return 1
 
     if pid_alive(PID_FILE_TUI):
-        print(
-            f"TUI started (PID {tui_pid}), "
-            f"OpenCode server started at {URL}"
-        )
+        print("Started")
         return 0
     else:
         print("ERROR: TUI process died shortly after starting")

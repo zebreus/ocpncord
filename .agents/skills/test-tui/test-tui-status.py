@@ -50,11 +50,7 @@ def main():
     tui_running = is_tmux_alive() and is_pid_alive(PID_FILE_TUI)
     opencode_running = is_pid_alive(PID_FILE_OPENCODE) and is_opencode_reachable()
 
-    tui_status = "RUNNING" if tui_running else "NOT_RUNNING"
-    opencode_status = "RUNNING" if opencode_running else "NOT_RUNNING"
-
-    print(f"TUI: {tui_status}")
-    print(f"OPENCODE: {opencode_status}")
+    print("Running" if tui_running and opencode_running else "Not Running")
     return 0
 
 

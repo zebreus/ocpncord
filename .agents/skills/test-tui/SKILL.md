@@ -15,22 +15,26 @@ A collection of seven Python scripts that let LLM agents drive the `opencode-nat
 | `test-tui-stop.py` | Kill both processes, kill tmux session, remove all temp files | `./test-tui-stop.py` | `Stopped` | `ERROR: ...` (non-zero exit) |
 | `test-tui-status.py` | Check tmux session, TUI PID, and OpenCode HTTP endpoint | `./test-tui-status.py` | `TUI: RUNNING` / `OPENCODE: RUNNING` | Always exits 0 |
 | `test-tui-screenshot.py` | Send SIGUSR1 to TUI, print screenshot content to stdout | `./test-tui-screenshot.py` | (screenshot plain-text content) | `ERROR: ...` (non-zero exit) |
-| `test-tui-input.py` | Send keystrokes to the TUI via tmux send-keys | `./test-tui-input.py --keys "h e l l o Enter"` | `Sent: h e l l o Enter` | `ERROR: ...` (non-zero exit) |
+| `test-tui-input.py` | Send keystrokes to the TUI via tmux send-keys | `./test-tui-input.py --keys "hello<Enter>"` | `Sent: hello<Enter>` | `ERROR: ...` (non-zero exit) |
 | `test-tui-logs-opencode.py` | Print `/tmp/opencode.log` to stdout | `./test-tui-logs-opencode.py` | (file contents) | `ERROR: log file not found at /tmp/opencode.log` (non-zero exit) |
 | `test-tui-logs-tui.py` | Print `/tmp/opencode-rust-client.log` (TUI debug log) to stdout | `./test-tui-logs-tui.py` | (file contents) | `ERROR: log file not found at /tmp/opencode-rust-client.log` (non-zero exit) |
 
-## tmux key notation for `test-tui-input.py`
+## key syntax for `test-tui-input.py`
 
-Each token passed to `--keys` is forwarded as a separate key name to `tmux send-keys`. Supported key names:
+The `--keys` argument uses angle-bracket notation. Text outside `<...>` is typed literally. Inside `<...>`, recognized key names are sent as keystrokes:
 
-| Category | Tokens |
+| Category | Names |
 |---|---|
-| Letters & digits | `a` `b` … `z` `0` … `9` |
-| Special keys | `Enter` `Escape` `Tab` `Backspace` `Space` `Up` `Down` `Left` `Right` `Home` `End` `PageUp` `PageDown` `Delete` |
+| Special keys | `Enter`, `Escape`, `Tab`, `Backspace`, `Space` |
+| Arrow keys | `Up`, `Down`, `Left`, `Right` |
+| Navigation | `Home`, `End`, `PageUp`, `PageDown` |
+| Editing | `Delete` |
 | Function keys | `F1` … `F12` |
-| Ctrl combos | `C-c` `C-d` `C-x` etc. |
+| Ctrl combos | `C-a` through `C-z` (e.g. `<C-c>`, `<C-x>`) |
 
-Example: `--keys "C-x q Enter"` sends Ctrl+X, then `q`, then Enter.
+`<<KEY>>` types `<KEY>` literally.
+
+Examples: `--keys "hello<Enter>"` types "hello" and presses Enter. `--keys "<C-x>h"` opens the help modal. `--keys "<<Enter>>"` types `<Enter>` literally.
 
 ## Recommended usage sequence
 
