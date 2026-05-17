@@ -385,6 +385,13 @@ impl<B: Backend> App<B> {
                     return self.apply_action(Some(action)).await;
                 }
 
+                // KeyChord consumed the event (leader mode entered).
+                // Prevent further processing (e.g. prompt_bar inserting a
+                // literal 'x' into the input when Ctrl+X was pressed).
+                if self.key_chord.is_leader_active() {
+                    return true;
+                }
+
                 if key.scancode == crate::event::Scancode::Tab {
                     if key.modifiers.shift {
                         self.cycle_agent_back();
@@ -2386,5 +2393,50 @@ mod tests {
         // Modal text should still render correctly
         let has_slash = buf.content().iter().any(|c| c.symbol() == "/");
         assert!(has_slash, "modal should render slash commands");
+    }
+
+    #[test]
+    fn ctrl_x_leader_does_not_leak_to_prompt_bar() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        // Type "hello" into the prompt bar
+        run(&mut app, char_key('h'));
+        run(&mut app, char_key('e'));
+        run(&mut app, char_key('l'));
+        run(&mut app, char_key('l'));
+        run(&mut app, char_key('o'));
+        assert_eq!(app.prompt_text(), "hello", "should have typed hello");
+
+        // Press Ctrl+X (leader key) — this must NOT leak 'x' to the prompt bar
+        run(&mut app, ctrl('x'));
+        assert_eq!(
+            app.prompt_text(),
+            "hello",
+            "ctrl+x should not leak 'x' to prompt bar"
+        );
+
+        // Complete the leader chord with 'h' for help
+        run(&mut app, char_key('h'));
+        assert!(
+            app.active_modal().is_some(),
+            "help modal should open after ctrl+x h"
+        );
+
+        // Close the modal
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Escape,
+                modifiers: Modifiers::default(),
+            }),
+        );
+
+        // Prompt bar should still show "hello" — unchanged by modal lifecycle
+        assert_eq!(
+            app.prompt_text(),
+            "hello",
+            "prompt bar should preserve input through modal lifecycle"
+        );
     }
 }

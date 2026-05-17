@@ -1,6 +1,6 @@
-use alloc::string::String;
 use crate::event::{KeyEvent, Modifiers, Scancode};
 use crate::screen::{Action, ModalId};
+use alloc::string::String;
 
 const LEADER_TIMEOUT_TICKS: u64 = 40;
 
@@ -26,6 +26,10 @@ impl KeyChord {
     pub fn tick(&mut self, tick: u64) -> Option<Action> {
         self.check_timeout(tick);
         None
+    }
+
+    pub fn is_leader_active(&self) -> bool {
+        self.leader_tick.is_some()
     }
 
     fn check_timeout(&mut self, tick: u64) {
