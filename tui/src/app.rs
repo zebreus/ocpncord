@@ -224,6 +224,10 @@ impl<B: Backend> App<B> {
         self.active_session.as_ref()
     }
 
+    pub fn set_cwd(&mut self, cwd: String) {
+        self.current_workspace = Some(cwd);
+    }
+
     /// Returns true if there is an active event stream (prompt or sync) to poll.
     pub fn has_event_stream(&self) -> bool {
         self.stream.is_some() || self.sync_stream.is_some()
@@ -263,6 +267,10 @@ impl<B: Backend> App<B> {
                 self.sync_stream = Some(stream);
             }
         }
+    }
+
+    pub fn prompt_text(&self) -> &str {
+        self.prompt_bar.text()
     }
 
     pub fn active_agent_name(&self) -> &str {
@@ -402,13 +410,6 @@ impl<B: Backend> App<B> {
                         self.partial_parts.push(part);
                     }
                     opencode_backend::BackendEvent::Done => {
-                        let parts = core::mem::take(&mut self.partial_parts);
-                        if !parts.is_empty() {
-                            self.messages.push(LoadedMessage {
-                                role: opencode_backend::MessageRole::Assistant,
-                                parts,
-                            });
-                        }
                         self.is_streaming = false;
                         self.stream = None;
                         self.partial_texts.clear();
@@ -431,6 +432,7 @@ impl<B: Backend> App<B> {
                                     && api_messages.len() >= self.messages.len()
                                 {
                                     self.messages = api_messages;
+                                    self.partial_parts.clear();
                                 }
                             }
                         }
@@ -484,12 +486,14 @@ impl<B: Backend> App<B> {
                         }
                     }
                     opencode_backend::BackendEvent::MessageRemoved { .. } => {}
-                    opencode_backend::BackendEvent::MessagePartUpdated { ref part, .. } => {
-                        if self.is_streaming {
+                    opencode_backend::BackendEvent::MessagePartUpdated { session_id, ref part } => {
+                        if self.active_session.as_ref().map(|s| s.id.as_str()) == Some(session_id.as_str()) {
                             self.partial_parts.push(part.clone());
                         }
                     }
-                    opencode_backend::BackendEvent::MessagePartDelta { part_id, field, delta, .. } if field == "text" && self.is_streaming => {
+                    opencode_backend::BackendEvent::MessagePartDelta { ref session_id, part_id, field, delta, .. } if field == "text"
+                        && self.active_session.as_ref().map(|s| s.id.as_str()) == Some(session_id.as_str()) =>
+                    {
                         let acc = self.partial_texts.entry(part_id).or_default();
                         acc.push_str(&delta);
                         let new_part = opencode_backend::Part::Text(opencode_backend::TextPart {
@@ -711,7 +715,7 @@ impl<B: Backend> App<B> {
         }
 
         if self.active_session.is_none() {
-            match self.backend.create_session("Chat", "").await {
+            match self.backend.create_session("Chat", self.current_workspace.as_deref().unwrap_or("")).await {
                 Ok(session) => {
                     self.active_session = Some(session);
                 }
@@ -772,7 +776,7 @@ impl<B: Backend> App<B> {
                 true
             }
             "/new" => {
-                match self.backend.create_session("Chat", "").await {
+                match self.backend.create_session("Chat", self.current_workspace.as_deref().unwrap_or("")).await {
                     Ok(session) => {
                         self.active_session = Some(session);
                     }
@@ -1801,7 +1805,10 @@ mod tests {
 
         run(&mut app, Event::Backend(opencode_backend::BackendEvent::Done));
         assert!(!app.is_streaming());
-        assert_eq!(app.messages().len(), 2, "user msg + assistant msg");
+        // Done no longer flushes partial_parts to messages; the REST API
+        // fallback populates messages when the server has persisted them.
+        assert_eq!(app.messages().len(), 1, "only user msg (no flush on Done)");
+        assert_eq!(app.partial_parts().len(), 1, "content stays in partial_parts for rendering");
     }
 
     /// Test that the real SSE event path (MessagePartUpdated + Done) works.
@@ -1822,7 +1829,7 @@ mod tests {
         run(
             &mut app,
             Event::Backend(opencode_backend::BackendEvent::MessagePartUpdated {
-                session_id: "ses1".into(),
+                session_id: "mock-session-id".into(),
                 part: opencode_backend::Part::Text(opencode_backend::TextPart {
                     text: "Hello from assistant".into(),
                 }),
@@ -1831,17 +1838,14 @@ mod tests {
         assert_eq!(
             app.partial_parts().len(),
             1,
-            "MessagePartUpdated should push to partial_parts when streaming"
+            "MessagePartUpdated should push to partial_parts"
         );
 
         // Simulate SSE: Done
         run(&mut app, Event::Backend(opencode_backend::BackendEvent::Done));
         assert!(!app.is_streaming());
-        assert_eq!(app.messages().len(), 2, "user msg + assistant msg");
-        assert!(
-            matches!(app.messages()[1].role, opencode_backend::MessageRole::Assistant),
-            "second message should be from assistant"
-        );
+        assert_eq!(app.messages().len(), 1, "only user msg (no flush on Done)");
+        assert_eq!(app.partial_parts().len(), 1, "content stays in partial_parts for rendering");
     }
 
     /// Test that MessagePartDelta accumulates text during streaming.
@@ -1860,7 +1864,7 @@ mod tests {
         run(
             &mut app,
             Event::Backend(opencode_backend::BackendEvent::MessagePartDelta {
-                session_id: "ses1".into(),
+                session_id: "mock-session-id".into(),
                 message_id: "msg1".into(),
                 part_id: "prt1".into(),
                 field: "text".into(),
@@ -1876,7 +1880,7 @@ mod tests {
         run(
             &mut app,
             Event::Backend(opencode_backend::BackendEvent::MessagePartDelta {
-                session_id: "ses1".into(),
+                session_id: "mock-session-id".into(),
                 message_id: "msg1".into(),
                 part_id: "prt1".into(),
                 field: "text".into(),
@@ -1900,7 +1904,8 @@ mod tests {
         // Finalize
         run(&mut app, Event::Backend(opencode_backend::BackendEvent::Done));
         assert!(!app.is_streaming());
-        assert_eq!(app.messages().len(), 2);
+        assert_eq!(app.messages().len(), 1, "only user msg (no flush on Done)");
+        assert_eq!(app.partial_parts().len(), 1, "content stays in partial_parts for rendering");
     }
 
     /// Test that MessagePartUpdated is IGNORED when NOT streaming.

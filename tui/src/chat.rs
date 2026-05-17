@@ -58,20 +58,18 @@ pub fn render_chat(
         }
     }
 
-    if is_streaming {
-        for part in partial_parts {
+    for part in partial_parts {
+        if y >= max_y {
+            break;
+        }
+        for line in render_part(part, theme, true) {
             if y >= max_y {
                 break;
             }
-            for line in render_part(part, theme, true) {
-                if y >= max_y {
-                    break;
-                }
-                let line_area = Rect::new(msg_area.x, y, msg_area.width, 1);
-                let text = Text::from(line);
-                text.render(line_area, frame.buffer_mut());
-                y += 1;
-            }
+            let line_area = Rect::new(msg_area.x, y, msg_area.width, 1);
+            let text = Text::from(line);
+            text.render(line_area, frame.buffer_mut());
+            y += 1;
         }
     }
 }
