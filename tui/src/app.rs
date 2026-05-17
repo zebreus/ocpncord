@@ -142,6 +142,8 @@ pub struct App<B: Backend> {
     side_panel_visible: bool,
     side_panel_tab: crate::screen::Tab,
     side_panel_scroll: u16,
+// Track the screen before switching to Terminal for toggle back
+    screen_before_terminal: ScreenId,
     // LSP diagnostics cache: file_path -> diagnostics
     lsp_diagnostics: alloc::collections::BTreeMap<String, Vec<LspDiagnostic>>,
     // Todo cache
@@ -181,6 +183,7 @@ impl<B: Backend> App<B> {
             side_panel_visible: false,
             side_panel_tab: crate::screen::Tab::Diagnostics,
             side_panel_scroll: 0,
+            screen_before_terminal: ScreenId::StartPage,
             lsp_diagnostics: alloc::collections::BTreeMap::new(),
             todos: Vec::new(),
             current_workspace: None,
@@ -979,7 +982,7 @@ impl<B: Backend> App<B> {
         }
     }
 
-async fn apply_action(&mut self, action: Option<Action>) -> bool {
+    async fn apply_action(&mut self, action: Option<Action>) -> bool {
          match action {
              Some(Action::Quit) => return false,
              Some(Action::SwitchScreen(id)) => self.active_screen = id,
@@ -1071,7 +1074,12 @@ async fn apply_action(&mut self, action: Option<Action>) -> bool {
                 self.side_panel_scroll = 0;
             }
             Some(Action::OpenTerminal(_pty_id)) => {
-                self.active_screen = ScreenId::Terminal;
+                if self.active_screen == ScreenId::Terminal {
+                    self.active_screen = self.screen_before_terminal;
+                } else {
+                    self.screen_before_terminal = self.active_screen;
+                    self.active_screen = ScreenId::Terminal;
+                }
             }
             Some(Action::CloseTerminal) => {
                 self.active_screen = ScreenId::Chat;
@@ -1381,50 +1389,61 @@ ScreenId::Chat => {
 
     fn render_terminal(&self, frame: &mut ratatui_core::terminal::Frame) {
         let area = frame.area();
-        let pty_height = area.height.saturating_sub(1);
 
-        let start_idx = self.terminal.scroll as usize;
-        let lines: Vec<_> = self
-            .terminal
-            .lines
-            .iter()
-            .skip(start_idx)
-            .take(pty_height as usize)
-            .collect();
+        if self.terminal.pty_id.is_none() {
+            let msg = "No active terminal — send a prompt to the agent to create one";
+            let msg_width = msg.len() as u16;
+            let x = (area.width.saturating_sub(msg_width)) / 2;
+            let y = area.height / 2;
+            Text::from(msg)
+                .style(self.theme.text_dim)
+                .render(Rect::new(x, y, msg_width.min(area.width), 1), frame.buffer_mut());
+        } else {
+            let pty_height = area.height.saturating_sub(1);
 
-        for (i, line) in lines.iter().enumerate() {
-            let y = area.y + i as u16;
-            let style = if line.is_error {
-                self.theme.pty_error
-            } else {
-                self.theme.pty_output
-            };
-            Text::from(line.content.as_str())
-                .style(style)
-                .render(Rect::new(area.x, y, area.width, 1), frame.buffer_mut());
+            let start_idx = self.terminal.scroll as usize;
+            let lines: Vec<_> = self
+                .terminal
+                .lines
+                .iter()
+                .skip(start_idx)
+                .take(pty_height as usize)
+                .collect();
+
+            for (i, line) in lines.iter().enumerate() {
+                let y = area.y + i as u16;
+                let style = if line.is_error {
+                    self.theme.pty_error
+                } else {
+                    self.theme.pty_output
+                };
+                Text::from(line.content.as_str())
+                    .style(style)
+                    .render(Rect::new(area.x, y, area.width, 1), frame.buffer_mut());
+            }
+
+            let status_area = Rect::new(
+                area.x,
+                area.y + area.height - 1,
+                area.width,
+                1,
+            );
+            let status_str = format!(
+                " {} {} | {} | {} | Exit: {} ",
+                self.terminal.command,
+                self.terminal.pty_id.as_deref().unwrap_or(""),
+                if self.terminal.status == ocpncord_backend::PtyStatus::Running {
+                    "running"
+                } else {
+                    "exited"
+                },
+                self.terminal.lines.len(),
+                self.terminal.exit_code.map(|c| c.to_string()).unwrap_or_default(),
+            );
+            Text::from(status_str)
+                .style(self.theme.pty_status_bar)
+                .render(status_area, frame.buffer_mut());
         }
-
-        let status_area = Rect::new(
-            area.x,
-            area.y + area.height - 1,
-            area.width,
-            1,
-        );
-        let status_str = format!(
-            " {} {} | {} | {} | Exit: {} ",
-            self.terminal.command,
-            self.terminal.pty_id.as_deref().unwrap_or(""),
-            if self.terminal.status == ocpncord_backend::PtyStatus::Running {
-                "running"
-            } else {
-                "exited"
-            },
-            self.terminal.lines.len(),
-            self.terminal.exit_code.map(|c| c.to_string()).unwrap_or_default(),
-        );
-        Text::from(status_str)
-            .style(self.theme.pty_status_bar)
-            .render(status_area, frame.buffer_mut());
     }
 }
 
@@ -2439,4 +2458,53 @@ mod tests {
             "prompt bar should preserve input through modal lifecycle"
         );
     }
+
+    #[test]
+    fn ctrl_x_t_toggles_terminal_screen() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+        assert_eq!(app.active_screen(), ScreenId::StartPage);
+
+        // Ctrl+X T on StartPage → Terminal
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('t'));
+        assert_eq!(
+            app.active_screen(),
+            ScreenId::Terminal,
+            "ctrl+x t should switch to terminal"
+        );
+
+        // Ctrl+X T again → back to StartPage
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('t'));
+        assert_eq!(
+            app.active_screen(),
+            ScreenId::StartPage,
+            "ctrl+x t again should return to start page"
+        );
+    }
+
+    #[test]
+    fn terminal_screen_shows_message_when_no_pty() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        // Switch to terminal
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('t'));
+        assert_eq!(app.active_screen(), ScreenId::Terminal);
+
+        // Render and verify helpful message
+        let test_backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let has_help = buf.content().iter().any(|c| c.symbol() == "a")
+            && buf.content().iter().any(|c| c.symbol() == "g")
+            && buf.content().iter().any(|c| c.symbol() == "e")
+            && buf.content().iter().any(|c| c.symbol() == "n");
+        assert!(has_help, "terminal should show a helpful message when no PTY");
+    }
+
 }
