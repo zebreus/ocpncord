@@ -692,6 +692,7 @@ dependencies = [
  "embedded-io-async",
  "embedded-nal-async",
  "futures",
+ "log",
  "opencode-backend",
  "opencode-backend-opencode",
  "opencode-tui",
@@ -706,6 +707,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "futures-core",
+ "log",
  "opencode-backend",
  "opencode-types",
  "ratatui-core",

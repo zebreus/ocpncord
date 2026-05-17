@@ -13,6 +13,7 @@ opencode-types.workspace = true
 opencode-backend = { path = "../backend" }
 opencode-backend-opencode = { path = "../backend-opencode" }
 opencode-tui = { path = "../tui" }
+log = "0.4"
 ratatui-core = { workspace = true, features = ["std"] }
 crossterm = "0.28"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util", "signal"] }

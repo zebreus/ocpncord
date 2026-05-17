@@ -4,6 +4,9 @@ use std::fs::OpenOptions;
 use std::io::{stdout, Write};
 use std::sync::Mutex;
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use log::{LevelFilter, Log, Metadata, Record};
 
 use clap::Parser;
 use crossterm::cursor::{Hide, Show};
@@ -27,22 +30,52 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 
-static LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
+struct TuiLogger {
+    file: Mutex<Option<std::fs::File>>,
+}
 
-fn log(msg: &str) {
-    if let Ok(mut guard) = LOG.lock() {
-        if guard.is_none() {
-            *guard = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/opencode-rust-client.log")
-                .ok();
+impl Log for TuiLogger {
+    fn enabled(&self, _metadata: &Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &Record) {
+        if let Ok(mut guard) = self.file.lock() {
+            if guard.is_none() {
+                *guard = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/opencode-rust-client.log")
+                    .ok();
+            }
+            if let Some(ref mut f) = *guard {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                let h = (now.as_secs() / 3600) % 24;
+                let m = (now.as_secs() / 60) % 60;
+                let s = now.as_secs() % 60;
+                let ns = now.subsec_nanos() / 100_000;
+                let _ = writeln!(
+                    f,
+                    "[{h:02}:{m:02}:{s:02}.{ns:04} TUI] [{}] {}",
+                    record.level(),
+                    record.args()
+                );
+            }
         }
-        if let Some(ref mut f) = *guard {
-            let _ = writeln!(f, "{msg}");
+    }
+
+    fn flush(&self) {
+        if let Ok(mut guard) = self.file.lock() {
+            if let Some(ref mut f) = *guard {
+                let _ = f.flush();
+            }
         }
     }
 }
+
+static LOGGER: TuiLogger = TuiLogger { file: Mutex::new(None) };
 
 /// A TCP transport over tokio `TcpStream`.
 struct StdTcp;
@@ -538,7 +571,7 @@ async fn connect_and_read_sse(
             return Ok(());
         }
         let events = parser.feed(&buf[..n]);
-        log(&format!("[SSE] fed {} bytes, got {} events", n, events.len()));
+        log::info!("[SSE] fed {} bytes, got {} events", n, events.len());
         send_events(events, event_tx);
     }
 }
@@ -550,11 +583,11 @@ fn send_events(
     for event in events {
         match event {
             Ok(ref be) => {
-                log(&format!("[SSE] sending: {be:?}"));
+                log::debug!("[SSE] sending: {be:?}");
                 let _ = event_tx.send(Some(Event::Backend(be.clone())));
             }
             Err(ref e) => {
-                log(&format!("[SSE] parse error: {e}"));
+                log::error!("[SSE] parse error: {e}");
                 let _ = event_tx.send(Some(Event::Backend(BackendEvent::Error {
                     message: format!("SSE parse: {e}"),
                 })));
@@ -652,6 +685,8 @@ async fn main() {
         std::process::exit(1);
     }
 
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Debug));
+
     static TCP: StdTcp = StdTcp;
     static DNS: StdDns = StdDns;
     let backend = OpenCodeBackend::new(&cli.url, &TCP, &DNS);
@@ -695,7 +730,7 @@ async fn main() {
                     match reader.read_new() {
                         Ok(events) => {
                             for event in events {
-                                log(&format!("[KEYSTROKE] {event:?}"));
+                                log::trace!("[KEYSTROKE] {event:?}");
                                 if keystroke_event_tx.send(Some(event)).is_err() {
                                     return;
                                 }
@@ -750,9 +785,9 @@ async fn main() {
         tokio::select! {
             maybe_event = event_rx.recv() => {
                 if let Some(Some(ref event)) = maybe_event {
-                    log(&format!("[DEBUG] event: {event:?}"));
+                    log::debug!("[DEBUG] event: {event:?}");
                     if matches!(event, Event::Backend(BackendEvent::Done)) {
-                        log(&format!("[DEBUG] Done received — is_streaming={} partial_parts={} messages={}", app.is_streaming(), app.partial_parts().len(), app.messages().len()));
+                        log::debug!("[DEBUG] Done received — is_streaming={} partial_parts={} messages={}", app.is_streaming(), app.partial_parts().len(), app.messages().len());
                     }
                 }
 
@@ -814,7 +849,7 @@ async fn main() {
             }
         }
 
-        log(&format!("[RENDER] screen={:?} is_streaming={} partial_parts={} messages={} tick={}", app.active_screen(), app.is_streaming(), app.partial_parts().len(), app.messages().len(), app.tick()));
+        log::debug!("[RENDER] screen={:?} is_streaming={} partial_parts={} messages={} tick={}", app.active_screen(), app.is_streaming(), app.partial_parts().len(), app.messages().len(), app.tick());
         render_target.draw(&app);
 
         // Screenshot after draw (captures the fresh frame)
