@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start OpenCode server and TUI in a tmux session."""
+"""Start OpenCode server and reference TUI (opencode attach) in tmux."""
 
 import argparse
 import os
@@ -8,17 +8,13 @@ import sys
 import time
 import socket
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
-PID_FILE_TUI = "/tmp/tui.pid"
-PID_FILE_OPENCODE = "/tmp/opencode.pid"
-LOG_OPENCODE = "/tmp/opencode.log"
-LOG_TUI_INTERNAL = "/tmp/ocpncord.log"
-WORKDIR_FILE = "/tmp/opencode_workdir"
-SESSION = "tui_session"
-URL = "http://localhost:7774"
+PID_FILE_TUI = "/tmp/reference_tui.pid"
+PID_FILE_OPENCODE = "/tmp/opencode_reference.pid"
+LOG_OPENCODE = "/tmp/opencode_reference.log"
+WORKDIR_FILE = "/tmp/opencode_reference_workdir"
+SESSION = "reference_tui_session"
+URL = "http://localhost:7775"
 
-# Resolve absolute path to avoid tmux-shell PATH issues
 _which = subprocess.run(
     ["which", "opencode"], capture_output=True, text=True
 )
@@ -63,7 +59,7 @@ def cleanup():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Start OpenCode server and TUI in tmux"
+        description="Start OpenCode server and reference TUI in tmux"
     )
     parser.parse_args()
 
@@ -90,7 +86,7 @@ def main():
 
     opencode_cmd = (
         f"cd {workdir}"
-        f" && {OPENCODE_BIN} serve --port 7774"
+        f" && {OPENCODE_BIN} serve --port 7775"
         f" --print-logs --log-level INFO 2>&1"
         f" | while IFS= read -r line; do"
         f" echo \"[$(date '+%H:%M:%S.%4N') OPENCODE] $line\"; done"
@@ -105,7 +101,7 @@ def main():
     for _ in range(15):
         time.sleep(0.3)
         result = subprocess.run(
-            ["pgrep", "-f", f"opencode serve --port 7774", "-n"],
+            ["pgrep", "-f", f"opencode serve --port 7775", "-n"],
             capture_output=True, text=True,
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -126,7 +122,7 @@ def main():
     server_up = False
     for _ in range(25):
         try:
-            with socket.create_connection((socket.gethostbyname("localhost"), 7774), timeout=1):
+            with socket.create_connection((socket.gethostbyname("localhost"), 7775), timeout=1):
                 server_up = True
                 break
         except OSError:
@@ -141,9 +137,7 @@ def main():
         check=True,
     )
 
-    tui_cmd = (
-        f"cd {REPO_ROOT} && cargo run -- --url {URL}"
-    )
+    tui_cmd = f"{OPENCODE_BIN} attach {URL}"
     subprocess.run(
         ["tmux", "send-keys", "-t", f"{SESSION}:tui", tui_cmd, "Enter"],
         check=True,
@@ -152,7 +146,7 @@ def main():
     tui_pid = None
     for _ in range(100):
         result = subprocess.run(
-            ["pgrep", "-f", "ocpncord-native", "-n"],
+            ["pgrep", "-f", f"opencode attach {URL}", "-n"],
             capture_output=True, text=True,
         )
         if result.returncode == 0 and result.stdout.strip():
