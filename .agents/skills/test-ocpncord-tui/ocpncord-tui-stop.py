@@ -12,18 +12,18 @@ SESSION = "tui_session"
 PID_FILE_TUI = "/tmp/tui.pid"
 PID_FILE_OPENCODE = "/tmp/opencode.pid"
 WORKDIR_FILE = "/tmp/opencode_workdir"
+URL = "http://localhost:7774"
 
 TEMP_FILES = [
     "/tmp/tui.pid",
     "/tmp/opencode.pid",
-    "/tmp/tui.log",
     "/tmp/opencode.log",
     "/tmp/ocpncord.log",
     "/tmp/opencode_workdir",
 ]
 
 
-def kill_pid(pidfile):
+def _kill_by_pidfile(pidfile):
     if not os.path.isfile(pidfile):
         return
     try:
@@ -41,10 +41,22 @@ def kill_pid(pidfile):
             except ProcessLookupError:
                 return
         os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (OSError, ProcessLookupError):
         pass
-    except OSError:
-        pass
+
+
+def _kill_by_pattern(pattern):
+    r = subprocess.run(
+        ["pgrep", "-f", pattern, "-n"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return
+    for pid in r.stdout.strip().split():
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except (ValueError, OSError, ProcessLookupError):
+            pass
 
 
 def main():
@@ -53,8 +65,10 @@ def main():
     )
     parser.parse_args()
 
-    kill_pid(PID_FILE_TUI)
-    kill_pid(PID_FILE_OPENCODE)
+    _kill_by_pattern(f"ocpncord-native")
+    _kill_by_pattern(f"opencode serve --port 7774")
+    _kill_by_pidfile(PID_FILE_TUI)
+    _kill_by_pidfile(PID_FILE_OPENCODE)
 
     subprocess.run(["tmux", "kill-session", "-t", SESSION],
                    capture_output=True)

@@ -25,19 +25,51 @@ _which = subprocess.run(
 if _which.returncode != 0 or not _which.stdout.strip():
     print("ERROR: opencode binary not found on PATH", file=sys.stderr)
     sys.exit(1)
-OPENCODE_BIN = _which.stdout.strip()
+OPENCODE_BIN = os.path.realpath(_which.stdout.strip())
 
 
-def pid_alive(pidfile):
+def _cmd_matches(pid, pattern):
+    try:
+        with open(f"/proc/{pid}/cmdline") as f:
+            cmd = f.read().replace("\0", " ")
+            return pattern in cmd
+    except (OSError, IOError):
+        r = subprocess.run(
+            ["pgrep", "-f", pattern, "-n"],
+            capture_output=True, text=True,
+        )
+        return r.returncode == 0 and str(pid) in r.stdout.strip().split()
+
+
+def _process_running(pidfile, cmd_pattern=None):
     if not os.path.isfile(pidfile):
-        return False
+        return None
     try:
         with open(pidfile) as f:
             pid = int(f.read().strip())
+    except (ValueError, OSError):
+        return None
+    try:
         os.kill(pid, 0)
-        return True
-    except (ValueError, OSError, ProcessLookupError):
-        return False
+    except (OSError, ProcessLookupError):
+        return None
+    if cmd_pattern is not None and not _cmd_matches(pid, cmd_pattern):
+        return None
+    return pid
+
+
+def _kill_procs(pattern):
+    r = subprocess.run(
+        ["pgrep", "-f", pattern, "-n"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return
+    for pid in r.stdout.strip().split():
+        try:
+            os.kill(int(pid), 15)
+        except (ValueError, OSError, ProcessLookupError):
+            pass
 
 
 def read_pid(pidfile):
@@ -50,7 +82,16 @@ def read_pid(pidfile):
 def cleanup():
     subprocess.run(["tmux", "kill-session", "-t", SESSION],
                    capture_output=True)
-    for f in [PID_FILE_TUI, PID_FILE_OPENCODE]:
+    _kill_procs("opencode serve --port 7774")
+    _kill_procs("ocpncord-native")
+    TEMP_FILES = [
+        PID_FILE_TUI,
+        PID_FILE_OPENCODE,
+        LOG_OPENCODE,
+        LOG_TUI_INTERNAL,
+        WORKDIR_FILE,
+    ]
+    for f in TEMP_FILES:
         if os.path.isfile(f):
             os.remove(f)
     if os.path.isfile(WORKDIR_FILE):
@@ -65,11 +106,18 @@ def main():
     parser = argparse.ArgumentParser(
         description="Start OpenCode server and TUI in tmux"
     )
-    parser.parse_args()
+    parser.add_argument(
+        "--force", "-f", action="store_true",
+        help="Skip running check and force restart"
+    )
+    args = parser.parse_args()
 
-    if pid_alive(PID_FILE_TUI) and pid_alive(PID_FILE_OPENCODE):
-        print("Already Running")
-        return 0
+    if not args.force:
+        svr = _process_running(PID_FILE_OPENCODE, "opencode serve --port 7774")
+        tui = _process_running(PID_FILE_TUI, "ocpncord-native")
+        if svr is not None and tui is not None:
+            print("Already Running")
+            return 0
 
     cleanup()
 
@@ -171,7 +219,7 @@ def main():
         cleanup()
         return 1
 
-    if pid_alive(PID_FILE_TUI):
+    if _process_running(PID_FILE_TUI, "ocpncord-native"):
         print("Started")
         return 0
     else:
