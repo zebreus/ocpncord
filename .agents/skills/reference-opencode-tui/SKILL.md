@@ -55,7 +55,7 @@ Examples:
 ## Important notes
 
 - **Uses port 7775** (separate from the ocpncord TUI skill which uses 7774).
-- **OpenCode server** always starts in a fresh temporary directory created by `mktemp -d`. The path is stored in `/tmp/opencode_reference_workdir`.
+- **OpenCode server** always starts in a fresh temporary directory at `/tmp/ref-tui-XXXXXX`. The path is stored in `/tmp/opencode_reference_workdir`.
 - **All scripts are idempotent** where applicable. Starting already-running services is a no-op (exit 0). Stopping when nothing is running is a no-op (exit 0).
 - **Agents must never interact with tmux directly.** Use these scripts as the sole interface.
 - **Log files:**

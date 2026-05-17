@@ -21,7 +21,7 @@ _which = subprocess.run(
 if _which.returncode != 0 or not _which.stdout.strip():
     print("ERROR: opencode binary not found on PATH", file=sys.stderr)
     sys.exit(1)
-OPENCODE_BIN = _which.stdout.strip()
+OPENCODE_BIN = os.path.realpath(_which.stdout.strip())
 
 
 def _cmd_matches(pid, pattern):

@@ -13,24 +13,40 @@ PID_FILE_OPENCODE = "/tmp/opencode_reference.pid"
 URL = "http://localhost:7775"
 
 
+def _cmd_matches(pid, pattern):
+    try:
+        with open(f"/proc/{pid}/cmdline") as f:
+            cmd = f.read().replace("\0", " ")
+            return pattern in cmd
+    except (OSError, IOError):
+        r = subprocess.run(
+            ["pgrep", "-f", pattern, "-n"],
+            capture_output=True, text=True,
+        )
+        return r.returncode == 0 and str(pid) in r.stdout.strip().split()
+
+
+def _process_running(pidfile, cmd_pattern):
+    if not os.path.isfile(pidfile):
+        return False
+    try:
+        with open(pidfile) as f:
+            pid = int(f.read().strip())
+    except (ValueError, OSError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return False
+    return cmd_pattern is None or _cmd_matches(pid, cmd_pattern)
+
+
 def is_tmux_alive():
     r = subprocess.run(
         ["tmux", "has-session", "-t", SESSION],
         capture_output=True,
     )
     return r.returncode == 0
-
-
-def is_pid_alive(pidfile):
-    if not os.path.isfile(pidfile):
-        return False
-    try:
-        with open(pidfile) as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)
-        return True
-    except (ValueError, OSError, ProcessLookupError):
-        return False
 
 
 def is_opencode_reachable():
@@ -47,8 +63,8 @@ def main():
     )
     parser.parse_args()
 
-    tui_running = is_tmux_alive() and is_pid_alive(PID_FILE_TUI)
-    opencode_running = is_pid_alive(PID_FILE_OPENCODE) and is_opencode_reachable()
+    tui_running = is_tmux_alive() and _process_running(PID_FILE_TUI, "opencode attach")
+    opencode_running = _process_running(PID_FILE_OPENCODE, "opencode serve") and is_opencode_reachable()
 
     print("Running" if tui_running and opencode_running else "Not Running")
     return 0
