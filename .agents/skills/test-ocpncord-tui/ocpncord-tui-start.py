@@ -74,7 +74,8 @@ def main():
     cleanup()
 
     workdir = subprocess.run(
-        ["mktemp", "-d"], capture_output=True, text=True, check=True
+        ["mktemp", "-d", "-p", "/tmp", "test-tui-XXXXXX"],
+        capture_output=True, text=True, check=True
     ).stdout.strip()
     with open(WORKDIR_FILE, "w") as f:
         f.write(workdir)
@@ -84,7 +85,7 @@ def main():
         check=True,
     )
     subprocess.run(
-        ["tmux", "set-window-option", "-g", "window-size", "manual"],
+        ["tmux", "set-window-option", "-t", f"{SESSION}:opencode", "window-size", "manual"],
         capture_output=True,
     )
 
@@ -139,6 +140,10 @@ def main():
     subprocess.run(
         ["tmux", "new-window", "-t", SESSION, "-n", "tui"],
         check=True,
+    )
+    subprocess.run(
+        ["tmux", "set-window-option", "-t", f"{SESSION}:tui", "window-size", "manual"],
+        capture_output=True,
     )
 
     tui_cmd = (
