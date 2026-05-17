@@ -14,7 +14,7 @@ A collection of seven Python scripts that let LLM agents drive the `opencode-nat
 | `test-tui-start.py` | Create tmux session, start OpenCode server, then start TUI | `./test-tui-start.py` | `TUI started (PID 12345), OpenCode server started at http://localhost:7774` | `ERROR: ...` (non-zero exit) |
 | `test-tui-stop.py` | Kill both processes, kill tmux session, remove all temp files | `./test-tui-stop.py` | `Stopped` | `ERROR: ...` (non-zero exit) |
 | `test-tui-status.py` | Check tmux session, TUI PID, and OpenCode HTTP endpoint | `./test-tui-status.py` | `TUI: RUNNING` / `OPENCODE: RUNNING` | Always exits 0 |
-| `test-tui-screenshot.py` | Send SIGUSR1 to TUI, print screenshot content to stdout | `./test-tui-screenshot.py` | (screenshot plain-text content) | `ERROR: ...` (non-zero exit) |
+| `test-tui-screenshot.py` | Capture tmux pane content as screenshot | `./test-tui-screenshot.py` | (pane text content) | `ERROR: ...` (non-zero exit) |
 | `test-tui-input.py` | Send keystrokes to the TUI via tmux send-keys | `./test-tui-input.py --keys "hello<Enter>"` | `Sent: hello<Enter>` | `ERROR: ...` (non-zero exit) |
 | `test-tui-logs-opencode.py` | Print `/tmp/opencode.log` to stdout | `./test-tui-logs-opencode.py` | (file contents) | `ERROR: log file not found at /tmp/opencode.log` (non-zero exit) |
 | `test-tui-logs-tui.py` | Print `/tmp/opencode-rust-client.log` (TUI debug log) to stdout | `./test-tui-logs-tui.py` | (file contents) | `ERROR: log file not found at /tmp/opencode-rust-client.log` (non-zero exit) |
@@ -53,8 +53,7 @@ Examples: `--keys "hello<Enter>"` types "hello" and presses Enter. `--keys "<C-x
 - **Log files:**
   - `/tmp/opencode.log` — OpenCode server stdout/stderr
   - `/tmp/opencode-rust-client.log` — TUI internal debug log (from `log!()` calls in `native/src/main.rs`)
-- **Screenshots:** Written as plain-text files to `/tmp/<ms>-screenshot.txt` (e.g. `/tmp/0000123-screenshot.txt`). The format is a rendered `TestBackend` buffer dump with a header showing screen name, dimensions, tick, streaming state, etc.
+- **Screenshots:** Uses `tmux capture-pane` to capture the visible pane content as plain text.
 - **PID files:** `/tmp/tui.pid` and `/tmp/opencode.pid`
 - **The TUI binary** is `opencode-native`. The start script uses `cargo run` from the repo root, so compilation happens automatically.
-- **TUI depends on SIGUSR1** for screenshots. The `--screenshot-dir /tmp` flag must be present for the signal handler to be installed.
 - **`opencode serve`** (no `r` at the end) is the correct subcommand. Do not use `opencode server`.

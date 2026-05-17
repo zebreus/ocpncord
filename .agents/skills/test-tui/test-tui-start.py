@@ -138,7 +138,7 @@ def main():
     )
 
     tui_cmd = (
-        f"cd {REPO_ROOT} && cargo run -- --url {URL} --screenshot-dir /tmp"
+        f"cd {REPO_ROOT} && cargo run -- --url {URL}"
     )
     subprocess.run(
         ["tmux", "send-keys", "-t", f"{SESSION}:tui", tui_cmd, "Enter"],
