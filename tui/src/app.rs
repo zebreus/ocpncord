@@ -1292,9 +1292,23 @@ ScreenId::Chat => {
 
         if let Some(ref modal) = self.active_modal {
             let area = frame.area();
-            frame
-                .buffer_mut()
-                .set_style(area, Style::new().bg(Color::Rgb(0, 0, 0)).fg(Color::Rgb(0, 0, 0)));
+
+            // Clear background symbols and apply dark overlay style.
+            // set_style alone is not enough — it changes styles but leaves
+            // stale symbols from the underlying screen (e.g. logo block
+            // characters, chat text) in the buffer.
+            {
+                let buf = frame.buffer_mut();
+                let dark = Style::new().bg(Color::Rgb(0, 0, 0)).fg(Color::Rgb(0, 0, 0));
+                for y in area.top()..area.bottom() {
+                    for x in area.left()..area.right() {
+                        if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                            cell.set_symbol(" ");
+                            cell.set_style(dark);
+                        }
+                    }
+                }
+            }
 
             let modal_width = (area.width as f32 * 0.6) as u16;
             let modal_height = (area.height as f32 * 0.7) as u16;
@@ -2342,5 +2356,35 @@ mod tests {
             app.active_modal().is_none(),
             "Escape should close the help modal"
         );
+    }
+
+    #[test]
+    fn modal_overlay_clears_background_symbols() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        // Open help modal on start page so logo gets drawn under the overlay
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('h'));
+        assert!(app.active_modal().is_some(), "help modal should be open");
+
+        let test_backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // app.render() draws the start page logo first (█ characters),
+        // then the modal dark overlay. The overlay's set_style() changes
+        // cell styles but NOT symbols — logo block characters would survive
+        // unless the symbol itself is cleared.
+        let has_logo_block = buf.content().iter().any(|c| c.symbol() == "█");
+        assert!(
+            !has_logo_block,
+            "modal overlay should not contain logo block characters — symbols must be cleared, not just styles"
+        );
+
+        // Modal text should still render correctly
+        let has_slash = buf.content().iter().any(|c| c.symbol() == "/");
+        assert!(has_slash, "modal should render slash commands");
     }
 }
