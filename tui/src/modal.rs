@@ -20,7 +20,9 @@ pub trait Modal {
 
 // --- Session list modal ---
 
+use alloc::format;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use ocpncord_backend::{Config, Session};
 use ratatui::text::{Line, Text};
@@ -240,24 +242,107 @@ impl Modal for SessionListModal {
 // --- Model picker modal ---
 
 pub struct ModelPickerModal {
-    model: Option<String>,
+    current_model: Option<String>,
+    agent_model: Option<String>,
+    models: Vec<ModelChoice>,
+    selected: usize,
+    scroll: u16,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ModelChoice {
+    id: String,
+    label: String,
+    details: String,
 }
 
 impl ModelPickerModal {
     pub fn new() -> Self {
         Self {
-            model: None,
+            current_model: None,
+            agent_model: None,
+            models: Vec::new(),
+            selected: 0,
+            scroll: 0,
             error: None,
         }
     }
 
     pub fn set_config(&mut self, config: Config) {
-        self.model = config.model;
+        self.current_model = config.model.clone();
+        self.agent_model = config
+            .agent
+            .get("build")
+            .and_then(|agent| agent.model.clone())
+            .or_else(|| config.agent.values().find_map(|agent| agent.model.clone()));
+
+        let mut models = Vec::new();
+        for (provider_id, provider) in config.provider {
+            let provider_label = provider
+                .name
+                .unwrap_or_else(|| provider.id.clone().unwrap_or_else(|| provider_id.clone()));
+            for (model_id, model) in provider.models {
+                let full_id = format!("{provider_id}/{model_id}");
+                let model_label = model
+                    .name
+                    .unwrap_or_else(|| model.id.clone().unwrap_or_else(|| model_id.clone()));
+                let mut detail = provider_label.clone();
+                if let Some(family) = model.family {
+                    detail.push_str(" - ");
+                    detail.push_str(&family);
+                }
+                if let Some(status) = model.status {
+                    detail.push_str(" - ");
+                    detail.push_str(&status);
+                }
+                if model.reasoning == Some(true) {
+                    detail.push_str(" - reasoning");
+                }
+                if model.tool_call == Some(true) {
+                    detail.push_str(" - tools");
+                }
+                models.push(ModelChoice {
+                    id: full_id,
+                    label: model_label,
+                    details: detail,
+                });
+            }
+        }
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        self.selected = self
+            .current_model
+            .as_ref()
+            .and_then(|current| models.iter().position(|choice| &choice.id == current))
+            .unwrap_or(0);
+        self.scroll = self.selected.saturating_sub(4) as u16;
+        self.models = models;
     }
 
     pub fn set_error(&mut self, error: String) {
         self.error = Some(error);
+    }
+
+    pub fn selected_model(&self) -> Option<&str> {
+        self.models
+            .get(self.selected)
+            .map(|choice| choice.id.as_str())
+    }
+
+    pub fn selected_index(&self) -> usize {
+        self.selected
+    }
+
+    fn ensure_selected_visible(&mut self, visible_rows: u16) {
+        if visible_rows == 0 {
+            return;
+        }
+        let selected = self.selected as u16;
+        if selected < self.scroll {
+            self.scroll = selected;
+        } else if selected >= self.scroll + visible_rows {
+            self.scroll = selected.saturating_sub(visible_rows.saturating_sub(1));
+        }
     }
 }
 
@@ -268,40 +353,111 @@ impl Modal for ModelPickerModal {
                 .style(theme.text_error)
                 .wrap(Wrap { trim: false })
                 .render(area, frame.buffer_mut());
-        } else if let Some(model) = &self.model {
-            Paragraph::new(alloc::format!("Current model: {}", model))
-                .style(theme.text)
-                .wrap(Wrap { trim: false })
-                .render(
-                    Rect::new(area.x, area.y, area.width, 2.min(area.height)),
-                    frame.buffer_mut(),
-                );
-        } else {
-            Text::from("No model configured")
-                .style(theme.text_dim)
-                .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
+            return;
         }
 
-        if self.error.is_none() {
-            let notice = "Read-only: configure model via server config";
-            let notice_y = area.y + 3.min(area.height.saturating_sub(1));
-            Paragraph::new(notice)
+        if area.height == 0 {
+            return;
+        }
+
+        let current = self
+            .current_model
+            .as_deref()
+            .or(self.agent_model.as_deref())
+            .unwrap_or("No model configured");
+        Text::from(format!("Current: {current}"))
+            .style(theme.text_dim)
+            .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
+
+        if self.models.is_empty() {
+            Text::from("No models found in server config")
                 .style(theme.text_dim)
-                .wrap(Wrap { trim: false })
                 .render(
-                    Rect::new(
-                        area.x,
-                        notice_y,
-                        area.width,
-                        area.bottom().saturating_sub(notice_y),
-                    ),
+                    Rect::new(area.x, area.y + 2, area.width, 1.min(area.height)),
                     frame.buffer_mut(),
                 );
+            return;
+        }
+
+        let list_y = area.y.saturating_add(2);
+        if list_y >= area.bottom() {
+            return;
+        }
+        let list_area = Rect::new(area.x, list_y, area.width, area.bottom() - list_y);
+        let visible_rows = list_area.height.max(1);
+        let rows: Vec<ListItem<'_>> = self
+            .models
+            .iter()
+            .skip(self.scroll as usize)
+            .take(visible_rows as usize)
+            .map(|choice| {
+                let marker = if Some(choice.id.as_str()) == self.current_model.as_deref() {
+                    "*"
+                } else {
+                    " "
+                };
+                ListItem::new(Line::from(format!(
+                    "{marker} {}  [{}]",
+                    choice.label, choice.details
+                )))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(self.selected.saturating_sub(self.scroll as usize)));
+        StatefulWidget::render(
+            List::new(rows)
+                .style(theme.text)
+                .highlight_style(theme.selection),
+            list_area,
+            frame.buffer_mut(),
+            &mut state,
+        );
+
+        if self.models.len() > visible_rows as usize {
+            let mut scroll_state =
+                ScrollbarState::new(self.models.len()).position(self.scroll as usize);
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_style(theme.scrollbar)
+                .render(list_area, frame.buffer_mut(), &mut scroll_state);
         }
     }
 
-    fn handle_event(&mut self, _event: Event) -> Action {
-        Action::None
+    fn handle_event(&mut self, event: Event) -> Action {
+        match event {
+            Event::Key(key) => match key.scancode {
+                Scancode::Escape => Action::CloseModal,
+                Scancode::Up => {
+                    self.selected = self.selected.saturating_sub(1);
+                    self.ensure_selected_visible(1);
+                    Action::None
+                }
+                Scancode::Down => {
+                    if !self.models.is_empty() {
+                        self.selected = (self.selected + 1).min(self.models.len() - 1);
+                    }
+                    self.ensure_selected_visible(1);
+                    Action::None
+                }
+                Scancode::PageUp => {
+                    self.selected = self.selected.saturating_sub(10);
+                    self.ensure_selected_visible(1);
+                    Action::None
+                }
+                Scancode::PageDown => {
+                    if !self.models.is_empty() {
+                        self.selected = (self.selected + 10).min(self.models.len() - 1);
+                    }
+                    self.ensure_selected_visible(1);
+                    Action::None
+                }
+                Scancode::Enter => self
+                    .selected_model()
+                    .map(|model| Action::SelectModel(model.to_string()))
+                    .unwrap_or(Action::None),
+                _ => Action::None,
+            },
+            _ => Action::None,
+        }
     }
 
     fn title(&self) -> &str {
@@ -461,11 +617,28 @@ mod tests {
 
     #[test]
     fn model_picker_shows_model_from_config() {
-        use ocpncord_backend::Config;
+        use ocpncord_backend::{Config, ModelConfig, ProviderConfig};
+        let mut provider = BTreeMap::new();
+        provider.insert(
+            "openrouter".into(),
+            ProviderConfig {
+                name: Some("OpenRouter".into()),
+                models: BTreeMap::from([(
+                    "gpt-4".into(),
+                    ModelConfig {
+                        name: Some("GPT-4".into()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
         let mut modal = ModelPickerModal::new();
         modal.set_config(Config {
-            model: Some("gpt-4".into()),
+            model: Some("openrouter/gpt-4".into()),
             username: None,
+            provider,
+            agent: Default::default(),
         });
 
         let theme = Theme::default();
@@ -479,35 +652,47 @@ mod tests {
         let buf = terminal.backend().buffer();
         let screen: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(
-            screen.contains("gpt-4"),
-            "Model name 'gpt-4' should appear. Screen: {}",
+            screen.contains("GPT-4"),
+            "Model name 'GPT-4' should appear. Screen: {}",
             screen
         );
     }
 
     #[test]
-    fn model_picker_shows_readonly_notice() {
-        use ocpncord_backend::Config;
+    fn model_picker_enter_returns_selected_model() {
+        use ocpncord_backend::{Config, ModelConfig, ProviderConfig};
+        let mut provider = BTreeMap::new();
+        provider.insert(
+            "anthropic".into(),
+            ProviderConfig {
+                name: Some("Anthropic".into()),
+                models: BTreeMap::from([
+                    ("claude-haiku".into(), ModelConfig::default()),
+                    ("claude-sonnet".into(), ModelConfig::default()),
+                ]),
+                ..Default::default()
+            },
+        );
         let mut modal = ModelPickerModal::new();
         modal.set_config(Config {
-            model: Some("gpt-4".into()),
+            model: Some("anthropic/claude-haiku".into()),
             username: None,
+            provider,
+            agent: Default::default(),
         });
 
-        let theme = Theme::default();
-        let backend = TestBackend::new(60, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                Modal::render(&modal, frame, &theme, Rect::new(10, 5, 40, 10));
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        let screen: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(
-            screen.contains("Read-only:"),
-            "Read-only notice should appear. Screen: {}",
-            screen
+        modal.handle_event(Event::Key(crate::event::KeyEvent {
+            scancode: Scancode::Down,
+            modifiers: Default::default(),
+        }));
+        assert_eq!(modal.selected_index(), 1);
+        let action = modal.handle_event(Event::Key(crate::event::KeyEvent {
+            scancode: Scancode::Enter,
+            modifiers: Default::default(),
+        }));
+        assert_eq!(
+            action,
+            Action::SelectModel("anthropic/claude-sonnet".into())
         );
     }
 

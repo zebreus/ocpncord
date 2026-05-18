@@ -1202,6 +1202,26 @@ impl<B: Backend> App<B> {
                 }
                 self.active_modal = Some(Box::new(modal));
             }
+            Some(Action::SelectModel(ref model)) => {
+                let mut modal = ModelPickerModal::new();
+                match self.backend.get_config().await {
+                    Ok(mut config) => {
+                        config.model = Some(model.clone());
+                        match self.backend.set_config(&config).await {
+                            Ok(updated) => {
+                                if updated.provider.is_empty() && !config.provider.is_empty() {
+                                    modal.set_config(config);
+                                } else {
+                                    modal.set_config(updated);
+                                }
+                            }
+                            Err(e) => modal.set_error(alloc::format!("{}", e)),
+                        }
+                    }
+                    Err(e) => modal.set_error(alloc::format!("{}", e)),
+                }
+                self.active_modal = Some(Box::new(modal));
+            }
             Some(Action::AbortSession(ref id)) => {
                 let _ = self.backend.abort_session(id).await;
             }
@@ -1386,6 +1406,7 @@ impl<B: Backend> App<B> {
                 .title_style(self.theme.text_accent)
                 .title(modal.title());
             let content_area = block.inner(modal_area);
+            Clear.render(content_area, frame.buffer_mut());
             block.render(modal_area, frame.buffer_mut());
             modal.render(frame, &self.theme, content_area);
         }
@@ -1406,7 +1427,12 @@ impl<B: Backend> App<B> {
             crate::screen::Tab::Todos => 1,
             crate::screen::Tab::Pane => 2,
         };
-        Tabs::new(["Diagnostics", "Todos", "Terminal"])
+        let labels = if rows[0].width < 26 {
+            ["Diag", "Todo", "Term"]
+        } else {
+            ["Diagnostics", "Todos", "Terminal"]
+        };
+        Tabs::new(labels)
             .select(selected)
             .style(self.theme.side_panel_tab_inactive)
             .highlight_style(self.theme.side_panel_tab_active)
@@ -2522,6 +2548,49 @@ mod tests {
         assert!(
             app.active_modal().is_some(),
             "Ctrl+X M should open the model picker modal"
+        );
+    }
+
+    #[test]
+    fn select_model_updates_backend_config() {
+        let mut backend = MockBackend::default();
+        backend.config_info = Some(ocpncord_backend::Config {
+            model: Some("openrouter/old".into()),
+            username: Some("mock-user".into()),
+            provider: alloc::collections::BTreeMap::from([(
+                "openrouter".into(),
+                ocpncord_backend::ProviderConfig {
+                    name: Some("OpenRouter".into()),
+                    models: alloc::collections::BTreeMap::from([(
+                        "new".into(),
+                        ocpncord_backend::ModelConfig {
+                            name: Some("New Model".into()),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            )]),
+            agent: Default::default(),
+        });
+        let mut app = App::new(backend);
+
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('m'));
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Enter,
+                modifiers: Modifiers::default(),
+            }),
+        );
+
+        assert_eq!(
+            app.backend()
+                .config_info
+                .as_ref()
+                .and_then(|cfg| cfg.model.as_deref()),
+            Some("openrouter/new")
         );
     }
 

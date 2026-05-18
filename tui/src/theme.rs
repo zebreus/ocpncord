@@ -1,4 +1,4 @@
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 
 /// A collection of semantic styles used throughout the TUI.
 ///
@@ -114,7 +114,7 @@ impl Default for Theme {
             message_assistant: Style::new().fg(fg),
 
             part_text: Style::new().fg(fg),
-            part_reasoning: Style::new().fg(yellow).add_modifier(Modifier::ITALIC),
+            part_reasoning: Style::new().fg(dim),
             part_tool_idle: Style::new().fg(dim),
             part_tool_running: Style::new().fg(blue),
             part_tool_done: Style::new().fg(green),

@@ -352,7 +352,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
     }
 
     async fn get_config(&mut self) -> Result<Config> {
-        let url = alloc::format!("{}/config", self.base_url);
+        let url = alloc::format!("{}/global/config", self.base_url);
         let body = self.send_get_body(Method::GET, &url, None).await?;
         serde_json::from_slice(&body).map_err(parse_err)
     }
@@ -384,7 +384,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
     }
 
     async fn set_config(&mut self, config: &Config) -> Result<Config> {
-        let url = alloc::format!("{}/config", self.base_url);
+        let url = alloc::format!("{}/global/config", self.base_url);
         let body = ocpncord_types::ConfigBody {
             model: config.model.as_deref(),
             username: config.username.as_deref(),

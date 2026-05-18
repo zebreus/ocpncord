@@ -9,6 +9,9 @@ use log::{LevelFilter, Log, Metadata, Record};
 
 use clap::Parser;
 use crossterm::cursor::{Hide, Show};
+use crossterm::style::{
+    Attribute, Color as CrosstermColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, size, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -22,6 +25,7 @@ use ocpncord_tui::{App, KeyEvent, Modifiers, Scancode};
 use ratatui_core::backend::Backend;
 use ratatui_core::buffer::Cell;
 use ratatui_core::layout::{Position, Size};
+use ratatui_core::style::{Color, Modifier};
 use ratatui_core::terminal::Terminal;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -175,20 +179,30 @@ impl Backend for CrosstermBackend {
         let mut stdout = stdout();
         for (x, y, cell) in content {
             let symbol = cell.symbol();
+            let modifier = cell.modifier;
             if !symbol.is_empty() {
                 let _ = queue!(
                     stdout,
                     crossterm::cursor::MoveTo(x, y),
-                    crossterm::style::Print(symbol),
+                    SetAttribute(Attribute::Reset),
+                    SetForegroundColor(to_crossterm_color(cell.fg)),
+                    SetBackgroundColor(to_crossterm_color(cell.bg)),
                 );
+                queue_modifiers(&mut stdout, modifier);
+                let _ = queue!(stdout, crossterm::style::Print(symbol),);
             } else {
                 let _ = queue!(
                     stdout,
                     crossterm::cursor::MoveTo(x, y),
-                    crossterm::style::Print(" "),
+                    SetAttribute(Attribute::Reset),
+                    SetForegroundColor(to_crossterm_color(cell.fg)),
+                    SetBackgroundColor(to_crossterm_color(cell.bg)),
                 );
+                queue_modifiers(&mut stdout, modifier);
+                let _ = queue!(stdout, crossterm::style::Print(" "),);
             }
         }
+        let _ = queue!(stdout, SetAttribute(Attribute::Reset));
         let _ = stdout.flush();
         Ok(())
     }
@@ -266,6 +280,57 @@ impl Backend for CrosstermBackend {
             columns_rows: Size::new(w, h),
             pixels: Size::new(0, 0),
         })
+    }
+}
+
+fn to_crossterm_color(color: Color) -> CrosstermColor {
+    match color {
+        Color::Reset => CrosstermColor::Reset,
+        Color::Black => CrosstermColor::Black,
+        Color::Red => CrosstermColor::DarkRed,
+        Color::Green => CrosstermColor::DarkGreen,
+        Color::Yellow => CrosstermColor::DarkYellow,
+        Color::Blue => CrosstermColor::DarkBlue,
+        Color::Magenta => CrosstermColor::DarkMagenta,
+        Color::Cyan => CrosstermColor::DarkCyan,
+        Color::Gray => CrosstermColor::Grey,
+        Color::DarkGray => CrosstermColor::DarkGrey,
+        Color::LightRed => CrosstermColor::Red,
+        Color::LightGreen => CrosstermColor::Green,
+        Color::LightYellow => CrosstermColor::Yellow,
+        Color::LightBlue => CrosstermColor::Blue,
+        Color::LightMagenta => CrosstermColor::Magenta,
+        Color::LightCyan => CrosstermColor::Cyan,
+        Color::White => CrosstermColor::White,
+        Color::Rgb(r, g, b) => CrosstermColor::Rgb { r, g, b },
+        Color::Indexed(index) => CrosstermColor::AnsiValue(index),
+    }
+}
+
+fn queue_modifiers(stdout: &mut std::io::Stdout, modifier: Modifier) {
+    if modifier.contains(Modifier::BOLD) {
+        let _ = queue!(stdout, SetAttribute(Attribute::Bold));
+    }
+    if modifier.contains(Modifier::DIM) {
+        let _ = queue!(stdout, SetAttribute(Attribute::Dim));
+    }
+    if modifier.contains(Modifier::ITALIC) {
+        let _ = queue!(stdout, SetAttribute(Attribute::Italic));
+    }
+    if modifier.contains(Modifier::UNDERLINED) {
+        let _ = queue!(stdout, SetAttribute(Attribute::Underlined));
+    }
+    if modifier.contains(Modifier::SLOW_BLINK) || modifier.contains(Modifier::RAPID_BLINK) {
+        let _ = queue!(stdout, SetAttribute(Attribute::SlowBlink));
+    }
+    if modifier.contains(Modifier::REVERSED) {
+        let _ = queue!(stdout, SetAttribute(Attribute::Reverse));
+    }
+    if modifier.contains(Modifier::HIDDEN) {
+        let _ = queue!(stdout, SetAttribute(Attribute::Hidden));
+    }
+    if modifier.contains(Modifier::CROSSED_OUT) {
+        let _ = queue!(stdout, SetAttribute(Attribute::CrossedOut));
     }
 }
 

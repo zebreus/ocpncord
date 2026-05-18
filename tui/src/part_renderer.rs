@@ -45,20 +45,7 @@ pub fn render_part<'a>(
                 vec![Line::from(alloc::format!("{icon} {}", tp.tool)).style(style)]
             }
         }
-        ocpncord_backend::Part::StepStart(sp) => {
-            let text = match &sp.snapshot {
-                Some(s) => alloc::format!("--- step start - {s} ---"),
-                None => "--- step start ---".into(),
-            };
-            vec![Line::from(text).style(theme.part_step_divider)]
-        }
-        ocpncord_backend::Part::StepFinish(fp) => {
-            let text = match &fp.reason {
-                Some(r) => alloc::format!("--- step finish - {r} ---"),
-                None => "--- step finish ---".into(),
-            };
-            vec![Line::from(text).style(theme.part_step_divider)]
-        }
+        ocpncord_backend::Part::StepStart(_) | ocpncord_backend::Part::StepFinish(_) => Vec::new(),
         ocpncord_backend::Part::File(fp) => {
             let label = fp.filename.as_deref().unwrap_or(&fp.url);
             vec![Line::from(alloc::format!("[file] {label}")).style(theme.part_text)]
@@ -232,30 +219,29 @@ mod tests {
     }
 
     #[test]
-    fn step_start_renders_divider() {
+    fn step_start_is_hidden_in_chat() {
         let theme = Theme::default();
         let part = Part::StepStart(StepStartPart {
             snapshot: None,
             session_id: None,
         });
         let lines = render_part(&part, &theme, true);
-        assert_eq!(lines.len(), 1);
+        assert!(lines.is_empty());
     }
 
     #[test]
-    fn step_start_with_snapshot() {
+    fn step_start_with_snapshot_is_hidden_in_chat() {
         let theme = Theme::default();
         let part = Part::StepStart(StepStartPart {
             snapshot: Some("planning".into()),
             session_id: None,
         });
         let lines = render_part(&part, &theme, true);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].to_string().contains("planning"));
+        assert!(lines.is_empty());
     }
 
     #[test]
-    fn step_finish_with_reason() {
+    fn step_finish_with_reason_is_hidden_in_chat() {
         let theme = Theme::default();
         let part = Part::StepFinish(StepFinishPart {
             reason: Some("done".into()),
@@ -263,12 +249,11 @@ mod tests {
             session_id: None,
         });
         let lines = render_part(&part, &theme, true);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].to_string().contains("done"));
+        assert!(lines.is_empty());
     }
 
     #[test]
-    fn step_finish_without_reason() {
+    fn step_finish_without_reason_is_hidden_in_chat() {
         let theme = Theme::default();
         let part = Part::StepFinish(StepFinishPart {
             reason: None,
@@ -276,6 +261,6 @@ mod tests {
             session_id: None,
         });
         let lines = render_part(&part, &theme, true);
-        assert_eq!(lines.len(), 1);
+        assert!(lines.is_empty());
     }
 }

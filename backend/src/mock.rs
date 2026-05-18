@@ -32,6 +32,8 @@ impl Default for MockBackend {
             config_info: Some(Config {
                 model: Some("mock/model".into()),
                 username: Some("mock-user".into()),
+                provider: Default::default(),
+                agent: Default::default(),
             }),
             agents: Vec::new(),
             prompt_events: Vec::new(),
@@ -187,10 +189,14 @@ impl Backend for MockBackend {
         Ok(MockStream { events, pos: 0 })
     }
 
-    async fn set_config(&mut self, _config: &Config) -> Result<Config> {
-        self.config_info.clone().ok_or(BackendError::Connection {
-            message: "no config stub".into(),
-        })
+    async fn set_config(&mut self, config: &Config) -> Result<Config> {
+        if self.config_info.is_none() {
+            return Err(BackendError::Connection {
+                message: "no config stub".into(),
+            });
+        }
+        self.config_info = Some(config.clone());
+        Ok(config.clone())
     }
 
     async fn dispose(&mut self) -> Result<()> {

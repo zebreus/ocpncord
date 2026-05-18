@@ -26,6 +26,7 @@ pub enum Action {
     ScrollPageUp,
     ScrollPageDown,
     ToggleDetails,
+    SelectModel(String),
     LoadSession(String),
     DeleteSession(String),
     NewSession,
