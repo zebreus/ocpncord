@@ -101,18 +101,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Start OpenCode server and reference TUI in tmux"
     )
-    parser.add_argument(
-        "--force", "-f", action="store_true",
-        help="Skip running check and force restart"
-    )
     args = parser.parse_args()
 
-    if not args.force:
-        svr = _process_running(PID_FILE_OPENCODE, "opencode serve --port 7775")
-        tui = _process_running(PID_FILE_TUI, "opencode attach")
-        if svr is not None and tui is not None:
-            print("Already Running")
-            return 0
+    svr = _process_running(PID_FILE_OPENCODE, "opencode serve --port 7775")
+    tui = _process_running(PID_FILE_TUI, "opencode attach")
+    if svr is not None and tui is not None:
+        print("Already Running")
+        return 0
 
     cleanup()
 

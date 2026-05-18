@@ -11,7 +11,7 @@ A collection of seven Python scripts that let LLM agents drive the `ocpncord-nat
 
 | Script | Description | CLI usage | Prints on success | Prints on failure |
 |---|---|---|---|---|
-| `ocpncord-tui-start.py` | Create tmux session, start OpenCode server, then start TUI | `./ocpncord-tui-start.py` or `./ocpncord-tui-start.py --force` to restart | `Started` / `Already Running` | `ERROR: ...` (non-zero exit) |
+| `ocpncord-tui-start.py` | Create tmux session, start OpenCode server, then start TUI | `./ocpncord-tui-start.py` | `Started` / `Already Running` | `ERROR: ...` (non-zero exit) |
 | `ocpncord-tui-stop.py` | Kill both processes, kill tmux session, remove all temp files | `./ocpncord-tui-stop.py` | `Stopped` | `ERROR: ...` (non-zero exit) |
 | `ocpncord-tui-status.py` | Check tmux session, TUI PID, and OpenCode HTTP endpoint | `./ocpncord-tui-status.py` | `Running` / `Not Running` | Always exits 0 |
 | `ocpncord-tui-screenshot.py` | Capture tmux pane content as screenshot | `./ocpncord-tui-screenshot.py` | (pane text content) | `ERROR: ...` (non-zero exit) |

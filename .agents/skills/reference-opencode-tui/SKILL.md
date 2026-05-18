@@ -11,7 +11,7 @@ A collection of six Python scripts that let LLM agents drive the reference `open
 
 | Script | Description | CLI usage | Prints on success | Prints on failure |
 |---|---|---|---|---|
-| `reference-opencode-tui-start.py` | Create tmux session, start OpenCode server, then start reference TUI | `./reference-opencode-tui-start.py` or `./reference-opencode-tui-start.py --force` to restart | `Started` / `Already Running` | `ERROR: ...` (non-zero exit) |
+| `reference-opencode-tui-start.py` | Create tmux session, start OpenCode server, then start reference TUI | `./reference-opencode-tui-start.py` | `Started` / `Already Running` | `ERROR: ...` (non-zero exit) |
 | `reference-opencode-tui-stop.py` | Kill both processes, kill tmux session, remove all temp files | `./reference-opencode-tui-stop.py` | `Stopped` | `ERROR: ...` (non-zero exit) |
 | `reference-opencode-tui-status.py` | Check tmux session, TUI PID, and OpenCode HTTP endpoint | `./reference-opencode-tui-status.py` | `Running` / `Not Running` | Always exits 0 |
 | `reference-opencode-tui-screenshot.py` | Capture tmux pane content as screenshot | `./reference-opencode-tui-screenshot.py` | (pane text content) | `ERROR: ...` (non-zero exit) |
