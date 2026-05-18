@@ -2,10 +2,10 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use ratatui_core::layout::Rect;
-use ratatui_core::terminal::Frame;
-use ratatui_core::text::Text;
-use ratatui_core::widgets::Widget;
+use ratatui::layout::Rect;
+use ratatui::text::{Line, Text};
+use ratatui::widgets::{List, ListItem, ListState, StatefulWidget, Widget};
+use ratatui::Frame;
 
 use crate::event::{Event, Scancode};
 use crate::modal::Modal;
@@ -135,21 +135,19 @@ impl CommandPaletteModal {
 
 impl Modal for CommandPaletteModal {
     fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect) {
-        // Title
-        Text::from("Command Palette")
-            .style(theme.text_accent)
-            .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
-
-        // Search input
-        let search_area = Rect::new(area.x, area.y + 1, area.width, 1);
+        let search_area = Rect::new(area.x, area.y, area.width, 1);
         let search_display = alloc::format!("> {}", self.search);
         Text::from(search_display)
             .style(theme.input)
             .render(search_area, frame.buffer_mut());
 
-        // Command list
-        let list_start_y = area.y + 3;
-        let max_y = area.bottom();
+        let list_start_y = area.y + 2;
+        let list_area = Rect::new(
+            area.x,
+            list_start_y,
+            area.width,
+            area.bottom().saturating_sub(list_start_y),
+        );
 
         if self.filtered_indices.is_empty() {
             Text::from("No matching commands")
@@ -161,42 +159,37 @@ impl Modal for CommandPaletteModal {
             return;
         }
 
-        for (visible_i, &cmd_idx) in self.filtered_indices.iter().enumerate() {
-            let y = list_start_y + visible_i as u16;
-            if y >= max_y {
-                break;
-            }
+        let items: Vec<ListItem<'_>> = self
+            .filtered_indices
+            .iter()
+            .map(|&cmd_idx| {
+                let cmd = &self.commands[cmd_idx];
+                let name_part = if cmd.slash_command.is_empty() {
+                    cmd.name.to_string()
+                } else {
+                    alloc::format!("{} ({})", cmd.name, cmd.slash_command)
+                };
 
-            let cmd = &self.commands[cmd_idx];
-            let is_selected = visible_i == self.selected;
+                let keybinding_part = if cmd.keybinding.is_empty() {
+                    String::new()
+                } else {
+                    alloc::format!("  [{}]", cmd.keybinding)
+                };
 
-            let name_part = if cmd.slash_command.is_empty() {
-                cmd.name.to_string()
-            } else {
-                alloc::format!("{} ({})", cmd.name, cmd.slash_command)
-            };
-
-            let keybinding_part = if cmd.keybinding.is_empty() {
-                String::new()
-            } else {
-                alloc::format!("  [{}]", cmd.keybinding)
-            };
-
-            let display = alloc::format!("{}{}", name_part, keybinding_part);
-
-            let prefix = if is_selected { "> " } else { "  " };
-            let full_display = alloc::format!("{}{}", prefix, display);
-
-            let style = if is_selected {
-                theme.selection
-            } else {
-                theme.text
-            };
-
-            Text::from(full_display)
-                .style(style)
-                .render(Rect::new(area.x, y, area.width, 1), frame.buffer_mut());
-        }
+                let display = alloc::format!("{}{}", name_part, keybinding_part);
+                ListItem::new(Line::from(display))
+            })
+            .collect();
+        let mut state = ListState::default().with_selected(Some(self.selected));
+        StatefulWidget::render(
+            List::new(items)
+                .style(theme.text)
+                .highlight_style(theme.selection)
+                .highlight_symbol("> "),
+            list_area,
+            frame.buffer_mut(),
+            &mut state,
+        );
     }
 
     fn handle_event(&mut self, event: Event) -> Action {
@@ -243,14 +236,21 @@ impl Modal for CommandPaletteModal {
     fn title(&self) -> &str {
         "Command Palette"
     }
+
+    fn preferred_size(&self, area: Rect) -> (u16, u16) {
+        (
+            ((area.width as u32) / 2).clamp(48, area.width as u32) as u16,
+            16.min(area.height),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::{KeyEvent, Modifiers, Scancode};
-    use ratatui_core::backend::TestBackend;
-    use ratatui_core::terminal::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn key_event(scancode: Scancode, modifiers: Modifiers) -> KeyEvent {
         KeyEvent {

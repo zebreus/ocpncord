@@ -24,6 +24,7 @@ TUI depends only on `Backend` trait (`ocpncord-backend`), never on `ocpncord-bac
 
 ```sh
 cargo check                            # only verification (no CI, no formatter/linter, no rust-toolchain.toml)
+cargo fmt --all                        # format before committing
 cargo build
 cargo run -p ocpncord-native -- --url http://localhost:4096
                                        # requires `opencode serve --port 4096`
@@ -33,6 +34,8 @@ cargo test -p ocpncord-backend-opencode --test integration -- --nocapture
 ```
 
 `cargo test` (without `--lib`) compiles all tests including integration. Use `--lib` when no server is running.
+
+Before committing, always run `cargo fmt --all` and `cargo check`.
 
 ## Key facts
 

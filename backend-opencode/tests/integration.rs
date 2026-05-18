@@ -8,9 +8,9 @@ use core::result::Result as CoreResult;
 
 use embedded_io_async::{ErrorType, Read};
 use embedded_nal_async::{AddrType, Dns, TcpConnect};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ocpncord_backend::*;
 use ocpncord_backend_opencode::OpenCodeBackend;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // --- Transport types (mirror opencode-native) ---
 
@@ -120,7 +120,10 @@ async fn create_and_get_session() {
     assert!(!s.version.is_empty());
     assert!(s.time.created > 0);
 
-    let fetched = b.get_session(&s.id).await.expect("get session should succeed");
+    let fetched = b
+        .get_session(&s.id)
+        .await
+        .expect("get session should succeed");
     assert_eq!(fetched.id, s.id);
     assert_eq!(fetched.title, s.title);
 }
@@ -131,7 +134,10 @@ async fn list_sessions() {
     // Ensure at least one session exists
     let _ = b.create_session("list-test", "/tmp").await;
 
-    let sessions = b.list_sessions().await.expect("list sessions should succeed");
+    let sessions = b
+        .list_sessions()
+        .await
+        .expect("list sessions should succeed");
     assert!(!sessions.is_empty());
     // Our session should be in the list
     assert!(sessions.iter().any(|s| s.title == "list-test"));
@@ -167,9 +173,7 @@ async fn children_sessions() {
 async fn abort_session() {
     let mut b = backend();
     let s = b.create_session("abort-test", "/tmp").await.unwrap();
-    b.abort_session(&s.id)
-        .await
-        .expect("abort should succeed");
+    b.abort_session(&s.id).await.expect("abort should succeed");
 }
 
 #[tokio::test]
@@ -228,7 +232,10 @@ async fn prompt_and_messages() {
         .list_messages(&s.id)
         .await
         .expect("list messages should succeed");
-    assert!(!messages.is_empty(), "prompt should create at least one message");
+    assert!(
+        !messages.is_empty(),
+        "prompt should create at least one message"
+    );
 
     // Check the message has expected fields
     let msg = &messages[0];

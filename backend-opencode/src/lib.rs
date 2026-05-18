@@ -26,7 +26,10 @@ const RX_BUF_SIZE: usize = 65536;
 ///
 /// Generic over the TCP transport and DNS resolver, allowing it to work
 /// with any platform that implements `embedded-nal-async` traits.
-pub struct OpenCodeBackend<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + 'static> {
+pub struct OpenCodeBackend<
+    T: embedded_nal_async::TcpConnect + 'static,
+    D: embedded_nal_async::Dns + 'static,
+> {
     base_url: String,
     rx_buf: [u8; RX_BUF_SIZE],
     transport: &'static T,
@@ -86,7 +89,9 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         let mut client = self.make_client();
         if let Some(bytes) = body_bytes {
             let handle = client.request(method, url).await.map_err(conn_err)?;
-            let mut handle = handle.body(bytes).content_type(ContentType::ApplicationJson);
+            let mut handle = handle
+                .body(bytes)
+                .content_type(ContentType::ApplicationJson);
             let response = handle.send(&mut self.rx_buf).await.map_err(conn_err)?;
             if !response.status.is_successful() {
                 let status = response.status.0;
@@ -113,7 +118,10 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
 /// POST JSON to the given URL and return the response body.
 /// Allocates its own rx buffer so it can be used in a boxed future without `&mut` access.
-async fn http_post_json<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + 'static>(
+async fn http_post_json<
+    T: embedded_nal_async::TcpConnect + 'static,
+    D: embedded_nal_async::Dns + 'static,
+>(
     transport: &'static T,
     dns: &'static D,
     url: &str,
@@ -136,7 +144,10 @@ async fn http_post_json<T: embedded_nal_async::TcpConnect + 'static, D: embedded
 /// Send a POST request and return immediately after receiving the status code.
 /// The response body is discarded — used for fire-and-forget triggers where
 /// the actual response arrives via the SSE event stream.
-async fn http_post_fire_and_forget<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + 'static>(
+async fn http_post_fire_and_forget<
+    T: embedded_nal_async::TcpConnect + 'static,
+    D: embedded_nal_async::Dns + 'static,
+>(
     transport: &'static T,
     dns: &'static D,
     url: &str,
@@ -158,7 +169,10 @@ async fn http_post_fire_and_forget<T: embedded_nal_async::TcpConnect + 'static, 
 }
 
 /// GET the given URL and return the response body (non-blocking, own buffer).
-async fn http_get<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + 'static>(
+async fn http_get<
+    T: embedded_nal_async::TcpConnect + 'static,
+    D: embedded_nal_async::Dns + 'static,
+>(
     transport: &'static T,
     dns: &'static D,
     url: &str,
@@ -204,7 +218,10 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
     async fn create_session(&mut self, title: &str, cwd: &str) -> Result<Session> {
         let url = alloc::format!("{}/session", self.base_url);
-        let body = ocpncord_types::CreateSessionBody { title, directory: cwd };
+        let body = ocpncord_types::CreateSessionBody {
+            title,
+            directory: cwd,
+        };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
         let body = self
             .send_get_body(Method::POST, &url, Some(json.as_bytes()))
@@ -254,7 +271,9 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
     ) -> Result<MessageDetail> {
         let url = alloc::format!(
             "{}/session/{}/message/{}",
-            self.base_url, session_id, message_id
+            self.base_url,
+            session_id,
+            message_id
         );
         let body = self.send_get_body(Method::GET, &url, None).await?;
         serde_json::from_slice(&body).map_err(parse_err)

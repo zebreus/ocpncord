@@ -10,7 +10,7 @@ use log::{LevelFilter, Log, Metadata, Record};
 use clap::Parser;
 use crossterm::cursor::{Hide, Show};
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, size,
+    disable_raw_mode, enable_raw_mode, size, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::{execute, queue};
 use embedded_io_async::{ErrorType, Read};
@@ -72,7 +72,9 @@ impl Log for TuiLogger {
     }
 }
 
-static LOGGER: TuiLogger = TuiLogger { file: Mutex::new(None) };
+static LOGGER: TuiLogger = TuiLogger {
+    file: Mutex::new(None),
+};
 
 /// A TCP transport over tokio `TcpStream`.
 struct StdTcp;
@@ -228,17 +230,31 @@ impl Backend for CrosstermBackend {
     }
 
     fn clear(&mut self) -> Result<(), Self::Error> {
-        let _ = execute!(stdout(), crossterm::terminal::Clear(crossterm::terminal::ClearType::All));
+        let _ = execute!(
+            stdout(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        );
         Ok(())
     }
 
-    fn clear_region(&mut self, clear_type: ratatui_core::backend::ClearType) -> Result<(), Self::Error> {
+    fn clear_region(
+        &mut self,
+        clear_type: ratatui_core::backend::ClearType,
+    ) -> Result<(), Self::Error> {
         let ct = match clear_type {
             ratatui_core::backend::ClearType::All => crossterm::terminal::ClearType::All,
-            ratatui_core::backend::ClearType::AfterCursor => crossterm::terminal::ClearType::FromCursorDown,
-            ratatui_core::backend::ClearType::BeforeCursor => crossterm::terminal::ClearType::FromCursorUp,
-            ratatui_core::backend::ClearType::CurrentLine => crossterm::terminal::ClearType::CurrentLine,
-            ratatui_core::backend::ClearType::UntilNewLine => crossterm::terminal::ClearType::UntilNewLine,
+            ratatui_core::backend::ClearType::AfterCursor => {
+                crossterm::terminal::ClearType::FromCursorDown
+            }
+            ratatui_core::backend::ClearType::BeforeCursor => {
+                crossterm::terminal::ClearType::FromCursorUp
+            }
+            ratatui_core::backend::ClearType::CurrentLine => {
+                crossterm::terminal::ClearType::CurrentLine
+            }
+            ratatui_core::backend::ClearType::UntilNewLine => {
+                crossterm::terminal::ClearType::UntilNewLine
+            }
         };
         let _ = execute!(stdout(), crossterm::terminal::Clear(ct));
         Ok(())
@@ -257,8 +273,12 @@ fn translate_crossterm_event(event: crossterm::event::Event) -> Option<Event> {
     match event {
         crossterm::event::Event::Key(key) => {
             let modifiers = Modifiers {
-                ctrl: key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL),
-                shift: key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT),
+                ctrl: key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL),
+                shift: key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::SHIFT),
                 alt: key.modifiers.contains(crossterm::event::KeyModifiers::ALT),
                 meta: false,
             };
@@ -280,7 +300,10 @@ fn translate_crossterm_event(event: crossterm::event::Event) -> Option<Event> {
                 crossterm::event::KeyCode::F(n) => Scancode::F(n),
                 _ => return None,
             };
-            Some(Event::Key(KeyEvent { scancode, modifiers }))
+            Some(Event::Key(KeyEvent {
+                scancode,
+                modifiers,
+            }))
         }
         crossterm::event::Event::Resize(_w, _h) => Some(Event::Tick),
         _ => None,
@@ -288,7 +311,10 @@ fn translate_crossterm_event(event: crossterm::event::Event) -> Option<Event> {
 }
 
 #[derive(Parser)]
-#[command(name = "ocpncord-native", about = "ocpncord — native TUI client for opencode")]
+#[command(
+    name = "ocpncord-native",
+    about = "ocpncord — native TUI client for opencode"
+)]
 struct Cli {
     /// OpenCode server URL
     #[arg(long = "url", default_value = "http://localhost:4096")]
@@ -303,10 +329,7 @@ struct Cli {
 
 /// Background task that maintains a persistent SSE connection to /global/event.
 /// Reconnects automatically with Last-Event-ID tracking.
-async fn sse_background_task(
-    base_url: String,
-    event_tx: mpsc::UnboundedSender<Option<Event>>,
-) {
+async fn sse_background_task(base_url: String, event_tx: mpsc::UnboundedSender<Option<Event>>) {
     static TCP: StdTcp = StdTcp;
     static DNS: StdDns = StdDns;
 
@@ -361,10 +384,7 @@ async fn connect_and_read_sse(
         }
         pos += n;
         if let Some(header_end) = buf[..pos].windows(4).position(|w| w == b"\r\n\r\n") {
-            let status_end = buf[..pos]
-                .iter()
-                .position(|&b| b == b'\r')
-                .unwrap_or(pos);
+            let status_end = buf[..pos].iter().position(|&b| b == b'\r').unwrap_or(pos);
             let status_line =
                 core::str::from_utf8(&buf[..status_end]).map_err(|_| "invalid utf-8")?;
             if !status_line.contains("200") {
@@ -394,7 +414,9 @@ async fn connect_and_read_sse(
 }
 
 fn send_events(
-    events: Vec<core::result::Result<ocpncord_backend::BackendEvent, ocpncord_backend::BackendError>>,
+    events: Vec<
+        core::result::Result<ocpncord_backend::BackendEvent, ocpncord_backend::BackendError>,
+    >,
     event_tx: &mpsc::UnboundedSender<Option<Event>>,
 ) {
     for event in events {
@@ -413,7 +435,9 @@ fn send_events(
     }
 }
 
-fn parse_http_url(url: &str) -> core::result::Result<(String, u16, String), Box<dyn std::error::Error>> {
+fn parse_http_url(
+    url: &str,
+) -> core::result::Result<(String, u16, String), Box<dyn std::error::Error>> {
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
@@ -504,7 +528,14 @@ async fn main() {
             }
         }
 
-        log::debug!("[RENDER] screen={:?} is_streaming={} partial_parts={} messages={} tick={}", app.active_screen(), app.is_streaming(), app.partial_parts().len(), app.messages().len(), app.tick());
+        log::trace!(
+            "[RENDER] screen={:?} is_streaming={} partial_parts={} messages={} tick={}",
+            app.active_screen(),
+            app.is_streaming(),
+            app.partial_parts().len(),
+            app.messages().len(),
+            app.tick()
+        );
         let _ = terminal.draw(|frame| app.render(frame));
     }
 

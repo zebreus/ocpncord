@@ -4,6 +4,7 @@ use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::Cell;
 
 use ocpncord_backend::{Backend, BackendEvent};
 
@@ -13,13 +14,15 @@ use crate::event::{Event, Scancode};
 use crate::key_chord::KeyChord;
 use crate::modal::{HelpModal, Modal, ModelPickerModal, SessionListModal};
 use crate::prompt_bar::PromptBar;
-use crate::screen::{Action, ModalId, Screen, ScreenId};
+use crate::screen::{Action, ModalId, ScreenId};
 use crate::start_page::StartPage;
 use crate::theme::Theme;
-use ratatui_core::layout::{Position, Rect};
-use ratatui_core::style::{Color, Style};
-use ratatui_core::text::Text;
-use ratatui_core::widgets::Widget;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::text::{Line, Text};
+use ratatui::widgets::{
+    Block, BorderType, Cell as TableCell, Clear, List, ListItem, ListState, Paragraph, Row,
+    Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Table, Tabs, Widget, Wrap,
+};
 
 /// A toast notification displayed briefly in the top-right corner.
 #[derive(Debug, Clone)]
@@ -45,7 +48,6 @@ pub struct LoadedMessage {
     pub role: ocpncord_backend::MessageRole,
     pub parts: Vec<ocpncord_backend::Part>,
 }
-
 
 /// A single LSP diagnostic entry.
 #[derive(Debug, Clone)]
@@ -134,7 +136,8 @@ pub struct App<B: Backend> {
     // Session cache for modals
     cached_sessions: Vec<ocpncord_backend::Session>,
     // Permission & Question pending queues
-    pending_permissions: alloc::collections::VecDeque<(ocpncord_backend::PermissionRequest, String)>,
+    pending_permissions:
+        alloc::collections::VecDeque<(ocpncord_backend::PermissionRequest, String)>,
     pending_questions: alloc::collections::VecDeque<(ocpncord_backend::QuestionRequest, String)>,
     // Toast notifications
     toasts: alloc::collections::VecDeque<Toast>,
@@ -142,8 +145,9 @@ pub struct App<B: Backend> {
     side_panel_visible: bool,
     side_panel_tab: crate::screen::Tab,
     side_panel_scroll: u16,
-// Track the screen before switching to Terminal for toggle back
+    // Track the screen before switching to Terminal for toggle back
     screen_before_terminal: ScreenId,
+    terminal_view_height: Cell<u16>,
     // LSP diagnostics cache: file_path -> diagnostics
     lsp_diagnostics: alloc::collections::BTreeMap<String, Vec<LspDiagnostic>>,
     // Todo cache
@@ -184,6 +188,7 @@ impl<B: Backend> App<B> {
             side_panel_tab: crate::screen::Tab::Diagnostics,
             side_panel_scroll: 0,
             screen_before_terminal: ScreenId::StartPage,
+            terminal_view_height: Cell::new(10),
             lsp_diagnostics: alloc::collections::BTreeMap::new(),
             todos: Vec::new(),
             current_workspace: None,
@@ -240,7 +245,9 @@ impl<B: Backend> App<B> {
     /// Prompt stream takes priority (it's the active conversation).
     /// Sync stream provides background session/message updates.
     /// Returns None when the stream is exhausted.
-    pub async fn poll_next_event(&mut self) -> Option<Result<BackendEvent, ocpncord_backend::BackendError>> {
+    pub async fn poll_next_event(
+        &mut self,
+    ) -> Option<Result<BackendEvent, ocpncord_backend::BackendError>> {
         use futures::StreamExt;
 
         if let Some(stream) = &mut self.stream {
@@ -371,13 +378,14 @@ impl<B: Backend> App<B> {
                         Action::CloseModal => self.active_modal = None,
                         Action::None => {}
                         other => {
+                            self.active_modal = None;
                             return self.apply_action(Some(other)).await;
                         }
                     }
                     return true;
                 }
 
-if self.is_streaming {
+                if self.is_streaming {
                     if key.scancode == Scancode::Escape {
                         return self.handle_interrupt().await;
                     }
@@ -407,6 +415,42 @@ if self.is_streaming {
                     return true;
                 }
 
+                if key.scancode == Scancode::Escape {
+                    if !self.prompt_bar.is_empty() {
+                        self.prompt_bar.clear();
+                    }
+                    return true;
+                }
+
+                if self.active_screen == ScreenId::Terminal {
+                    let action = match key.scancode {
+                        Scancode::Up => Some(Action::ScrollUp),
+                        Scancode::Down => Some(Action::ScrollDown),
+                        Scancode::PageUp => Some(Action::ScrollPageUp),
+                        Scancode::PageDown => Some(Action::ScrollPageDown),
+                        _ => None,
+                    };
+                    if action.is_some() {
+                        return self.apply_action(action).await;
+                    }
+                    return true;
+                }
+
+                if self.active_screen == ScreenId::Chat
+                    || (self.side_panel_visible && self.side_panel_tab == crate::screen::Tab::Pane)
+                {
+                    let action = match key.scancode {
+                        Scancode::Up => Some(Action::ScrollUp),
+                        Scancode::Down => Some(Action::ScrollDown),
+                        Scancode::PageUp => Some(Action::ScrollPageUp),
+                        Scancode::PageDown => Some(Action::ScrollPageDown),
+                        _ => None,
+                    };
+                    if action.is_some() {
+                        return self.apply_action(action).await;
+                    }
+                }
+
                 if let Some(action) = self.prompt_bar.handle_key(key) {
                     match action {
                         Action::SendMessage => {
@@ -434,7 +478,9 @@ if self.is_streaming {
                             if let Ok(summaries) = self.backend.list_messages(&session_id).await {
                                 let mut api_messages: Vec<LoadedMessage> = Vec::new();
                                 for summary in &summaries {
-                                    if let Ok(detail) = self.backend.get_message(&session_id, &summary.id).await {
+                                    if let Ok(detail) =
+                                        self.backend.get_message(&session_id, &summary.id).await
+                                    {
                                         api_messages.push(LoadedMessage {
                                             role: detail.info.role,
                                             parts: detail.parts,
@@ -458,7 +504,11 @@ if self.is_streaming {
                         self.partial_texts.clear();
                     }
                     ocpncord_backend::BackendEvent::SessionCreated { session } => {
-                        let is_new = self.active_session.as_ref().map(|s| s.id != session.id).unwrap_or(true);
+                        let is_new = self
+                            .active_session
+                            .as_ref()
+                            .map(|s| s.id != session.id)
+                            .unwrap_or(true);
                         self.active_session = Some(session);
                         self.active_screen = ScreenId::Chat;
                         if is_new {
@@ -485,7 +535,7 @@ if self.is_streaming {
                     ocpncord_backend::BackendEvent::SessionDiff { .. } => {}
                     ocpncord_backend::BackendEvent::SessionCompacted { .. } => {}
                     ocpncord_backend::BackendEvent::MessageUpdated { .. } => {
-                if self.is_streaming {
+                        if self.is_streaming {
                             let parts = core::mem::take(&mut self.partial_parts);
                             if !parts.is_empty() {
                                 self.messages.push(LoadedMessage {
@@ -499,13 +549,25 @@ if self.is_streaming {
                         }
                     }
                     ocpncord_backend::BackendEvent::MessageRemoved { .. } => {}
-                    ocpncord_backend::BackendEvent::MessagePartUpdated { session_id, ref part } => {
-                        if self.active_session.as_ref().map(|s| s.id.as_str()) == Some(session_id.as_str()) {
+                    ocpncord_backend::BackendEvent::MessagePartUpdated {
+                        session_id,
+                        ref part,
+                    } => {
+                        if self.active_session.as_ref().map(|s| s.id.as_str())
+                            == Some(session_id.as_str())
+                        {
                             self.partial_parts.push(part.clone());
                         }
                     }
-                    ocpncord_backend::BackendEvent::MessagePartDelta { ref session_id, part_id, field, delta, .. } if field == "text"
-                        && self.active_session.as_ref().map(|s| s.id.as_str()) == Some(session_id.as_str()) =>
+                    ocpncord_backend::BackendEvent::MessagePartDelta {
+                        ref session_id,
+                        part_id,
+                        field,
+                        delta,
+                        ..
+                    } if field == "text"
+                        && self.active_session.as_ref().map(|s| s.id.as_str())
+                            == Some(session_id.as_str()) =>
                     {
                         let acc = self.partial_texts.entry(part_id).or_default();
                         acc.push_str(&delta);
@@ -527,14 +589,22 @@ if self.is_streaming {
                     ocpncord_backend::BackendEvent::MessagePartDelta { .. } => {}
                     ocpncord_backend::BackendEvent::MessagePartRemoved { .. } => {}
                     ocpncord_backend::BackendEvent::PermissionAsked { request } => {
-                        let sid = self.active_session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+                        let sid = self
+                            .active_session
+                            .as_ref()
+                            .map(|s| s.id.clone())
+                            .unwrap_or_default();
                         self.pending_permissions.push_back((request.clone(), sid));
                     }
                     ocpncord_backend::BackendEvent::PermissionReplied { .. } => {
                         self.pending_permissions.pop_front();
                     }
                     ocpncord_backend::BackendEvent::QuestionAsked { request } => {
-                        let sid = self.active_session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+                        let sid = self
+                            .active_session
+                            .as_ref()
+                            .map(|s| s.id.clone())
+                            .unwrap_or_default();
                         self.pending_questions.push_back((request.clone(), sid));
                     }
                     ocpncord_backend::BackendEvent::QuestionRejected { .. } => {
@@ -543,7 +613,9 @@ if self.is_streaming {
                     ocpncord_backend::BackendEvent::QuestionReplied { .. } => {
                         self.pending_questions.pop_front();
                     }
-                    ocpncord_backend::BackendEvent::CommandExecuted { name, arguments, .. } => {
+                    ocpncord_backend::BackendEvent::CommandExecuted {
+                        name, arguments, ..
+                    } => {
                         self.toasts.push_back(Toast {
                             title: Some("Command".into()),
                             message: alloc::format!("{name} {arguments}"),
@@ -710,6 +782,9 @@ if self.is_streaming {
             }
             Event::Tick => {
                 self.tick = self.tick.wrapping_add(1);
+                let tick = self.tick;
+                self.toasts
+                    .retain(|toast| tick.saturating_sub(toast.created_at) <= toast.duration);
                 if let Some(action) = self.key_chord.tick(self.tick) {
                     return self.apply_action(Some(action)).await;
                 }
@@ -728,7 +803,11 @@ if self.is_streaming {
         }
 
         if self.active_session.is_none() {
-            match self.backend.create_session("Chat", self.current_workspace.as_deref().unwrap_or("")).await {
+            match self
+                .backend
+                .create_session("Chat", self.current_workspace.as_deref().unwrap_or(""))
+                .await
+            {
                 Ok(session) => {
                     self.active_session = Some(session);
                 }
@@ -789,7 +868,11 @@ if self.is_streaming {
                 true
             }
             "/new" => {
-                match self.backend.create_session("Chat", self.current_workspace.as_deref().unwrap_or("")).await {
+                match self
+                    .backend
+                    .create_session("Chat", self.current_workspace.as_deref().unwrap_or(""))
+                    .await
+                {
                     Ok(session) => {
                         self.active_session = Some(session);
                     }
@@ -850,9 +933,7 @@ if self.is_streaming {
                 true
             }
             "/exit" => false,
-            _ => {
-                self.handle_unknown_slash_command(text).await
-            }
+            _ => self.handle_unknown_slash_command(text).await,
         }
     }
 
@@ -969,7 +1050,9 @@ if self.is_streaming {
                     Ok(summaries) => {
                         let mut messages = Vec::new();
                         for summary in summaries {
-                            if let Ok(detail) = self.backend.get_message(&session_id, &summary.id).await {
+                            if let Ok(detail) =
+                                self.backend.get_message(&session_id, &summary.id).await
+                            {
                                 messages.push(LoadedMessage {
                                     role: detail.info.role,
                                     parts: detail.parts,
@@ -986,15 +1069,15 @@ if self.is_streaming {
     }
 
     async fn apply_action(&mut self, action: Option<Action>) -> bool {
-         match action {
-             Some(Action::Quit) => return false,
-             Some(Action::SwitchScreen(id)) => self.active_screen = id,
-             Some(Action::CloseModal) => self.active_modal = None,
-             Some(Action::OpenPalette) => {
-                 let modal = CommandPaletteModal::new(crate::command_palette::default_commands());
-                 self.active_modal = Some(Box::new(modal));
-             }
-             Some(Action::OpenModal(ModalId::SessionList)) => {
+        match action {
+            Some(Action::Quit) => return false,
+            Some(Action::SwitchScreen(id)) => self.active_screen = id,
+            Some(Action::CloseModal) => self.active_modal = None,
+            Some(Action::OpenPalette) => {
+                let modal = CommandPaletteModal::new(crate::command_palette::default_commands());
+                self.active_modal = Some(Box::new(modal));
+            }
+            Some(Action::OpenModal(ModalId::SessionList)) => {
                 let mut modal = SessionListModal::new();
                 match self.backend.list_sessions().await {
                     Ok(sessions) => modal.set_sessions(sessions),
@@ -1064,10 +1147,34 @@ if self.is_streaming {
                 return self.handle_interrupt().await;
             }
             Some(Action::ScrollUp) => {
-                self.chat.scroll = self.chat.scroll.saturating_add(1);
+                if self.scroll_targets_terminal() {
+                    self.scroll_terminal_up(1);
+                } else {
+                    self.chat.scroll = self.chat.scroll.saturating_add(1);
+                }
             }
             Some(Action::ScrollDown) => {
-                self.chat.scroll = self.chat.scroll.saturating_sub(1);
+                if self.scroll_targets_terminal() {
+                    self.scroll_terminal_down(1);
+                } else {
+                    self.chat.scroll = self.chat.scroll.saturating_sub(1);
+                }
+            }
+            Some(Action::ScrollPageUp) => {
+                let amount = self.page_scroll_amount();
+                if self.scroll_targets_terminal() {
+                    self.scroll_terminal_up(amount);
+                } else {
+                    self.chat.scroll = self.chat.scroll.saturating_add(amount);
+                }
+            }
+            Some(Action::ScrollPageDown) => {
+                let amount = self.page_scroll_amount();
+                if self.scroll_targets_terminal() {
+                    self.scroll_terminal_down(amount);
+                } else {
+                    self.chat.scroll = self.chat.scroll.saturating_sub(amount);
+                }
             }
             Some(Action::ToggleSidePanel) => {
                 self.side_panel_visible = !self.side_panel_visible;
@@ -1114,15 +1221,71 @@ if self.is_streaming {
         true
     }
 
-    pub fn render(&self, frame: &mut ratatui_core::terminal::Frame) {
+    fn page_scroll_amount(&self) -> u16 {
+        self.terminal_view_height.get().saturating_sub(1).max(1)
+    }
+
+    fn scroll_targets_terminal(&self) -> bool {
+        self.active_screen == ScreenId::Terminal
+            || (self.side_panel_visible && self.side_panel_tab == crate::screen::Tab::Pane)
+    }
+
+    fn max_terminal_scroll(&self) -> u16 {
+        self.terminal
+            .lines
+            .len()
+            .saturating_sub(self.terminal_view_height.get() as usize) as u16
+    }
+
+    fn scroll_terminal_up(&mut self, amount: u16) {
+        let max_scroll = self.max_terminal_scroll();
+        self.terminal.scroll = self.terminal.scroll.saturating_add(amount).min(max_scroll);
+    }
+
+    fn scroll_terminal_down(&mut self, amount: u16) {
+        self.terminal.scroll = self.terminal.scroll.saturating_sub(amount);
+    }
+
+    pub fn render(&self, frame: &mut ratatui::Frame) {
+        let area = frame.area();
+        let panel_width = if self.side_panel_visible {
+            ((area.width as u32 * 30) / 100)
+                .max(24)
+                .min(area.width as u32) as u16
+        } else {
+            0
+        };
+        let chunks = if panel_width > 0 {
+            Layout::new(
+                Direction::Horizontal,
+                [
+                    Constraint::Min(0),
+                    Constraint::Length(panel_width.min(area.width)),
+                ],
+            )
+            .split(area)
+        } else {
+            Layout::new(Direction::Horizontal, [Constraint::Min(0)]).split(area)
+        };
+        let main_area = chunks[0];
+
         match self.active_screen {
             ScreenId::StartPage => {
-                StartPage.render(frame, &self.theme);
-                let area = frame.area();
+                StartPage.render_in(frame, &self.theme, main_area);
+                let rows = Layout::new(
+                    Direction::Vertical,
+                    [
+                        Constraint::Min(0),
+                        Constraint::Length(1),
+                        Constraint::Length(7),
+                    ],
+                )
+                .split(main_area);
+                let prompt_row = rows[1];
                 let prompt_area = Rect::new(
-                    area.x + area.width.saturating_sub(50) / 2,
-                    area.height.saturating_sub(8),
-                    50.min(area.width),
+                    prompt_row.x + prompt_row.width.saturating_sub(50) / 2,
+                    prompt_row.y,
+                    50.min(prompt_row.width),
                     1,
                 );
                 self.prompt_bar.render(
@@ -1134,29 +1297,33 @@ if self.is_streaming {
                     self.tick,
                 );
             }
-ScreenId::Chat => {
-                 render_chat(
-                     frame,
-                     &self.theme,
-                     &self.messages,
-                     &self.partial_parts,
-                     self.is_streaming,
-                     self.chat.scroll,
-                 );
-                 let area = frame.area();
-                 let prompt_area = Rect::new(area.x, area.height.saturating_sub(1), area.width, 1);
-                 self.prompt_bar.render(
-                     prompt_area,
-                     frame,
-                     &self.theme,
-                     self.is_streaming,
-                     self.active_agent_name(),
-                     self.tick,
-                 );
-             }
-             ScreenId::Terminal => {
-                 self.render_terminal(frame);
-             }
+            ScreenId::Chat => {
+                let rows = Layout::new(
+                    Direction::Vertical,
+                    [Constraint::Min(0), Constraint::Length(1)],
+                )
+                .split(main_area);
+                render_chat(
+                    frame,
+                    &self.theme,
+                    main_area,
+                    &self.messages,
+                    &self.partial_parts,
+                    self.is_streaming,
+                    self.chat.scroll,
+                );
+                self.prompt_bar.render(
+                    rows[1],
+                    frame,
+                    &self.theme,
+                    self.is_streaming,
+                    self.active_agent_name(),
+                    self.tick,
+                );
+            }
+            ScreenId::Terminal => {
+                self.render_terminal(frame, main_area);
+            }
         }
 
         if let Some(ref err) = self.error {
@@ -1202,244 +1369,215 @@ ScreenId::Chat => {
 
         // Render side panel (right 30% when visible)
         if self.side_panel_visible {
-            let area = frame.area();
-            let panel_width = (area.width as f32 * 0.3) as u16;
-            let panel_x = area.width - panel_width;
-            let panel_area = Rect::new(panel_x, area.y, panel_width, area.height);
-
-            // Background — clear stale symbols and set panel colour
-            let buf = frame.buffer_mut();
-            let panel_style = self.theme.side_panel_bg;
-            for y in panel_area.top()..panel_area.bottom() {
-                for x in panel_area.left()..panel_area.right() {
-                    if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
-                        cell.set_symbol(" ");
-                        cell.set_style(panel_style);
-                    }
-                }
-            }
-
-            // Tab bar
-            let _tabs = ["Diagnostics", "Todos", "Terminal"];
-            let tab_labels: [&str; 3] = ["Diagnostics", "Todos", "Terminal"];
-            let mut tab_x = panel_x + 1;
-            for (i, label) in tab_labels.iter().enumerate() {
-                let is_active = match (i, self.side_panel_tab) {
-                    (0, crate::screen::Tab::Diagnostics) => true,
-                    (1, crate::screen::Tab::Todos) => true,
-                    (2, crate::screen::Tab::Pane) => true,
-                    _ => false,
-                };
-                let style = if is_active {
-                    self.theme.side_panel_tab_active
-                } else {
-                    self.theme.side_panel_tab_inactive
-                };
-                let display = alloc::format!(" {} ", label);
-                Text::from(display.as_str())
-                    .style(style)
-                    .render(Rect::new(tab_x, area.y, display.len() as u16, 1), frame.buffer_mut());
-                tab_x += display.len() as u16 + 1;
-            }
-
-            // Content area
-            let content_area = Rect::new(panel_x + 1, area.y + 1, panel_width - 2, area.height - 1);
-            match self.side_panel_tab {
-                crate::screen::Tab::Diagnostics => {
-                    if self.lsp_diagnostics.is_empty() {
-                        Text::from("No diagnostics")
-                            .style(self.theme.text_dim)
-                            .render(content_area, frame.buffer_mut());
-                    } else {
-                        let mut y = content_area.y;
-                        for (file, diags) in self.lsp_diagnostics.iter() {
-                            if y >= content_area.bottom() { break; }
-                            Text::from(file.as_str())
-                                .style(self.theme.side_panel_title)
-                                .render(Rect::new(content_area.x, y, content_area.width, 1), frame.buffer_mut());
-                            y += 1;
-                            for diag in diags.iter() {
-                                if y >= content_area.bottom() { break; }
-                                let sev = diag.severity.as_deref().unwrap_or("info");
-                                let display = alloc::format!("  [{}] {}:{} {}", sev, diag.line, diag.character, diag.message);
-                                let display: String = display.chars().take(content_area.width as usize).collect();
-                                Text::from(display.as_str())
-                                    .style(self.theme.text)
-                                    .render(Rect::new(content_area.x, y, content_area.width, 1), frame.buffer_mut());
-                                y += 1;
-                            }
-                        }
-                    }
-                }
-                crate::screen::Tab::Todos => {
-                    if self.todos.is_empty() {
-                        Text::from("No todos")
-                            .style(self.theme.text_dim)
-                            .render(content_area, frame.buffer_mut());
-                    } else {
-                        let mut y = content_area.y;
-                        for todo in self.todos.iter() {
-                            if y >= content_area.bottom() { break; }
-                            let checkbox = if todo.status == "completed" { "[x]" } else { "[ ]" };
-                            let display = alloc::format!("{} {}", checkbox, todo.content);
-                            let display: String = display.chars().take(content_area.width as usize).collect();
-                            let style = if todo.status == "completed" {
-                                self.theme.text_dim
-                            } else {
-                                self.theme.text
-                            };
-                            Text::from(display.as_str())
-                                .style(style)
-                                .render(Rect::new(content_area.x, y, content_area.width, 1), frame.buffer_mut());
-                            y += 1;
-                        }
-                    }
-                }
-                crate::screen::Tab::Pane => {
-                    // Show PTY output in side panel
-                    if self.terminal.pty_id.is_none() {
-                        Text::from("No terminal")
-                            .style(self.theme.text_dim)
-                            .render(content_area, frame.buffer_mut());
-                    } else {
-                        let mut y = content_area.y;
-                        for line in self.terminal.lines.iter().skip(self.terminal.scroll as usize) {
-                            if y >= content_area.bottom() { break; }
-                            let style = if line.is_error { self.theme.pty_error } else { self.theme.pty_output };
-                            let display: String = line.content.chars().take(content_area.width as usize).collect();
-                            Text::from(display.as_str())
-                                .style(style)
-                                .render(Rect::new(content_area.x, y, content_area.width, 1), frame.buffer_mut());
-                            y += 1;
-                        }
-                    }
-                }
-            }
+            let panel_area = if chunks.len() > 1 { chunks[1] } else { area };
+            self.render_side_panel(frame, panel_area);
         }
 
         if let Some(ref modal) = self.active_modal {
             let area = frame.area();
-
-            // Clear background symbols and apply dark overlay style.
-            // set_style alone is not enough — it changes styles but leaves
-            // stale symbols from the underlying screen (e.g. logo block
-            // characters, chat text) in the buffer.
-            {
-                let buf = frame.buffer_mut();
-                let dark = Style::new().bg(Color::Rgb(0, 0, 0)).fg(Color::Rgb(0, 0, 0));
-                for y in area.top()..area.bottom() {
-                    for x in area.left()..area.right() {
-                        if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
-                            cell.set_symbol(" ");
-                            cell.set_style(dark);
-                        }
-                    }
-                }
-            }
-
-            let modal_width = (area.width as f32 * 0.6) as u16;
-            let modal_height = (area.height as f32 * 0.7) as u16;
+            let (modal_width, modal_height) = modal.preferred_size(area);
             let modal_x = area.x + (area.width.saturating_sub(modal_width)) / 2;
             let modal_y = area.y + (area.height.saturating_sub(modal_height)) / 2;
-
-            use ratatui_core::symbols::border::ROUNDED;
-
-            let border_style = self.theme.border;
-            let buf = frame.buffer_mut();
-
-            for x in modal_x..modal_x + modal_width {
-                if let Some(cell) = buf.cell_mut(Position::new(x, modal_y)) {
-                    cell.set_style(border_style).set_symbol(ROUNDED.horizontal_top);
-                }
-                if let Some(cell) = buf.cell_mut(Position::new(x, modal_y + modal_height - 1)) {
-                    cell.set_style(border_style).set_symbol(ROUNDED.horizontal_bottom);
-                }
-            }
-            for y in modal_y..modal_y + modal_height {
-                if let Some(cell) = buf.cell_mut(Position::new(modal_x, y)) {
-                    cell.set_style(border_style).set_symbol(ROUNDED.vertical_left);
-                }
-                if let Some(cell) = buf.cell_mut(Position::new(modal_x + modal_width - 1, y)) {
-                    cell.set_style(border_style).set_symbol(ROUNDED.vertical_right);
-                }
-            }
-
-            if let Some(cell) = buf.cell_mut(Position::new(modal_x, modal_y)) {
-                cell.set_symbol(ROUNDED.top_left);
-            }
-            if let Some(cell) = buf.cell_mut(Position::new(modal_x + modal_width - 1, modal_y)) {
-                cell.set_symbol(ROUNDED.top_right);
-            }
-            if let Some(cell) = buf.cell_mut(Position::new(modal_x, modal_y + modal_height - 1)) {
-                cell.set_symbol(ROUNDED.bottom_left);
-            }
-            if let Some(cell) = buf.cell_mut(Position::new(modal_x + modal_width - 1, modal_y + modal_height - 1)) {
-                cell.set_symbol(ROUNDED.bottom_right);
-            }
-
-            let title = modal.title();
-            let title_style = self.theme.text_accent;
-            let title_x = modal_x + 2;
-            for (i, ch) in title.chars().enumerate() {
-                let tx = title_x + i as u16;
-                if tx < modal_x + modal_width - 1 {
-                    if let Some(cell) = buf.cell_mut(Position::new(tx, modal_y)) {
-                        cell.set_char(ch).set_style(title_style);
-                    }
-                }
-            }
-
-            let content_area = Rect::new(
-                modal_x + 1,
-                modal_y + 1,
-                modal_width - 2,
-                modal_height - 2,
-            );
+            let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+            Clear.render(modal_area, frame.buffer_mut());
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(self.theme.border)
+                .title_style(self.theme.text_accent)
+                .title(modal.title());
+            let content_area = block.inner(modal_area);
+            block.render(modal_area, frame.buffer_mut());
             modal.render(frame, &self.theme, content_area);
         }
     }
 
-    fn render_terminal(&self, frame: &mut ratatui_core::terminal::Frame) {
-        let area = frame.area();
+    fn render_side_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let panel = Block::new().style(self.theme.side_panel_bg);
+        let panel_inner = panel.inner(area);
+        panel.render(area, frame.buffer_mut());
 
-        if self.terminal.pty_id.is_none() {
-            let msg = "No active terminal — send a prompt to the agent to create one";
-            let msg_width = msg.len() as u16;
-            let x = (area.width.saturating_sub(msg_width)) / 2;
-            let y = area.height / 2;
-            Text::from(msg)
+        let rows = Layout::new(
+            Direction::Vertical,
+            [Constraint::Length(1), Constraint::Min(0)],
+        )
+        .split(panel_inner);
+        let selected = match self.side_panel_tab {
+            crate::screen::Tab::Diagnostics => 0,
+            crate::screen::Tab::Todos => 1,
+            crate::screen::Tab::Pane => 2,
+        };
+        Tabs::new(["Diagnostics", "Todos", "Terminal"])
+            .select(selected)
+            .style(self.theme.side_panel_tab_inactive)
+            .highlight_style(self.theme.side_panel_tab_active)
+            .render(rows[0], frame.buffer_mut());
+
+        let content_area = rows[1];
+        match self.side_panel_tab {
+            crate::screen::Tab::Diagnostics => self.render_diagnostics_panel(frame, content_area),
+            crate::screen::Tab::Todos => self.render_todos_panel(frame, content_area),
+            crate::screen::Tab::Pane => self.render_terminal_panel(frame, content_area),
+        }
+    }
+
+    fn render_diagnostics_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
+        if self.lsp_diagnostics.is_empty() {
+            Text::from("No diagnostics")
                 .style(self.theme.text_dim)
-                .render(Rect::new(x, y, msg_width.min(area.width), 1), frame.buffer_mut());
-        } else {
-            let pty_height = area.height.saturating_sub(1);
+                .render(area, frame.buffer_mut());
+            return;
+        }
 
-            let start_idx = self.terminal.scroll as usize;
-            let lines: Vec<_> = self
-                .terminal
-                .lines
-                .iter()
-                .skip(start_idx)
-                .take(pty_height as usize)
-                .collect();
+        let mut rows: Vec<Row<'_>> = Vec::new();
+        for (file, diags) in self.lsp_diagnostics.iter() {
+            rows.push(Row::new([
+                TableCell::new(""),
+                TableCell::new(""),
+                TableCell::new(file.as_str()).style(self.theme.side_panel_title),
+            ]));
+            for diag in diags.iter() {
+                let severity = diag.severity.as_deref().unwrap_or("info");
+                let location = alloc::format!("{}:{}", diag.line, diag.character);
+                rows.push(Row::new([
+                    TableCell::new(severity).style(self.theme.text_accent),
+                    TableCell::new(location),
+                    TableCell::new(diag.message.as_str()),
+                ]));
+            }
+        }
 
-            for (i, line) in lines.iter().enumerate() {
-                let y = area.y + i as u16;
+        Widget::render(
+            Table::new(
+                rows,
+                [
+                    Constraint::Length(7),
+                    Constraint::Length(7),
+                    Constraint::Min(8),
+                ],
+            )
+            .column_spacing(1)
+            .style(self.theme.text),
+            area,
+            frame.buffer_mut(),
+        );
+    }
+
+    fn render_todos_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
+        if self.todos.is_empty() {
+            Text::from("No todos")
+                .style(self.theme.text_dim)
+                .render(area, frame.buffer_mut());
+            return;
+        }
+
+        let items: Vec<ListItem<'_>> = self
+            .todos
+            .iter()
+            .map(|todo| {
+                let checkbox = if todo.status == "completed" {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                let style = if todo.status == "completed" {
+                    self.theme.text_dim
+                } else {
+                    self.theme.text
+                };
+                ListItem::new(Line::from(alloc::format!("{} {}", checkbox, todo.content)))
+                    .style(style)
+            })
+            .collect();
+        Widget::render(List::new(items), area, frame.buffer_mut());
+    }
+
+    fn render_terminal_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
+        if self.terminal.pty_id.is_none() {
+            Text::from("No terminal")
+                .style(self.theme.text_dim)
+                .render(area, frame.buffer_mut());
+            return;
+        }
+
+        self.terminal_view_height.set(area.height);
+        let start_idx =
+            terminal_start_index(self.terminal.lines.len(), area.height, self.terminal.scroll);
+        let items: Vec<ListItem<'_>> = self
+            .terminal
+            .lines
+            .iter()
+            .map(|line| {
                 let style = if line.is_error {
                     self.theme.pty_error
                 } else {
                     self.theme.pty_output
                 };
-                Text::from(line.content.as_str())
-                    .style(style)
-                    .render(Rect::new(area.x, y, area.width, 1), frame.buffer_mut());
-            }
+                ListItem::new(Line::from(line.content.as_str())).style(style)
+            })
+            .collect();
+        let mut state = ListState::default().with_offset(start_idx);
+        StatefulWidget::render(List::new(items), area, frame.buffer_mut(), &mut state);
 
-            let status_area = Rect::new(
-                area.x,
-                area.y + area.height - 1,
-                area.width,
-                1,
+        if self.terminal.lines.len() > area.height as usize {
+            let mut scrollbar = ScrollbarState::new(self.terminal.lines.len()).position(start_idx);
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_style(self.theme.scrollbar)
+                .track_style(self.theme.text_dim)
+                .render(area, frame.buffer_mut(), &mut scrollbar);
+        }
+    }
+
+    fn render_terminal(&self, frame: &mut ratatui::Frame, area: Rect) {
+        if self.terminal.pty_id.is_none() {
+            let msg = "No active terminal — send a prompt to the agent to create one";
+            let msg_width = msg.len() as u16;
+            let x = area.x + (area.width.saturating_sub(msg_width)) / 2;
+            let y = area.y + area.height / 2;
+            Text::from(msg).style(self.theme.text_dim).render(
+                Rect::new(x, y, msg_width.min(area.width), 1),
+                frame.buffer_mut(),
             );
+            Text::from("Ctrl+X T: back")
+                .style(self.theme.pty_status_bar)
+                .render(
+                    Rect::new(area.x, area.height.saturating_sub(1), area.width, 1),
+                    frame.buffer_mut(),
+                );
+        } else {
+            let rows = Layout::new(
+                Direction::Vertical,
+                [Constraint::Min(0), Constraint::Length(1)],
+            )
+            .split(area);
+            let terminal_area = rows[0];
+            self.terminal_view_height.set(terminal_area.height);
+
+            let start_idx = terminal_start_index(
+                self.terminal.lines.len(),
+                terminal_area.height,
+                self.terminal.scroll,
+            );
+            let lines: Vec<Line<'_>> = self
+                .terminal
+                .lines
+                .iter()
+                .skip(start_idx)
+                .take(terminal_area.height as usize)
+                .map(|line| {
+                    let style = if line.is_error {
+                        self.theme.pty_error
+                    } else {
+                        self.theme.pty_output
+                    };
+                    Line::from(line.content.as_str()).style(style)
+                })
+                .collect();
+
+            Paragraph::new(Text::from(lines))
+                .wrap(Wrap { trim: false })
+                .render(terminal_area, frame.buffer_mut());
+
+            let status_area = rows[1];
             let status_str = format!(
                 " {} {} | {} | {} | Exit: {} ",
                 self.terminal.command,
@@ -1450,7 +1588,10 @@ ScreenId::Chat => {
                     "exited"
                 },
                 self.terminal.lines.len(),
-                self.terminal.exit_code.map(|c| c.to_string()).unwrap_or_default(),
+                self.terminal
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
             );
             Text::from(status_str)
                 .style(self.theme.pty_status_bar)
@@ -1459,13 +1600,19 @@ ScreenId::Chat => {
     }
 }
 
+fn terminal_start_index(line_count: usize, height: u16, scroll: u16) -> usize {
+    line_count
+        .saturating_sub(height as usize)
+        .saturating_sub(scroll as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::{KeyEvent, Modifiers, Scancode};
     use ocpncord_backend::mock::MockBackend;
-    use ratatui_core::backend::TestBackend;
-    use ratatui_core::terminal::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn ctrl(key: char) -> Event {
         Event::Key(KeyEvent {
@@ -1488,6 +1635,16 @@ mod tests {
 
     fn run<B: Backend>(app: &mut App<B>, event: Event) -> bool {
         futures::executor::block_on(app.handle_event(event))
+    }
+
+    fn rendered_screen(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
     }
 
     #[test]
@@ -1855,12 +2012,19 @@ mod tests {
         );
         assert_eq!(app.partial_parts().len(), 1);
 
-        run(&mut app, Event::Backend(ocpncord_backend::BackendEvent::Done));
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::Done),
+        );
         assert!(!app.is_streaming());
         // Done no longer flushes partial_parts to messages; the REST API
         // fallback populates messages when the server has persisted them.
         assert_eq!(app.messages().len(), 1, "only user msg (no flush on Done)");
-        assert_eq!(app.partial_parts().len(), 1, "content stays in partial_parts for rendering");
+        assert_eq!(
+            app.partial_parts().len(),
+            1,
+            "content stays in partial_parts for rendering"
+        );
     }
 
     /// Test that the real SSE event path (MessagePartUpdated + Done) works.
@@ -1894,10 +2058,17 @@ mod tests {
         );
 
         // Simulate SSE: Done
-        run(&mut app, Event::Backend(ocpncord_backend::BackendEvent::Done));
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::Done),
+        );
         assert!(!app.is_streaming());
         assert_eq!(app.messages().len(), 1, "only user msg (no flush on Done)");
-        assert_eq!(app.partial_parts().len(), 1, "content stays in partial_parts for rendering");
+        assert_eq!(
+            app.partial_parts().len(),
+            1,
+            "content stays in partial_parts for rendering"
+        );
     }
 
     /// Test that MessagePartDelta accumulates text during streaming.
@@ -1954,10 +2125,17 @@ mod tests {
         }
 
         // Finalize
-        run(&mut app, Event::Backend(ocpncord_backend::BackendEvent::Done));
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::Done),
+        );
         assert!(!app.is_streaming());
         assert_eq!(app.messages().len(), 1, "only user msg (no flush on Done)");
-        assert_eq!(app.partial_parts().len(), 1, "content stays in partial_parts for rendering");
+        assert_eq!(
+            app.partial_parts().len(),
+            1,
+            "content stays in partial_parts for rendering"
+        );
     }
 
     /// Test that MessagePartUpdated is IGNORED when NOT streaming.
@@ -2120,9 +2298,7 @@ mod tests {
 
         let test_backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal
-            .draw(|frame| app.render(frame))
-            .unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
         let buf = terminal.backend().buffer();
         let has_session_1 = buf.content().iter().any(|c| c.symbol() == "F");
         assert!(
@@ -2147,15 +2323,10 @@ mod tests {
 
         let test_backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal
-            .draw(|frame| app.render(frame))
-            .unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
         let buf = terminal.backend().buffer();
         let has_empty_msg = buf.content().iter().any(|c| c.symbol() == "N");
-        assert!(
-            has_empty_msg,
-            "Empty state should show 'No sessions yet'"
-        );
+        assert!(has_empty_msg, "Empty state should show 'No sessions yet'");
     }
 
     #[test]
@@ -2181,7 +2352,7 @@ mod tests {
     #[test]
     fn escape_closes_active_modal() {
         use crate::modal::Modal;
-        use ratatui_core::terminal::Frame;
+        use ratatui::Frame;
 
         struct TestCloseModal;
 
@@ -2258,7 +2429,10 @@ mod tests {
             ScreenId::Chat,
             "unknown command should transition to chat"
         );
-        assert!(app.messages().len() > 0, "unknown command should add a message");
+        assert!(
+            app.messages().len() > 0,
+            "unknown command should add a message"
+        );
     }
 
     #[test]
@@ -2272,7 +2446,10 @@ mod tests {
         assert_eq!(app.active_screen(), ScreenId::Chat);
 
         // Complete the stream so input is accepted again
-        run(&mut app, Event::Backend(ocpncord_backend::BackendEvent::Done));
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::Done),
+        );
 
         let session_count_before = app.backend().sessions.len();
 
@@ -2411,14 +2588,21 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
         let buf = terminal.backend().buffer();
 
-        // app.render() draws the start page logo first (█ characters),
-        // then the modal dark overlay. The overlay's set_style() changes
-        // cell styles but NOT symbols — logo block characters would survive
-        // unless the symbol itself is cleared.
-        let has_logo_block = buf.content().iter().any(|c| c.symbol() == "█");
+        // app.render() draws the start page first, then clears only the
+        // modal rectangle before drawing the modal block. Background content
+        // may remain outside the modal, but must not bleed through inside it.
+        let modal_area = Rect::new(15, 0, 50, 24);
+        let mut has_logo_block_inside_modal = false;
+        for y in modal_area.top()..modal_area.bottom() {
+            for x in modal_area.left()..modal_area.right() {
+                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "█") {
+                    has_logo_block_inside_modal = true;
+                }
+            }
+        }
         assert!(
-            !has_logo_block,
-            "modal overlay should not contain logo block characters — symbols must be cleared, not just styles"
+            !has_logo_block_inside_modal,
+            "modal area should not contain logo block characters"
         );
 
         // Modal text should still render correctly
@@ -2497,6 +2681,253 @@ mod tests {
     }
 
     #[test]
+    fn terminal_screen_plain_keys_do_not_mutate_prompt() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('t'));
+        assert_eq!(app.active_screen(), ScreenId::Terminal);
+
+        run(&mut app, char_key('a'));
+        run(&mut app, char_key('b'));
+        assert_eq!(app.prompt_text(), "");
+    }
+
+    #[test]
+    fn terminal_screen_scrolls_from_bottom_with_arrow_and_page_keys() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+        app.terminal.pty_id = Some("pty-1".into());
+        app.terminal.command = "sh".into();
+        for idx in 0..12 {
+            app.terminal.push_line(TermLine {
+                content: alloc::format!("line-{idx}"),
+                is_error: false,
+            });
+        }
+
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('t'));
+        assert_eq!(app.active_screen(), ScreenId::Terminal);
+
+        let test_backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("line-11"), "screen: {screen}");
+        assert!(!screen.contains("line-0"), "screen: {screen}");
+
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Up,
+                modifiers: Modifiers::default(),
+            }),
+        );
+        assert_eq!(app.terminal.scroll, 1);
+
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::PageUp,
+                modifiers: Modifiers::default(),
+            }),
+        );
+        assert_eq!(app.terminal.scroll, 5);
+
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::PageDown,
+                modifiers: Modifiers::default(),
+            }),
+        );
+        assert_eq!(app.terminal.scroll, 1);
+    }
+
+    #[test]
+    fn terminal_screen_scroll_offset_changes_visible_output() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+        app.terminal.pty_id = Some("pty-1".into());
+        app.terminal.command = "sh".into();
+        for idx in 0..12 {
+            app.terminal.push_line(TermLine {
+                content: alloc::format!("line-{idx}"),
+                is_error: false,
+            });
+        }
+        app.terminal.scroll = 3;
+
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('t'));
+
+        let test_backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(screen.contains("line-4"), "screen: {screen}");
+        assert!(screen.contains("line-8"), "screen: {screen}");
+        assert!(!screen.contains("line-11"), "screen: {screen}");
+    }
+
+    #[test]
+    fn diagnostics_panel_renders_table_columns() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+        app.side_panel_visible = true;
+        app.side_panel_tab = crate::screen::Tab::Diagnostics;
+        app.lsp_diagnostics.insert(
+            "src/main.rs".into(),
+            vec![LspDiagnostic {
+                message: "missing semicolon".into(),
+                severity: Some("error".into()),
+                line: 12,
+                character: 4,
+            }],
+        );
+
+        let test_backend = TestBackend::new(140, 12);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(screen.contains("src/main.rs"), "screen: {screen}");
+        assert!(screen.contains("error"), "screen: {screen}");
+        assert!(screen.contains("12:4"), "screen: {screen}");
+        assert!(screen.contains("missing semicolon"), "screen: {screen}");
+    }
+
+    #[test]
+    fn todos_panel_renders_list_items_with_status_styles() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+        app.side_panel_visible = true;
+        app.side_panel_tab = crate::screen::Tab::Todos;
+        app.todos = vec![
+            ocpncord_backend::Todo {
+                content: "done task".into(),
+                status: "completed".into(),
+                priority: "normal".into(),
+            },
+            ocpncord_backend::Todo {
+                content: "active task".into(),
+                status: "pending".into(),
+                priority: "normal".into(),
+            },
+        ];
+
+        let test_backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(screen.contains("[x] done task"), "screen: {screen}");
+        assert!(screen.contains("[ ] active task"), "screen: {screen}");
+
+        let buf = terminal.backend().buffer();
+        let panel_x = 56;
+        assert_eq!(
+            buf[(panel_x, 1)].style().fg,
+            app.theme.text_dim.fg,
+            "completed todo should use dim style"
+        );
+        assert_eq!(
+            buf[(panel_x, 2)].style().fg,
+            app.theme.text.fg,
+            "active todo should use normal text style"
+        );
+    }
+
+    #[test]
+    fn terminal_side_panel_uses_terminal_scroll_offset() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+        app.side_panel_visible = true;
+        app.side_panel_tab = crate::screen::Tab::Pane;
+        app.terminal.pty_id = Some("pty-1".into());
+        app.terminal.command = "sh".into();
+        for idx in 0..10 {
+            app.terminal.push_line(TermLine {
+                content: alloc::format!("line-{idx}"),
+                is_error: false,
+            });
+        }
+        app.terminal.scroll = 2;
+
+        let test_backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(screen.contains("line-3"), "screen: {screen}");
+        assert!(screen.contains("line-7"), "screen: {screen}");
+        assert!(!screen.contains("line-2"), "screen: {screen}");
+        assert!(!screen.contains("line-9"), "screen: {screen}");
+    }
+
+    #[test]
+    fn prompt_row_stays_visible_at_narrow_widths() {
+        let backend = MockBackend::default();
+        let app = App::new(backend);
+
+        let test_backend = TestBackend::new(24, 6);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(screen.contains(">"), "screen: {screen}");
+    }
+
+    #[test]
+    fn escape_clears_prompt_when_no_modal_is_open() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, char_key('h'));
+        run(&mut app, char_key('i'));
+        assert_eq!(app.prompt_text(), "hi");
+
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Escape,
+                modifiers: Modifiers::default(),
+            }),
+        );
+        assert_eq!(app.prompt_text(), "");
+    }
+
+    #[test]
+    fn command_palette_enter_closes_palette_before_applying_action() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, ctrl('p'));
+        assert_eq!(
+            app.active_modal().map(|modal| modal.title()),
+            Some("Command Palette")
+        );
+
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Enter,
+                modifiers: Modifiers::default(),
+            }),
+        );
+        assert_eq!(app.active_modal().map(|modal| modal.title()), Some("Help"));
+    }
+
+    #[test]
     fn terminal_screen_shows_message_when_no_pty() {
         let backend = MockBackend::default();
         let mut app = App::new(backend);
@@ -2516,7 +2947,10 @@ mod tests {
             && buf.content().iter().any(|c| c.symbol() == "g")
             && buf.content().iter().any(|c| c.symbol() == "e")
             && buf.content().iter().any(|c| c.symbol() == "n");
-        assert!(has_help, "terminal should show a helpful message when no PTY");
+        assert!(
+            has_help,
+            "terminal should show a helpful message when no PTY"
+        );
     }
 
     #[test]
@@ -2575,7 +3009,10 @@ mod tests {
         assert!(app.is_streaming(), "should be streaming after send");
 
         let running = run(&mut app, ctrl('c'));
-        assert!(running, "ctrl+c during streaming should interrupt, not quit");
+        assert!(
+            running,
+            "ctrl+c during streaming should interrupt, not quit"
+        );
         assert!(!app.is_streaming(), "streaming should be stopped");
     }
 }

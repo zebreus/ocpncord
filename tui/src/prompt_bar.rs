@@ -1,8 +1,8 @@
 use alloc::string::String;
 
-use ratatui_core::layout::Rect;
-use ratatui_core::text::Text;
-use ratatui_core::widgets::Widget;
+use ratatui::layout::Rect;
+use ratatui::text::Text;
+use ratatui::widgets::Widget;
 
 use crate::event::{KeyEvent, Scancode};
 use crate::screen::Action;
@@ -44,6 +44,7 @@ impl PromptBar {
             Some('/') => InputMode::Command,
             Some('!') => InputMode::Shell,
             Some('@') => InputMode::FileRef,
+            Some('#') => InputMode::ToolRef,
             _ => InputMode::Normal,
         }
     }
@@ -78,6 +79,10 @@ impl PromptBar {
         self.cursor = 0;
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.input.is_empty()
+    }
+
     pub fn append_text(&mut self, text: &str) {
         for ch in text.chars() {
             self.input.insert(self.cursor, ch);
@@ -90,45 +95,60 @@ impl PromptBar {
     pub fn render(
         &self,
         area: Rect,
-        frame: &mut ratatui_core::terminal::Frame,
+        frame: &mut ratatui::Frame,
         theme: &Theme,
         is_streaming: bool,
         agent_name: &str,
         tick: u64,
     ) {
         let agent_display = alloc::format!("[{}]", agent_name);
+        let agent_width = agent_display.chars().count() as u16;
+        let gap = if area.width > agent_width { 1 } else { 0 };
+        let input_width = area.width.saturating_sub(agent_width + gap);
+        let input_area = Rect::new(area.x, area.y, input_width, 1);
         let agent_area = Rect::new(
-            area.right().saturating_sub(agent_display.len() as u16 + 1),
+            area.x + input_width + gap,
             area.y,
-            agent_display.len() as u16,
+            agent_width.min(area.width),
             1,
         );
-        Text::from(agent_display.as_str())
-            .style(theme.agent_indicator)
-            .render(agent_area, frame.buffer_mut());
 
         if is_streaming {
             let spinner = Self::SPINNER[(tick as usize / 3) % Self::SPINNER.len()];
             let msg = alloc::format!("{spinner} Agent is responding... (Esc to interrupt)");
-            Text::from(msg.as_str())
+            Text::from(clamp_tail(msg.as_str(), input_width as usize))
                 .style(theme.text_dim)
-                .render(area, frame.buffer_mut());
+                .render(input_area, frame.buffer_mut());
+            Text::from(agent_display.as_str())
+                .style(theme.agent_indicator)
+                .render(agent_area, frame.buffer_mut());
             return;
         }
 
-        let prefix = match self.input_mode() {
-            InputMode::Command => "/",
-            InputMode::Shell => "!",
-            InputMode::FileRef => "@",
-            InputMode::ToolRef => "#",
-            InputMode::Normal => "> ",
+        let (prefix, body) = match self.input_mode() {
+            InputMode::Command => ("/ ", self.input.trim_start_matches('/')),
+            InputMode::Shell => ("! ", self.input.trim_start_matches('!')),
+            InputMode::FileRef => ("@ ", self.input.trim_start_matches('@')),
+            InputMode::ToolRef => ("# ", self.input.trim_start_matches('#')),
+            InputMode::Normal => ("> ", self.input.as_str()),
         };
 
-        let display = alloc::format!("{}{}", prefix, self.input);
-        Text::from(display)
+        let display = alloc::format!("{}{}", prefix, body);
+        Text::from(clamp_tail(display.as_str(), input_width as usize))
             .style(theme.input)
-            .render(area, frame.buffer_mut());
+            .render(input_area, frame.buffer_mut());
+        Text::from(agent_display.as_str())
+            .style(theme.agent_indicator)
+            .render(agent_area, frame.buffer_mut());
     }
+}
+
+fn clamp_tail(text: &str, width: usize) -> alloc::string::String {
+    if width == 0 {
+        return alloc::string::String::new();
+    }
+    let len = text.chars().count();
+    text.chars().skip(len.saturating_sub(width)).collect()
 }
 
 impl Default for PromptBar {
@@ -141,6 +161,8 @@ impl Default for PromptBar {
 mod tests {
     use super::*;
     use crate::event::{KeyEvent, Modifiers, Scancode};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn key_event(ch: char) -> KeyEvent {
         KeyEvent {
@@ -152,13 +174,6 @@ mod tests {
     fn backspace() -> KeyEvent {
         KeyEvent {
             scancode: Scancode::Backspace,
-            modifiers: Modifiers::default(),
-        }
-    }
-
-    fn enter() -> KeyEvent {
-        KeyEvent {
-            scancode: Scancode::Enter,
             modifiers: Modifiers::default(),
         }
     }
@@ -215,5 +230,62 @@ mod tests {
         bar.handle_key(&key_event('h'));
         bar.handle_key(&key_event('i'));
         assert_eq!(bar.input_mode(), InputMode::Normal);
+    }
+
+    #[test]
+    fn leading_hash_is_toolref_mode() {
+        let mut bar = PromptBar::new();
+        bar.handle_key(&key_event('#'));
+        assert_eq!(bar.input_mode(), InputMode::ToolRef);
+    }
+
+    #[test]
+    fn command_prefix_is_not_rendered_twice() {
+        let mut bar = PromptBar::new();
+        bar.append_text("/help");
+        let theme = Theme::default();
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                bar.render(frame.area(), frame, &theme, false, "build", 0);
+            })
+            .unwrap();
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("/ help"));
+        assert!(!screen.contains("//help"));
+        assert!(screen.contains("[build]"));
+    }
+
+    #[test]
+    fn long_input_does_not_overwrite_agent_indicator() {
+        let mut bar = PromptBar::new();
+        bar.append_text("this input is intentionally longer than the prompt area");
+        let theme = Theme::default();
+        let backend = TestBackend::new(24, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                bar.render(frame.area(), frame, &theme, false, "build", 0);
+            })
+            .unwrap();
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("[build]"), "screen: {screen}");
     }
 }

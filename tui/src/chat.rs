@@ -1,6 +1,10 @@
-use ratatui_core::layout::{Alignment, Rect};
-use ratatui_core::text::Text;
-use ratatui_core::widgets::Widget;
+use alloc::vec::Vec;
+
+use ratatui::layout::{Alignment, Rect};
+use ratatui::text::{Line, Text};
+use ratatui::widgets::{
+    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget, Wrap,
+};
 
 use crate::app::LoadedMessage;
 use crate::event::Event;
@@ -12,14 +16,14 @@ const PROMPT_BAR_LINES: u16 = 1;
 
 /// Renders the Chat message area using the provided data.
 pub fn render_chat(
-    frame: &mut ratatui_core::terminal::Frame,
+    frame: &mut ratatui::Frame,
     theme: &Theme,
+    area: Rect,
     messages: &[LoadedMessage],
     partial_parts: &[ocpncord_backend::Part],
     is_streaming: bool,
-    _scroll: u16,
+    scroll: u16,
 ) {
-    let area = frame.area();
     let msg_area = Rect::new(
         area.x,
         area.y,
@@ -35,43 +39,54 @@ pub fn render_chat(
         return;
     }
 
-    let mut y = msg_area.y;
-    let max_y = msg_area.y + msg_area.height;
-
+    let mut lines: Vec<Line<'_>> = Vec::new();
     for msg in messages {
         for part in &msg.parts {
-            if y >= max_y {
-                break;
-            }
-            for line in render_part(part, theme, true) {
-                if y >= max_y {
-                    break;
-                }
-                let line_area = Rect::new(msg_area.x, y, msg_area.width, 1);
-                let text = Text::from(line);
-                text.render(line_area, frame.buffer_mut());
-                y += 1;
-            }
-        }
-        if y >= max_y {
-            break;
+            lines.extend(render_part(part, theme, true));
         }
     }
 
     for part in partial_parts {
-        if y >= max_y {
-            break;
-        }
-        for line in render_part(part, theme, true) {
-            if y >= max_y {
-                break;
-            }
-            let line_area = Rect::new(msg_area.x, y, msg_area.width, 1);
-            let text = Text::from(line);
-            text.render(line_area, frame.buffer_mut());
-            y += 1;
-        }
+        lines.extend(render_part(part, theme, true));
     }
+
+    let full_width_height = wrapped_height(&lines, msg_area.width);
+    let show_scrollbar = full_width_height > msg_area.height as usize
+        || (msg_area.width > 1
+            && wrapped_height(&lines, msg_area.width - 1) > msg_area.height as usize);
+    let text_area = if show_scrollbar && msg_area.width > 1 {
+        Rect::new(msg_area.x, msg_area.y, msg_area.width - 1, msg_area.height)
+    } else {
+        msg_area
+    };
+
+    let content_height = wrapped_height(&lines, text_area.width);
+    let max_scroll = content_height.saturating_sub(text_area.height as usize) as u16;
+    let scroll_y = max_scroll.saturating_sub(scroll.min(max_scroll));
+
+    Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y, 0))
+        .render(text_area, frame.buffer_mut());
+
+    if show_scrollbar {
+        let mut state = ScrollbarState::new(content_height).position(scroll_y as usize);
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .thumb_style(theme.scrollbar)
+            .track_style(theme.text_dim)
+            .render(msg_area, frame.buffer_mut(), &mut state);
+    }
+}
+
+fn wrapped_height(lines: &[Line<'_>], width: u16) -> usize {
+    let width = width.max(1) as usize;
+    lines
+        .iter()
+        .map(|line| {
+            let line_width = line.width();
+            core::cmp::max(1, line_width.saturating_add(width - 1) / width)
+        })
+        .sum()
 }
 
 pub struct Chat {
@@ -91,7 +106,7 @@ impl Default for Chat {
 }
 
 impl Screen for Chat {
-    fn render(&self, _frame: &mut ratatui_core::terminal::Frame, _theme: &Theme) {
+    fn render(&self, _frame: &mut ratatui::Frame, _theme: &Theme) {
         // Chat is rendered via `render_chat` from App::render
     }
 
@@ -100,8 +115,8 @@ impl Screen for Chat {
             Event::Key(key) => match key.scancode {
                 crate::event::Scancode::Up => Action::ScrollUp,
                 crate::event::Scancode::Down => Action::ScrollDown,
-                crate::event::Scancode::PageUp => Action::ScrollUp,
-                crate::event::Scancode::PageDown => Action::ScrollDown,
+                crate::event::Scancode::PageUp => Action::ScrollPageUp,
+                crate::event::Scancode::PageDown => Action::ScrollPageDown,
                 _ => Action::None,
             },
             _ => Action::None,
@@ -113,8 +128,8 @@ impl Screen for Chat {
 mod tests {
     use super::*;
     use ocpncord_backend::*;
-    use ratatui_core::backend::TestBackend;
-    use ratatui_core::terminal::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
     fn renders_placeholder_when_empty() {
@@ -123,7 +138,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_chat(frame, &theme, &[], &[], false, 0);
+                render_chat(frame, &theme, frame.area(), &[], &[], false, 0);
             })
             .unwrap();
 
@@ -146,7 +161,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_chat(frame, &theme, &msgs, &[], false, 0);
+                render_chat(frame, &theme, frame.area(), &msgs, &[], false, 0);
             })
             .unwrap();
 
@@ -166,7 +181,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_chat(frame, &theme, &[], &partial, true, 0);
+                render_chat(frame, &theme, frame.area(), &[], &partial, true, 0);
             })
             .unwrap();
 
@@ -192,5 +207,31 @@ mod tests {
             })),
             Action::ScrollDown
         );
+    }
+
+    #[test]
+    fn handle_event_page_keys_return_page_scroll_actions() {
+        let mut chat = Chat::new();
+        assert_eq!(
+            chat.handle_event(Event::Key(crate::event::KeyEvent {
+                scancode: crate::event::Scancode::PageUp,
+                modifiers: Default::default(),
+            })),
+            Action::ScrollPageUp
+        );
+        assert_eq!(
+            chat.handle_event(Event::Key(crate::event::KeyEvent {
+                scancode: crate::event::Scancode::PageDown,
+                modifiers: Default::default(),
+            })),
+            Action::ScrollPageDown
+        );
+    }
+
+    #[test]
+    fn wrapped_height_counts_width_after_scrollbar_reservation() {
+        let line = Line::from("1234567890");
+        assert_eq!(wrapped_height(&[line.clone()], 10), 1);
+        assert_eq!(wrapped_height(&[line], 9), 2);
     }
 }

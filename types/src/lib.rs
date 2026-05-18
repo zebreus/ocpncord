@@ -781,10 +781,7 @@ pub enum ServerEvent {
     #[serde(rename = "file.edited")]
     FileEdited { file: String },
     #[serde(rename = "file.watcher.updated")]
-    FileWatcherUpdated {
-        file: String,
-        event: String,
-    },
+    FileWatcherUpdated { file: String, event: String },
     #[serde(rename = "pty.created")]
     PtyCreated { info: Pty },
     #[serde(rename = "pty.updated")]
@@ -822,10 +819,7 @@ pub enum ServerEvent {
     #[serde(rename = "workspace.failed")]
     WorkspaceFailed { message: String },
     #[serde(rename = "worktree.ready")]
-    WorktreeReady {
-        name: String,
-        branch: String,
-    },
+    WorktreeReady { name: String, branch: String },
     #[serde(rename = "worktree.failed")]
     WorktreeFailed { message: String },
     #[serde(rename = "vcs.branch.updated")]

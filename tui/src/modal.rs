@@ -1,5 +1,5 @@
-use ratatui_core::layout::Rect;
-use ratatui_core::terminal::Frame;
+use ratatui::layout::Rect;
+use ratatui::Frame;
 
 use crate::event::{Event, Scancode};
 use crate::screen::Action;
@@ -10,6 +10,12 @@ pub trait Modal {
     fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect);
     fn handle_event(&mut self, event: Event) -> Action;
     fn title(&self) -> &str;
+    fn preferred_size(&self, area: Rect) -> (u16, u16) {
+        (
+            ((area.width as u32 * 3) / 5).clamp(40, area.width as u32) as u16,
+            ((area.height as u32 * 7) / 10).clamp(8, area.height as u32) as u16,
+        )
+    }
 }
 
 // --- Session list modal ---
@@ -17,8 +23,11 @@ pub trait Modal {
 use alloc::string::String;
 use alloc::vec::Vec;
 use ocpncord_backend::{Config, Session};
-use ratatui_core::text::Text;
-use ratatui_core::widgets::Widget;
+use ratatui::text::{Line, Text};
+use ratatui::widgets::{
+    List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    StatefulWidget, Widget, Wrap,
+};
 
 enum SessionListState {
     Loading,
@@ -31,6 +40,7 @@ pub struct SessionListModal {
     state: SessionListState,
     sessions: Vec<Session>,
     selected: usize,
+    scroll: u16,
     confirm_delete: Option<usize>,
 }
 
@@ -40,6 +50,7 @@ impl SessionListModal {
             state: SessionListState::Loading,
             sessions: Vec::new(),
             selected: 0,
+            scroll: 0,
             confirm_delete: None,
         }
     }
@@ -49,6 +60,7 @@ impl SessionListModal {
             self.state = SessionListState::Empty;
         } else {
             self.selected = self.selected.min(sessions.len().saturating_sub(1));
+            self.ensure_selected_visible(0);
             self.sessions = sessions;
             self.state = SessionListState::Loaded;
         }
@@ -60,6 +72,25 @@ impl SessionListModal {
 
     pub fn selected_index(&self) -> usize {
         self.selected
+    }
+
+    pub fn scroll_offset(&self) -> u16 {
+        self.scroll
+    }
+
+    fn ensure_selected_visible(&mut self, visible_height: u16) {
+        if visible_height == 0 {
+            return;
+        }
+        let selected = self.selected as u16;
+        if selected < self.scroll {
+            self.scroll = selected;
+        } else {
+            let bottom = self.scroll.saturating_add(visible_height.saturating_sub(1));
+            if selected > bottom {
+                self.scroll = selected.saturating_sub(visible_height.saturating_sub(1));
+            }
+        }
     }
 }
 
@@ -77,39 +108,65 @@ impl Modal for SessionListModal {
                     .render(area, frame.buffer_mut());
             }
             SessionListState::Loaded => {
-                // Title
-                Text::from("Sessions")
-                    .style(theme.text_accent)
-                    .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
-
-                // Confirmation bar
+                let mut list_area = area;
                 if self.confirm_delete == Some(self.selected) {
                     let confirm_msg = "Press Delete again to confirm, Escape to cancel";
-                    Text::from(confirm_msg).style(theme.text_error).render(
-                        Rect::new(area.x, area.y + 1, area.width, 1),
-                        frame.buffer_mut(),
+                    Text::from(confirm_msg)
+                        .style(theme.text_error)
+                        .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
+                    list_area = Rect::new(
+                        area.x,
+                        area.y + 1,
+                        area.width,
+                        area.height.saturating_sub(1),
                     );
                 }
 
-                // Session list
-                for (i, session) in self.sessions.iter().enumerate() {
-                    let y = area.y + 2 + i as u16;
-                    if y >= area.bottom() {
-                        break;
-                    }
-                    let style = if i == self.selected {
-                        theme.selection
+                let visible_height = list_area.height;
+                let scroll = self
+                    .scroll
+                    .min(self.sessions.len().saturating_sub(visible_height as usize) as u16);
+                let list_content_area =
+                    if self.sessions.len() > visible_height as usize && list_area.width > 1 {
+                        Rect::new(
+                            list_area.x,
+                            list_area.y,
+                            list_area.width - 1,
+                            list_area.height,
+                        )
                     } else {
-                        theme.text
+                        list_area
                     };
-                    let display = if i == self.selected {
-                        alloc::format!("> {}  [{}]", session.title, session.id)
-                    } else {
-                        alloc::format!("  {}  [{}]", session.title, session.id)
-                    };
-                    Text::from(display)
-                        .style(style)
-                        .render(Rect::new(area.x, y, area.width, 1), frame.buffer_mut());
+                let items: Vec<ListItem<'_>> = self
+                    .sessions
+                    .iter()
+                    .map(|session| {
+                        ListItem::new(Line::from(alloc::format!(
+                            "{}  [{}]",
+                            session.title,
+                            session.id
+                        )))
+                    })
+                    .collect();
+                let mut state = ListState::default()
+                    .with_selected(Some(self.selected))
+                    .with_offset(scroll as usize);
+                StatefulWidget::render(
+                    List::new(items)
+                        .style(theme.text)
+                        .highlight_style(theme.selection)
+                        .highlight_symbol("> "),
+                    list_content_area,
+                    frame.buffer_mut(),
+                    &mut state,
+                );
+                if self.sessions.len() > visible_height as usize {
+                    let mut scrollbar_state =
+                        ScrollbarState::new(self.sessions.len()).position(scroll as usize);
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .thumb_style(theme.scrollbar)
+                        .track_style(theme.text_dim)
+                        .render(list_area, frame.buffer_mut(), &mut scrollbar_state);
                 }
             }
             SessionListState::Error(ref e) => {
@@ -126,11 +183,16 @@ impl Modal for SessionListModal {
                 Event::Key(ref ke) => match ke.scancode {
                     Scancode::Up => {
                         self.selected = self.selected.saturating_sub(1);
+                        self.ensure_selected_visible(1);
                         Action::None
                     }
                     Scancode::Down => {
                         let max = self.sessions.len().saturating_sub(1);
                         self.selected = self.selected.saturating_add(1).min(max);
+                        self.ensure_selected_visible(1);
+                        if self.selected as u16 >= self.scroll.saturating_add(1) {
+                            self.scroll = self.selected as u16;
+                        }
                         Action::None
                     }
                     Scancode::Enter => {
@@ -201,39 +263,40 @@ impl ModelPickerModal {
 
 impl Modal for ModelPickerModal {
     fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect) {
-        Text::from("Model")
-            .style(theme.text_accent)
-            .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
-
-        let content_y = area.y + 2;
-
         if let Some(err) = &self.error {
-            Text::from(err.as_str()).style(theme.text_error).render(
-                Rect::new(area.x, content_y, area.width, 1),
-                frame.buffer_mut(),
-            );
+            Paragraph::new(err.as_str())
+                .style(theme.text_error)
+                .wrap(Wrap { trim: false })
+                .render(area, frame.buffer_mut());
         } else if let Some(model) = &self.model {
-            Text::from(alloc::format!("Current model: {}", model))
+            Paragraph::new(alloc::format!("Current model: {}", model))
                 .style(theme.text)
+                .wrap(Wrap { trim: false })
                 .render(
-                    Rect::new(area.x, content_y, area.width, 1),
+                    Rect::new(area.x, area.y, area.width, 2.min(area.height)),
                     frame.buffer_mut(),
                 );
         } else {
             Text::from("No model configured")
                 .style(theme.text_dim)
-                .render(
-                    Rect::new(area.x, content_y, area.width, 1),
-                    frame.buffer_mut(),
-                );
+                .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
         }
 
         if self.error.is_none() {
             let notice = "Read-only: configure model via server config";
-            Text::from(notice).style(theme.text_dim).render(
-                Rect::new(area.x, area.y + 4, area.width, 1),
-                frame.buffer_mut(),
-            );
+            let notice_y = area.y + 3.min(area.height.saturating_sub(1));
+            Paragraph::new(notice)
+                .style(theme.text_dim)
+                .wrap(Wrap { trim: false })
+                .render(
+                    Rect::new(
+                        area.x,
+                        notice_y,
+                        area.width,
+                        area.bottom().saturating_sub(notice_y),
+                    ),
+                    frame.buffer_mut(),
+                );
         }
     }
 
@@ -258,57 +321,50 @@ impl HelpModal {
 
 impl Modal for HelpModal {
     fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect) {
-        let mut lines: Vec<alloc::string::String> = Vec::new();
-
-        lines.push("Slash Commands".into());
-        lines.push("  /help         Show this help".into());
-        lines.push("  /sessions     List sessions".into());
-        lines.push("  /new          New session".into());
-        lines.push("  /settings     Settings / model picker".into());
-        lines.push("  /todos        Toggle todos panel".into());
-        lines.push("  /diagnostics  Toggle diagnostics panel".into());
-        lines.push("  /pty          Toggle terminal panel".into());
-        lines.push("  /abort        Abort current session".into());
-        lines.push("  /exit         Quit".into());
-        lines.push("  /details      Toggle tool details".into());
-        lines.push("".into());
-        lines.push("Keybindings".into());
-        lines.push("  Ctrl+X H      Help".into());
-        lines.push("  Ctrl+X Q      Quit".into());
-        lines.push("  Ctrl+X N      New session".into());
-        lines.push("  Ctrl+X L      Sessions".into());
-        lines.push("  Ctrl+X M      Settings".into());
-        lines.push("  Ctrl+X T      Terminal".into());
-        lines.push("  Ctrl+X D      Diagnostics".into());
-        lines.push("  Ctrl+X O      Todos".into());
-        lines.push("  Ctrl+P        Command palette".into());
-        lines.push("  Tab           Cycle agent forward".into());
-        lines.push("  Shift+Tab     Cycle agent backward".into());
-        lines.push("  Escape        Close modal / interrupt".into());
-        lines.push("".into());
-        lines.push("Input Prefixes".into());
-        lines.push("  /             Command mode".into());
-        lines.push("  !             Shell mode".into());
-        lines.push("  @             File reference".into());
-        lines.push("  #             Tool reference".into());
-
-        for (i, line) in lines.iter().enumerate() {
-            let y = area.y + i as u16;
-            if y >= area.bottom() {
-                break;
-            }
-            let style = if line.ends_with("Commands")
-                || line == "Keybindings"
-                || line == "Input Prefixes"
-            {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        for (text, heading) in [
+            ("Slash Commands", true),
+            ("  /help         Show this help", false),
+            ("  /sessions     List sessions", false),
+            ("  /new          New session", false),
+            ("  /settings     Settings / model picker", false),
+            ("  /todos        Toggle todos panel", false),
+            ("  /diagnostics  Toggle diagnostics panel", false),
+            ("  /pty          Toggle terminal panel", false),
+            ("  /abort        Abort current session", false),
+            ("  /exit         Quit", false),
+            ("  /details      Toggle tool details", false),
+            ("", false),
+            ("Keybindings", true),
+            ("  Ctrl+X H      Help", false),
+            ("  Ctrl+X Q      Quit", false),
+            ("  Ctrl+X N      New session", false),
+            ("  Ctrl+X L      Sessions", false),
+            ("  Ctrl+X M      Settings", false),
+            ("  Ctrl+X T      Terminal", false),
+            ("  Ctrl+X D      Diagnostics", false),
+            ("  Ctrl+X O      Todos", false),
+            ("  Ctrl+P        Command palette", false),
+            ("  Tab           Cycle agent forward", false),
+            ("  Shift+Tab     Cycle agent backward", false),
+            ("  Escape        Close modal / interrupt", false),
+            ("", false),
+            ("Input Prefixes", true),
+            ("  /             Command mode", false),
+            ("  !             Shell mode", false),
+            ("  @             File reference", false),
+            ("  #             Tool reference", false),
+        ] {
+            lines.push(Line::from(text).style(if heading {
                 theme.text_accent
             } else {
                 theme.text
-            };
-            Text::from(line.as_str())
-                .style(style)
-                .render(Rect::new(area.x, y, area.width, 1), frame.buffer_mut());
+            }));
         }
+
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .render(area, frame.buffer_mut());
     }
 
     fn handle_event(&mut self, event: Event) -> Action {
@@ -321,14 +377,26 @@ impl Modal for HelpModal {
     fn title(&self) -> &str {
         "Help"
     }
+
+    fn preferred_size(&self, area: Rect) -> (u16, u16) {
+        (
+            ((area.width as u32 * 3) / 5).clamp(50, area.width as u32) as u16,
+            34.min(area.height),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::Scancode;
-    use ratatui_core::backend::TestBackend;
-    use ratatui_core::terminal::Terminal;
+    use alloc::collections::BTreeMap;
+    use ocpncord_backend::{
+        PermissionRequest, PermissionToolInfo, QuestionInfo, QuestionOption, QuestionRequest,
+        SessionTime,
+    };
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     struct TestModal;
 
@@ -349,6 +417,27 @@ mod tests {
     fn modal_trait_title_works() {
         let modal = TestModal;
         assert_eq!(modal.title(), "Test Modal");
+    }
+
+    fn make_session(id: &str, title: &str) -> Session {
+        Session {
+            id: id.into(),
+            title: title.into(),
+            project_id: "p1".into(),
+            directory: "/".into(),
+            parent_id: None,
+            time: SessionTime {
+                created: 0,
+                updated: 0,
+            },
+            slug: String::new(),
+            version: String::new(),
+            workspace_id: None,
+            summary: None,
+            share: None,
+            permission: None,
+            revert: None,
+        }
     }
 
     #[test]
@@ -420,6 +509,42 @@ mod tests {
             "Read-only notice should appear. Screen: {}",
             screen
         );
+    }
+
+    #[test]
+    fn session_list_scrolls_long_lists_to_selected_item() {
+        let mut modal = SessionListModal::new();
+        let sessions = (0..12)
+            .map(|idx| make_session(&alloc::format!("s{idx}"), &alloc::format!("Session {idx}")))
+            .collect();
+        modal.set_sessions(sessions);
+
+        for _ in 0..9 {
+            modal.handle_event(Event::Key(crate::event::KeyEvent {
+                scancode: Scancode::Down,
+                modifiers: Default::default(),
+            }));
+        }
+
+        assert_eq!(modal.selected_index(), 9);
+        assert!(modal.scroll_offset() > 0);
+
+        let theme = Theme::default();
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                Modal::render(&modal, frame, &theme, Rect::new(0, 0, 40, 4));
+            })
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("Session 9"), "screen: {screen}");
     }
 
     #[test]
@@ -569,6 +694,87 @@ mod tests {
             screen
         );
     }
+
+    #[test]
+    fn permission_modal_wraps_content_without_internal_title() {
+        let modal = PermissionModal::new(PermissionRequest {
+            id: "permission-1".into(),
+            session_id: "session-1".into(),
+            permission: "very-long-permission-name-that-needs-wrapping".into(),
+            patterns: vec!["/tmp/some/really/long/path/that/needs/wrapping".into()],
+            metadata: BTreeMap::new(),
+            always: Vec::new(),
+            tool: Some(PermissionToolInfo {
+                message_id: "m1".into(),
+                call_id: "c1".into(),
+            }),
+        });
+        let theme = Theme::default();
+        let backend = TestBackend::new(32, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                Modal::render(&modal, frame, &theme, Rect::new(0, 0, 32, 8));
+            })
+            .unwrap();
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!screen.contains("Permission Request"));
+        assert!(screen.contains("Permission:"));
+        assert!(screen.contains("Allow Once"));
+    }
+
+    #[test]
+    fn question_modal_wraps_content_without_internal_title() {
+        let modal = QuestionModal::new(QuestionRequest {
+            id: "question-1".into(),
+            session_id: "session-1".into(),
+            questions: vec![QuestionInfo {
+                question: "Choose the option that should be used for this very long prompt".into(),
+                header: "Decision".into(),
+                options: vec![
+                    QuestionOption {
+                        label: "A".into(),
+                        description: "First long option description".into(),
+                    },
+                    QuestionOption {
+                        label: "B".into(),
+                        description: "Second long option description".into(),
+                    },
+                ],
+                multiple: false,
+                custom: false,
+            }],
+            tool: None,
+        });
+        let theme = Theme::default();
+        let backend = TestBackend::new(36, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                Modal::render(&modal, frame, &theme, Rect::new(0, 0, 36, 8));
+            })
+            .unwrap();
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!screen.contains("QuestionQuestion"));
+        assert!(screen.contains("Decision"));
+        assert!(screen.contains("A -"));
+    }
 }
 
 // --- Permission approval modal ---
@@ -589,32 +795,26 @@ impl PermissionModal {
 
 impl Modal for PermissionModal {
     fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect) {
-        Text::from("Permission Request")
-            .style(theme.dialog_title)
-            .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
-        let display = alloc::format!("Permission: {}", self.request.permission);
-        Text::from(display.as_str()).style(theme.text).render(
-            Rect::new(area.x, area.y + 2, area.width, 1),
-            frame.buffer_mut(),
+        let button_y = area.y + area.height.saturating_sub(1);
+        let content_height = button_y.saturating_sub(area.y);
+        let content_area = Rect::new(area.x, area.y, area.width, content_height);
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        lines.push(
+            Line::from(alloc::format!("Permission: {}", self.request.permission)).style(theme.text),
         );
         if !self.request.patterns.is_empty() {
-            Text::from("Patterns:").style(theme.text_dim).render(
-                Rect::new(area.x, area.y + 3, area.width, 1),
-                frame.buffer_mut(),
-            );
-            for (i, pattern) in self.request.patterns.iter().enumerate() {
-                let y = area.y + 4 + i as u16;
-                if y >= area.bottom() {
-                    break;
-                }
-                let display = alloc::format!("  {pattern}");
-                Text::from(display.as_str())
-                    .style(theme.text)
-                    .render(Rect::new(area.x, y, area.width, 1), frame.buffer_mut());
+            lines.push(Line::from(""));
+            lines.push(Line::from("Patterns:").style(theme.text_dim));
+            for pattern in self.request.patterns.iter() {
+                lines.push(Line::from(alloc::format!("  {pattern}")).style(theme.text));
             }
         }
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .render(content_area, frame.buffer_mut());
+
         let buttons = ["Allow Once", "Allow Always", "Deny"];
-        let btn_y = area.y + area.height - 2;
+        let mut x = area.x;
         for (i, label) in buttons.iter().enumerate() {
             let style = if i == self.selected {
                 theme.dialog_button_focused
@@ -623,9 +823,10 @@ impl Modal for PermissionModal {
             };
             let display = alloc::format!("  {label}  ");
             Text::from(display.as_str()).style(style).render(
-                Rect::new(area.x + (i as u16 * 16), btn_y, display.len() as u16, 1),
+                Rect::new(x, button_y, display.len() as u16, 1),
                 frame.buffer_mut(),
             );
+            x = x.saturating_add(display.len() as u16 + 1);
         }
     }
 
@@ -686,37 +887,23 @@ impl QuestionModal {
 
 impl Modal for QuestionModal {
     fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect) {
-        Text::from("Question")
-            .style(theme.dialog_title)
-            .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
         if let Some(qinfo) = self.request.questions.get(self.current_q) {
-            Text::from(qinfo.header.as_str())
-                .style(theme.text_accent)
-                .render(
-                    Rect::new(area.x, area.y + 2, area.width, 1),
-                    frame.buffer_mut(),
-                );
-            Text::from(qinfo.question.as_str())
-                .style(theme.text)
-                .render(
-                    Rect::new(area.x, area.y + 3, area.width, 1),
-                    frame.buffer_mut(),
-                );
+            let mut lines: Vec<Line<'_>> = Vec::new();
+            lines.push(Line::from(qinfo.header.as_str()).style(theme.text_accent));
+            lines.push(Line::from(qinfo.question.as_str()).style(theme.text));
+            lines.push(Line::from(""));
             for (i, opt) in qinfo.options.iter().enumerate() {
-                let y = area.y + 5 + i as u16;
-                if y >= area.bottom() {
-                    break;
-                }
                 let style = if i == self.selected {
                     theme.dialog_button_focused
                 } else {
                     theme.dialog_button
                 };
                 let display = alloc::format!("  {} - {}", opt.label, opt.description);
-                Text::from(display.as_str())
-                    .style(style)
-                    .render(Rect::new(area.x, y, area.width, 1), frame.buffer_mut());
+                lines.push(Line::from(display).style(style));
             }
+            Paragraph::new(Text::from(lines))
+                .wrap(Wrap { trim: false })
+                .render(area, frame.buffer_mut());
         }
     }
 

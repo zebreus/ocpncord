@@ -1,7 +1,8 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use ratatui_core::text::Line;
+use ratatui::style::Style;
+use ratatui::text::Line;
 
 use crate::theme::Theme;
 
@@ -14,12 +15,10 @@ pub fn render_part<'a>(
     show_details: bool,
 ) -> Vec<Line<'a>> {
     match part {
-        ocpncord_backend::Part::Text(tp) => {
-            vec![Line::from(tp.text.as_str()).style(theme.part_text)]
-        }
+        ocpncord_backend::Part::Text(tp) => styled_lines(tp.text.as_str(), theme.part_text),
         ocpncord_backend::Part::Reasoning(rp) => {
             if show_details {
-                vec![Line::from(rp.text.as_str()).style(theme.part_reasoning)]
+                styled_lines(rp.text.as_str(), theme.part_reasoning)
             } else {
                 vec![Line::from("reasoning hidden").style(theme.text_dim)]
             }
@@ -41,7 +40,7 @@ pub fn render_part<'a>(
                     }
                     _ => alloc::format!("{icon} {}", tp.tool),
                 };
-                vec![Line::from(summary).style(style)]
+                styled_lines_owned(summary, style)
             } else {
                 vec![Line::from(alloc::format!("{icon} {}", tp.tool)).style(style)]
             }
@@ -93,6 +92,28 @@ pub fn render_part<'a>(
     }
 }
 
+fn styled_lines(text: &str, style: Style) -> Vec<Line<'_>> {
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        lines.push(Line::from(line).style(style));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("").style(style));
+    }
+    lines
+}
+
+fn styled_lines_owned(text: alloc::string::String, style: Style) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        lines.push(Line::from(alloc::string::String::from(line)).style(style));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("").style(style));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +128,18 @@ mod tests {
         let lines = render_part(&part, &theme, true);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].to_string(), "hello world");
+    }
+
+    #[test]
+    fn text_part_newlines_render_as_distinct_lines() {
+        let theme = Theme::default();
+        let part = Part::Text(TextPart {
+            text: "hello\nworld".into(),
+        });
+        let lines = render_part(&part, &theme, true);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].to_string(), "hello");
+        assert_eq!(lines[1].to_string(), "world");
     }
 
     #[test]

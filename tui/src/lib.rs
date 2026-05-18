@@ -3,7 +3,7 @@
 
 //! Platform-agnostic TUI for the ocpncord client.
 //!
-//! Built on `ratatui-core` widgets. Renders via Crossterm on desktop
+//! Built on `ratatui` widgets. Renders via Crossterm on desktop
 //! and via mousefood on embedded hardware.
 
 extern crate alloc;
@@ -21,7 +21,7 @@ mod start_page;
 mod theme;
 
 pub use app::App;
-pub use command_palette::{CommandPaletteModal, default_commands};
+pub use command_palette::{default_commands, CommandPaletteModal};
 pub use event::{Event, KeyEvent, Modifiers, Scancode};
 pub use key_chord::KeyChord;
 pub use modal::Modal;

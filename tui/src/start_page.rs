@@ -1,6 +1,6 @@
-use ratatui_core::layout::{Alignment, Rect};
-use ratatui_core::text::Text;
-use ratatui_core::widgets::Widget;
+use ratatui::layout::{Alignment, Rect};
+use ratatui::text::Text;
+use ratatui::widgets::Widget;
 
 use crate::event::Event;
 use crate::screen::{Action, Screen};
@@ -18,10 +18,8 @@ const TIP: &str = "Tip: Ctrl+X H for help, Ctrl+X Q to quit";
 
 pub struct StartPage;
 
-impl Screen for StartPage {
-    fn render(&self, frame: &mut ratatui_core::terminal::Frame, theme: &Theme) {
-        let area = frame.area();
-
+impl StartPage {
+    pub fn render_in(&self, frame: &mut ratatui::Frame, theme: &Theme, area: Rect) {
         let logo_height = LOGO.lines().count() as u16;
         let tip_height = 1u16;
         let total_content_height = logo_height + tip_height;
@@ -39,6 +37,12 @@ impl Screen for StartPage {
             .alignment(Alignment::Center)
             .render(tip_area, frame.buffer_mut());
     }
+}
+
+impl Screen for StartPage {
+    fn render(&self, frame: &mut ratatui::Frame, theme: &Theme) {
+        self.render_in(frame, theme, frame.area());
+    }
 
     fn handle_event(&mut self, _event: Event) -> Action {
         Action::None
@@ -48,8 +52,8 @@ impl Screen for StartPage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui_core::backend::TestBackend;
-    use ratatui_core::terminal::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
     fn renders_logo_and_tip() {

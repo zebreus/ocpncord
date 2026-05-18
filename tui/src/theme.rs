@@ -1,4 +1,4 @@
-use ratatui_core::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 
 /// A collection of semantic styles used throughout the TUI.
 ///

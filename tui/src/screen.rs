@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::{Event, Theme};
-use ratatui_core::terminal::Frame;
+use ratatui::Frame;
 
 /// One screen or widget tree in the TUI.
 pub trait Screen {
@@ -23,23 +23,25 @@ pub enum Action {
     OpenPalette,
     ScrollUp,
     ScrollDown,
+    ScrollPageUp,
+    ScrollPageDown,
     ToggleDetails,
     LoadSession(String),
     DeleteSession(String),
     NewSession,
     // --- New: session lifecycle ---
-    RenameSession(String, String),   // session_id, new_title
-    AbortSession(String),            // session_id
-    SwitchToChat(String),            // session_id (load then switch)
+    RenameSession(String, String), // session_id, new_title
+    AbortSession(String),          // session_id
+    SwitchToChat(String),          // session_id (load then switch)
     // --- New: UI navigation ---
     OpenSettings,
-    OpenTerminal(String),            // pty_id
+    OpenTerminal(String), // pty_id
     CloseTerminal,
     ToggleSidePanel,
     SidePanelSelectTab(Tab),
     // --- New: modal replies ---
     ReplyPermission(String, String, PermissionReplyAction), // session_id, request_id, reply
-    ReplyQuestion(String, String, Vec<String>), // session_id, request_id, answers
+    ReplyQuestion(String, String, Vec<String>),             // session_id, request_id, answers
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
