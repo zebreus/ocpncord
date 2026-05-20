@@ -18,7 +18,7 @@ use crossterm::terminal::{
 use crossterm::{execute, queue};
 use embedded_io_async::{ErrorType, Read};
 use embedded_nal_async::{AddrType, Dns, TcpConnect};
-use ocpncord_backend::BackendEvent;
+use ocpncord_backend::{Backend as OcpBackend, BackendEvent};
 use ocpncord_backend_opencode::{OpenCodeBackend, SseParser};
 use ocpncord_tui::Event;
 use ocpncord_tui::{App, KeyEvent, Modifiers, Scancode};
@@ -547,12 +547,14 @@ async fn main() {
     // Persistent SSE background task — all backend events flow through here
     let sse_event_tx = event_tx.clone();
     let sse_url = cli.url.clone();
+    let prompt_url = cli.url.clone();
 
     tokio::spawn(async move {
         sse_background_task(sse_url, sse_event_tx).await;
     });
 
     // Keyboard input
+    let input_event_tx = event_tx.clone();
     tokio::spawn(async move {
         loop {
             let event = tokio::task::spawn_blocking(|| {
@@ -563,7 +565,7 @@ async fn main() {
             .await
             .ok()
             .flatten();
-            if event_tx.send(event).is_err() {
+            if input_event_tx.send(event).is_err() {
                 break;
             }
         }
@@ -591,6 +593,22 @@ async fn main() {
             _ = tick_interval.tick() => {
                 running = app.handle_event(Event::Tick).await;
             }
+        }
+
+        for prompt in app.take_pending_prompts() {
+            let event_tx = event_tx.clone();
+            let url = prompt_url.clone();
+            tokio::spawn(async move {
+                let mut backend = OpenCodeBackend::new(&url, &TCP, &DNS);
+                if let Err(e) = backend
+                    .prompt(&prompt.session_id, &prompt.text, Some(&prompt.agent))
+                    .await
+                {
+                    let _ = event_tx.send(Some(Event::Backend(BackendEvent::Error {
+                        message: format!("{e}"),
+                    })));
+                }
+            });
         }
 
         log::trace!(

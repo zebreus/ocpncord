@@ -9,7 +9,7 @@ use ratatui::Frame;
 
 use crate::event::{Event, Scancode};
 use crate::modal::Modal;
-use crate::screen::{Action, ModalId};
+use crate::screen::{Action, ModalId, Tab};
 use crate::theme::Theme;
 
 /// A single command entry in the palette.
@@ -52,13 +52,13 @@ pub fn default_commands() -> Vec<PaletteCommand> {
             name: "Todos",
             slash_command: "/todos",
             keybinding: "",
-            action: Action::ToggleSidePanel,
+            action: Action::ToggleSidePanelTab(Tab::Todos),
         },
         PaletteCommand {
             name: "Diagnostics",
             slash_command: "/diagnostics",
             keybinding: "",
-            action: Action::ToggleSidePanel,
+            action: Action::ToggleSidePanelTab(Tab::Diagnostics),
         },
         PaletteCommand {
             name: "Terminal",

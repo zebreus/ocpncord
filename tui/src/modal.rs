@@ -365,7 +365,8 @@ impl Modal for ModelPickerModal {
             .as_deref()
             .or(self.agent_model.as_deref())
             .unwrap_or("No model configured");
-        Text::from(format!("Current: {current}"))
+        let current_label = fit_with_ellipsis(format!("Current: {current}"), area.width as usize);
+        Text::from(current_label)
             .style(theme.text_dim)
             .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
 
@@ -396,9 +397,10 @@ impl Modal for ModelPickerModal {
                 } else {
                     " "
                 };
-                ListItem::new(Line::from(format!(
-                    "{marker} {}  [{}]",
-                    choice.label, choice.details
+                let display = format!("{marker} {}  [{}]", choice.label, choice.details);
+                ListItem::new(Line::from(fit_with_ellipsis(
+                    display,
+                    list_area.width as usize,
                 )))
             })
             .collect();
@@ -463,6 +465,19 @@ impl Modal for ModelPickerModal {
     fn title(&self) -> &str {
         "Model Picker"
     }
+}
+
+fn fit_with_ellipsis(text: String, width: usize) -> String {
+    let len = text.chars().count();
+    if len <= width {
+        return text;
+    }
+    if width <= 3 {
+        return text.chars().take(width).collect();
+    }
+    let mut out: String = text.chars().take(width - 3).collect();
+    out.push_str("...");
+    out
 }
 
 // --- Help modal ---
@@ -656,6 +671,50 @@ mod tests {
             "Model name 'GPT-4' should appear. Screen: {}",
             screen
         );
+    }
+
+    #[test]
+    fn model_picker_truncates_current_model_with_ellipsis() {
+        use ocpncord_backend::{Config, ModelConfig, ProviderConfig};
+        let mut provider = BTreeMap::new();
+        provider.insert(
+            "very-long-provider-name".into(),
+            ProviderConfig {
+                name: Some("Very Long Provider".into()),
+                models: BTreeMap::from([(
+                    "very-long-model-name-that-does-not-fit".into(),
+                    ModelConfig {
+                        name: Some("Long Model".into()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
+        let mut modal = ModelPickerModal::new();
+        modal.set_config(Config {
+            model: Some("very-long-provider-name/very-long-model-name-that-does-not-fit".into()),
+            username: None,
+            provider,
+            agent: Default::default(),
+        });
+
+        let theme = Theme::default();
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                Modal::render(&modal, frame, &theme, Rect::new(0, 0, 24, 6));
+            })
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("..."), "screen: {screen}");
     }
 
     #[test]

@@ -90,41 +90,15 @@ impl PromptBar {
         }
     }
 
-    const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
     pub fn render(
         &self,
         area: Rect,
         frame: &mut ratatui::Frame,
         theme: &Theme,
-        is_streaming: bool,
-        agent_name: &str,
-        tick: u64,
+        _is_streaming: bool,
+        _agent_name: &str,
+        _tick: u64,
     ) {
-        let agent_display = alloc::format!("[{}]", agent_name);
-        let agent_width = agent_display.chars().count() as u16;
-        let gap = if area.width > agent_width { 1 } else { 0 };
-        let input_width = area.width.saturating_sub(agent_width + gap);
-        let input_area = Rect::new(area.x, area.y, input_width, 1);
-        let agent_area = Rect::new(
-            area.x + input_width + gap,
-            area.y,
-            agent_width.min(area.width),
-            1,
-        );
-
-        if is_streaming {
-            let spinner = Self::SPINNER[(tick as usize / 3) % Self::SPINNER.len()];
-            let msg = alloc::format!("{spinner} Agent is responding... (Esc to interrupt)");
-            Text::from(clamp_tail(msg.as_str(), input_width as usize))
-                .style(theme.text_dim)
-                .render(input_area, frame.buffer_mut());
-            Text::from(agent_display.as_str())
-                .style(theme.agent_indicator)
-                .render(agent_area, frame.buffer_mut());
-            return;
-        }
-
         let (prefix, body) = match self.input_mode() {
             InputMode::Command => ("/ ", self.input.trim_start_matches('/')),
             InputMode::Shell => ("! ", self.input.trim_start_matches('!')),
@@ -134,12 +108,9 @@ impl PromptBar {
         };
 
         let display = alloc::format!("{}{}", prefix, body);
-        Text::from(clamp_tail(display.as_str(), input_width as usize))
+        Text::from(clamp_tail(display.as_str(), area.width as usize))
             .style(theme.input)
-            .render(input_area, frame.buffer_mut());
-        Text::from(agent_display.as_str())
-            .style(theme.agent_indicator)
-            .render(agent_area, frame.buffer_mut());
+            .render(area, frame.buffer_mut());
     }
 }
 
@@ -262,11 +233,10 @@ mod tests {
             .collect();
         assert!(screen.contains("/ help"));
         assert!(!screen.contains("//help"));
-        assert!(screen.contains("[build]"));
     }
 
     #[test]
-    fn long_input_does_not_overwrite_agent_indicator() {
+    fn long_input_is_clamped_to_prompt_area() {
         let mut bar = PromptBar::new();
         bar.append_text("this input is intentionally longer than the prompt area");
         let theme = Theme::default();
@@ -286,6 +256,6 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(screen.contains("[build]"), "screen: {screen}");
+        assert_eq!(screen.chars().count(), 24, "screen: {screen}");
     }
 }

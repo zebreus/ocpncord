@@ -1,5 +1,5 @@
 use crate::event::{KeyEvent, Modifiers, Scancode};
-use crate::screen::{Action, ModalId};
+use crate::screen::{Action, ModalId, Tab};
 use alloc::string::String;
 
 const LEADER_TIMEOUT_TICKS: u64 = 40;
@@ -72,8 +72,12 @@ impl KeyChord {
             }
             Scancode::Char('h') | Scancode::Char('H') => Some(Action::OpenModal(ModalId::Help)),
             Scancode::Char('t') | Scancode::Char('T') => Some(Action::OpenTerminal(String::new())),
-            Scancode::Char('d') | Scancode::Char('D') => Some(Action::ToggleSidePanel),
-            Scancode::Char('o') | Scancode::Char('O') => Some(Action::ToggleSidePanel),
+            Scancode::Char('d') | Scancode::Char('D') => {
+                Some(Action::ToggleSidePanelTab(Tab::Diagnostics))
+            }
+            Scancode::Char('o') | Scancode::Char('O') => {
+                Some(Action::ToggleSidePanelTab(Tab::Todos))
+            }
             _ => None,
         }
     }
@@ -206,6 +210,26 @@ mod tests {
             Some(Action::OpenModal(ModalId::Help))
         );
         assert!(chord.leader_tick.is_none());
+    }
+
+    #[test]
+    fn leader_d_toggles_diagnostics_panel() {
+        let mut chord = KeyChord::new();
+        chord.handle(&ctrl('x'), 0);
+        assert_eq!(
+            chord.handle(&key('d'), 1),
+            Some(Action::ToggleSidePanelTab(Tab::Diagnostics))
+        );
+    }
+
+    #[test]
+    fn leader_o_toggles_todos_panel() {
+        let mut chord = KeyChord::new();
+        chord.handle(&ctrl('x'), 0);
+        assert_eq!(
+            chord.handle(&key('o'), 1),
+            Some(Action::ToggleSidePanelTab(Tab::Todos))
+        );
     }
 
     #[test]

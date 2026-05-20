@@ -39,6 +39,7 @@ pub enum Action {
     OpenTerminal(String), // pty_id
     CloseTerminal,
     ToggleSidePanel,
+    ToggleSidePanelTab(Tab),
     SidePanelSelectTab(Tab),
     // --- New: modal replies ---
     ReplyPermission(String, String, PermissionReplyAction), // session_id, request_id, reply

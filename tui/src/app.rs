@@ -8,13 +8,13 @@ use core::cell::Cell;
 
 use ocpncord_backend::{Backend, BackendEvent};
 
-use crate::chat::{render_chat, Chat};
+use crate::chat::{render_chat, Chat, ChatTranscript};
 use crate::command_palette::CommandPaletteModal;
 use crate::event::{Event, Scancode};
 use crate::key_chord::KeyChord;
 use crate::modal::{HelpModal, Modal, ModelPickerModal, SessionListModal};
 use crate::prompt_bar::PromptBar;
-use crate::screen::{Action, ModalId, ScreenId};
+use crate::screen::{Action, ModalId, ScreenId, Tab};
 use crate::start_page::StartPage;
 use crate::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -49,6 +49,19 @@ pub struct LoadedMessage {
     pub parts: Vec<ocpncord_backend::Part>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPrompt {
+    pub session_id: String,
+    pub text: String,
+    pub agent: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamTextKind {
+    Text,
+    Reasoning,
+}
+
 /// A single LSP diagnostic entry.
 #[derive(Debug, Clone)]
 pub struct LspDiagnostic {
@@ -73,6 +86,102 @@ pub struct TerminalPane {
 pub struct TermLine {
     pub content: String,
     pub is_error: bool,
+}
+
+fn parts_equivalent(left: &ocpncord_backend::Part, right: &ocpncord_backend::Part) -> bool {
+    match (left, right) {
+        (ocpncord_backend::Part::Text(left), ocpncord_backend::Part::Text(right)) => {
+            left.text == right.text
+        }
+        (ocpncord_backend::Part::Reasoning(left), ocpncord_backend::Part::Reasoning(right)) => {
+            left.text == right.text
+        }
+        (ocpncord_backend::Part::Tool(left), ocpncord_backend::Part::Tool(right)) => {
+            left.tool == right.tool && tool_states_equivalent(&left.state, &right.state)
+        }
+        (ocpncord_backend::Part::StepStart(_), ocpncord_backend::Part::StepStart(_)) => true,
+        (ocpncord_backend::Part::StepFinish(left), ocpncord_backend::Part::StepFinish(right)) => {
+            left.reason == right.reason
+        }
+        _ => false,
+    }
+}
+
+fn tool_states_equivalent(
+    left: &ocpncord_backend::ToolState,
+    right: &ocpncord_backend::ToolState,
+) -> bool {
+    match (left, right) {
+        (
+            ocpncord_backend::ToolState::Pending {
+                input: left_input,
+                raw: left_raw,
+            },
+            ocpncord_backend::ToolState::Pending {
+                input: right_input,
+                raw: right_raw,
+            },
+        ) => left_input == right_input && left_raw == right_raw,
+        (
+            ocpncord_backend::ToolState::Running { .. },
+            ocpncord_backend::ToolState::Running { .. },
+        ) => true,
+        (
+            ocpncord_backend::ToolState::Completed {
+                output: left_output,
+                title: left_title,
+                ..
+            },
+            ocpncord_backend::ToolState::Completed {
+                output: right_output,
+                title: right_title,
+                ..
+            },
+        ) => left_output == right_output && left_title == right_title,
+        (
+            ocpncord_backend::ToolState::Error {
+                error: left_error, ..
+            },
+            ocpncord_backend::ToolState::Error {
+                error: right_error, ..
+            },
+        ) => left_error == right_error,
+        _ => false,
+    }
+}
+
+fn clamp_tail(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let len = text.chars().count();
+    text.chars().skip(len.saturating_sub(width)).collect()
+}
+
+fn user_loaded_message(text: &str) -> LoadedMessage {
+    LoadedMessage {
+        role: ocpncord_backend::MessageRole::User,
+        parts: vec![ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+            text: text.into(),
+        })],
+    }
+}
+
+fn stream_text_kind(part: &ocpncord_backend::Part) -> Option<StreamTextKind> {
+    match part {
+        ocpncord_backend::Part::Text(_) => Some(StreamTextKind::Text),
+        ocpncord_backend::Part::Reasoning(_) => Some(StreamTextKind::Reasoning),
+        _ => None,
+    }
+}
+
+fn set_stream_text(part: &mut ocpncord_backend::Part, text: String, kind: StreamTextKind) {
+    *part = match kind {
+        StreamTextKind::Text => ocpncord_backend::Part::Text(ocpncord_backend::TextPart { text }),
+        StreamTextKind::Reasoning => {
+            ocpncord_backend::Part::Reasoning(ocpncord_backend::ReasoningPart { text })
+        }
+    };
 }
 
 impl TerminalPane {
@@ -122,10 +231,18 @@ pub struct App<B: Backend> {
     draft: Option<String>,
     error: Option<String>,
     is_streaming: bool,
+    response_indicator_until_tick: u64,
     partial_parts: Vec<ocpncord_backend::Part>,
     /// Accumulated delta text per part_id for real-time streaming.
     partial_texts: alloc::collections::BTreeMap<String, String>,
+    partial_part_indices: alloc::collections::BTreeMap<String, usize>,
+    latest_text_part_index: Option<usize>,
     messages: Vec<LoadedMessage>,
+    pending_prompts: Vec<PendingPrompt>,
+    queued_prompts: Vec<PendingPrompt>,
+    queued_messages: Vec<LoadedMessage>,
+    ignore_done_until_tick: u64,
+    response_seen_assistant_activity: bool,
     stream: Option<B::PromptStream>,
     sync_stream: Option<B::EventStream>,
     active_modal: Option<Box<dyn Modal>>,
@@ -171,9 +288,17 @@ impl<B: Backend> App<B> {
             draft: None,
             error: None,
             is_streaming: false,
+            response_indicator_until_tick: 0,
             partial_parts: Vec::new(),
             partial_texts: alloc::collections::BTreeMap::new(),
+            partial_part_indices: alloc::collections::BTreeMap::new(),
+            latest_text_part_index: None,
             messages: Vec::new(),
+            pending_prompts: Vec::new(),
+            queued_prompts: Vec::new(),
+            queued_messages: Vec::new(),
+            ignore_done_until_tick: 0,
+            response_seen_assistant_activity: false,
             stream: None,
             active_modal: None,
             agents: Vec::new(),
@@ -290,6 +415,23 @@ impl<B: Backend> App<B> {
             .unwrap_or("build")
     }
 
+    fn active_agent_status(&self) -> (String, &'static str, String) {
+        let Some(agent) = self.agents.get(self.active_agent) else {
+            return ("build".into(), "primary", "default".into());
+        };
+        let mode = match agent.mode {
+            ocpncord_backend::AgentMode::Primary => "primary",
+            ocpncord_backend::AgentMode::Subagent => "subagent",
+            ocpncord_backend::AgentMode::All => "all",
+        };
+        let model = agent
+            .model
+            .as_ref()
+            .map(|model| alloc::format!("{}/{}", model.provider_id, model.model_id))
+            .unwrap_or_else(|| "default".into());
+        (agent.name.clone(), mode, model)
+    }
+
     pub fn cycle_agent(&mut self) {
         if !self.agents.is_empty() {
             self.active_agent = (self.active_agent + 1) % self.agents.len();
@@ -358,8 +500,74 @@ impl<B: Backend> App<B> {
         &self.messages
     }
 
+    pub fn pending_prompts(&self) -> &[PendingPrompt] {
+        &self.pending_prompts
+    }
+
+    pub fn queued_prompts(&self) -> &[PendingPrompt] {
+        &self.queued_prompts
+    }
+
+    pub fn take_pending_prompts(&mut self) -> Vec<PendingPrompt> {
+        core::mem::take(&mut self.pending_prompts)
+    }
+
     pub fn tick(&self) -> u64 {
         self.tick
+    }
+
+    fn mark_response_active(&mut self) {
+        self.response_indicator_until_tick = self.tick.saturating_add(80);
+    }
+
+    fn should_show_response_indicator(&self) -> bool {
+        self.is_streaming || self.response_indicator_until_tick > self.tick
+    }
+
+    fn queue_or_dispatch_prompt(&mut self, prompt: PendingPrompt, message: LoadedMessage) {
+        if self.is_streaming || !self.pending_prompts.is_empty() {
+            self.queued_prompts.push(prompt);
+            self.queued_messages.push(message);
+            return;
+        }
+
+        self.dispatch_prompt(prompt, message);
+    }
+
+    fn dispatch_prompt(&mut self, prompt: PendingPrompt, message: LoadedMessage) {
+        self.messages.push(message);
+        self.draft = Some(prompt.text.clone());
+        self.active_screen = ScreenId::Chat;
+        self.is_streaming = true;
+        self.mark_response_active();
+        self.partial_parts.clear();
+        self.partial_texts.clear();
+        self.partial_part_indices.clear();
+        self.latest_text_part_index = None;
+        self.response_seen_assistant_activity = false;
+        self.pending_prompts.push(prompt);
+    }
+
+    fn dispatch_next_queued_prompt(&mut self) {
+        if self.queued_prompts.is_empty() || self.queued_messages.is_empty() {
+            return;
+        }
+
+        if !self.partial_parts.is_empty() {
+            let parts = core::mem::take(&mut self.partial_parts);
+            self.messages.push(LoadedMessage {
+                role: ocpncord_backend::MessageRole::Assistant,
+                parts,
+            });
+            self.partial_texts.clear();
+            self.partial_part_indices.clear();
+            self.latest_text_part_index = None;
+        }
+
+        let prompt = self.queued_prompts.remove(0);
+        let message = self.queued_messages.remove(0);
+        self.ignore_done_until_tick = self.tick.saturating_add(2);
+        self.dispatch_prompt(prompt, message);
     }
 
     /// Returns `false` when the application should quit.
@@ -392,7 +600,6 @@ impl<B: Backend> App<B> {
                     if key.scancode == Scancode::Char('c') && key.modifiers.ctrl {
                         return self.handle_interrupt().await;
                     }
-                    return true;
                 }
 
                 if let Some(action) = self.key_chord.handle(key, self.tick) {
@@ -464,35 +671,49 @@ impl<B: Backend> App<B> {
                 #[allow(unreachable_patterns)]
                 match event {
                     ocpncord_backend::BackendEvent::Part { part, delta: _ } => {
-                        self.partial_parts.push(part);
+                        self.mark_response_active();
+                        self.response_seen_assistant_activity = true;
+                        self.merge_stream_part(part);
                     }
                     ocpncord_backend::BackendEvent::Done => {
-                        self.is_streaming = false;
-                        self.stream = None;
-                        self.partial_texts.clear();
+                        if self.tick >= self.ignore_done_until_tick
+                            && self.response_seen_assistant_activity
+                        {
+                            let was_streaming = self.is_streaming;
+                            self.is_streaming = false;
+                            self.stream = None;
+                            self.partial_texts.clear();
+                            self.partial_part_indices.clear();
+                            self.latest_text_part_index = None;
 
-                        // REST API fallback: fetch all messages to fill in any
-                        // that SSE events might have missed.
-                        if let Some(ref session) = self.active_session.clone() {
-                            let session_id = session.id.clone();
-                            if let Ok(summaries) = self.backend.list_messages(&session_id).await {
-                                let mut api_messages: Vec<LoadedMessage> = Vec::new();
-                                for summary in &summaries {
-                                    if let Ok(detail) =
-                                        self.backend.get_message(&session_id, &summary.id).await
+                            // REST API fallback: fetch all messages to fill in any
+                            // that SSE events might have missed.
+                            if let Some(ref session) = self.active_session.clone() {
+                                let session_id = session.id.clone();
+                                if let Ok(summaries) = self.backend.list_messages(&session_id).await
+                                {
+                                    let mut api_messages: Vec<LoadedMessage> = Vec::new();
+                                    for summary in &summaries {
+                                        if let Ok(detail) =
+                                            self.backend.get_message(&session_id, &summary.id).await
+                                        {
+                                            api_messages.push(LoadedMessage {
+                                                role: detail.info.role,
+                                                parts: detail.parts,
+                                            });
+                                        }
+                                    }
+                                    if !api_messages.is_empty()
+                                        && api_messages.len() >= self.messages.len()
                                     {
-                                        api_messages.push(LoadedMessage {
-                                            role: detail.info.role,
-                                            parts: detail.parts,
-                                        });
+                                        self.messages = api_messages;
+                                        self.partial_parts.clear();
                                     }
                                 }
-                                if !api_messages.is_empty()
-                                    && api_messages.len() >= self.messages.len()
-                                {
-                                    self.messages = api_messages;
-                                    self.partial_parts.clear();
-                                }
+                            }
+
+                            if was_streaming {
+                                self.dispatch_next_queued_prompt();
                             }
                         }
                     }
@@ -500,8 +721,13 @@ impl<B: Backend> App<B> {
                         self.error = Some(message);
                         self.partial_parts.clear();
                         self.is_streaming = false;
+                        self.response_indicator_until_tick = 0;
                         self.stream = None;
                         self.partial_texts.clear();
+                        self.partial_part_indices.clear();
+                        self.latest_text_part_index = None;
+                        self.response_seen_assistant_activity = false;
+                        self.dispatch_next_queued_prompt();
                     }
                     ocpncord_backend::BackendEvent::SessionCreated { session } => {
                         let is_new = self
@@ -535,18 +761,10 @@ impl<B: Backend> App<B> {
                     ocpncord_backend::BackendEvent::SessionDiff { .. } => {}
                     ocpncord_backend::BackendEvent::SessionCompacted { .. } => {}
                     ocpncord_backend::BackendEvent::MessageUpdated { .. } => {
-                        if self.is_streaming {
-                            let parts = core::mem::take(&mut self.partial_parts);
-                            if !parts.is_empty() {
-                                self.messages.push(LoadedMessage {
-                                    role: ocpncord_backend::MessageRole::Assistant,
-                                    parts,
-                                });
-                            }
-                            self.is_streaming = false;
-                            self.stream = None;
-                            self.partial_texts.clear();
-                        }
+                        // MessageUpdated is a persistence/status notification.
+                        // The visible stream is built from part events, and
+                        // Done performs the REST fallback for committed
+                        // messages. Flushing here duplicates replayed parts.
                     }
                     ocpncord_backend::BackendEvent::MessageRemoved { .. } => {}
                     ocpncord_backend::BackendEvent::MessagePartUpdated {
@@ -556,7 +774,11 @@ impl<B: Backend> App<B> {
                         if self.active_session.as_ref().map(|s| s.id.as_str())
                             == Some(session_id.as_str())
                         {
-                            self.partial_parts.push(part.clone());
+                            self.mark_response_active();
+                            if !self.is_echoed_user_text(part) {
+                                self.response_seen_assistant_activity = true;
+                            }
+                            self.merge_stream_part(part.clone());
                         }
                     }
                     ocpncord_backend::BackendEvent::MessagePartDelta {
@@ -569,22 +791,9 @@ impl<B: Backend> App<B> {
                         && self.active_session.as_ref().map(|s| s.id.as_str())
                             == Some(session_id.as_str()) =>
                     {
-                        let acc = self.partial_texts.entry(part_id).or_default();
-                        acc.push_str(&delta);
-                        let new_part = ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
-                            text: acc.clone(),
-                        });
-                        let replaced = self.partial_parts.iter_mut().rev().find_map(|p| {
-                            if matches!(p, ocpncord_backend::Part::Text(_)) {
-                                *p = new_part.clone();
-                                Some(())
-                            } else {
-                                None
-                            }
-                        });
-                        if replaced.is_none() {
-                            self.partial_parts.push(new_part);
-                        }
+                        self.mark_response_active();
+                        self.response_seen_assistant_activity = true;
+                        self.merge_stream_delta(part_id, delta);
                     }
                     ocpncord_backend::BackendEvent::MessagePartDelta { .. } => {}
                     ocpncord_backend::BackendEvent::MessagePartRemoved { .. } => {}
@@ -824,33 +1033,15 @@ impl<B: Backend> App<B> {
             .map(|s| s.id.clone())
             .unwrap_or_default();
 
-        self.messages.push(LoadedMessage {
-            role: ocpncord_backend::MessageRole::User,
-            parts: vec![ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
-                text: text.clone(),
-            })],
-        });
-
-        self.draft = Some(text.clone());
         self.prompt_bar.clear();
-        self.active_screen = ScreenId::Chat;
-
         let agent = self.active_agent_name().to_string();
-
-        // Set streaming BEFORE the POST so SSE events received during the
-        // HTTP round-trip are not dropped (they arrive via the persistent
-        // /global/event connection and check is_streaming).
-        self.is_streaming = true;
-        self.partial_parts = Vec::new();
-        self.partial_texts.clear();
-
-        match self.backend.prompt(&session_id, &text, Some(&agent)).await {
-            Ok(_stream) => {}
-            Err(e) => {
-                self.is_streaming = false;
-                self.error = Some(alloc::format!("{}", e));
-            }
-        }
+        let message = user_loaded_message(&text);
+        let prompt = PendingPrompt {
+            session_id,
+            text: text.clone(),
+            agent,
+        };
+        self.queue_or_dispatch_prompt(prompt, message);
 
         true
     }
@@ -904,18 +1095,21 @@ impl<B: Backend> App<B> {
                 true
             }
             "/todos" => {
+                self.prompt_bar.clear();
                 self.side_panel_visible = true;
-                self.side_panel_tab = crate::screen::Tab::Todos;
+                self.side_panel_tab = Tab::Todos;
                 true
             }
             "/diagnostics" => {
+                self.prompt_bar.clear();
                 self.side_panel_visible = true;
-                self.side_panel_tab = crate::screen::Tab::Diagnostics;
+                self.side_panel_tab = Tab::Diagnostics;
                 true
             }
             "/pty" => {
+                self.prompt_bar.clear();
                 self.side_panel_visible = true;
-                self.side_panel_tab = crate::screen::Tab::Pane;
+                self.side_panel_tab = Tab::Pane;
                 true
             }
             "/abort" => {
@@ -956,30 +1150,15 @@ impl<B: Backend> App<B> {
             .map(|s| s.id.clone())
             .unwrap_or_default();
 
-        self.messages.push(LoadedMessage {
-            role: ocpncord_backend::MessageRole::User,
-            parts: vec![ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
-                text: text.into(),
-            })],
-        });
-
-        self.draft = Some(text.into());
         self.prompt_bar.clear();
-        self.active_screen = ScreenId::Chat;
-
         let agent = self.active_agent_name().to_string();
-
-        self.is_streaming = true;
-        self.partial_parts = Vec::new();
-        self.partial_texts.clear();
-
-        match self.backend.prompt(&session_id, text, Some(&agent)).await {
-            Ok(_stream) => {}
-            Err(e) => {
-                self.is_streaming = false;
-                self.error = Some(alloc::format!("{}", e));
-            }
-        }
+        let message = user_loaded_message(text);
+        let prompt = PendingPrompt {
+            session_id,
+            text: text.into(),
+            agent,
+        };
+        self.queue_or_dispatch_prompt(prompt, message);
 
         true
     }
@@ -990,8 +1169,14 @@ impl<B: Backend> App<B> {
         }
         self.stream = None;
         self.is_streaming = false;
+        self.response_indicator_until_tick = 0;
         self.partial_parts.clear();
         self.partial_texts.clear();
+        self.partial_part_indices.clear();
+        self.latest_text_part_index = None;
+        self.response_seen_assistant_activity = false;
+        self.queued_prompts.clear();
+        self.queued_messages.clear();
         true
     }
 
@@ -1179,6 +1364,15 @@ impl<B: Backend> App<B> {
             Some(Action::ToggleSidePanel) => {
                 self.side_panel_visible = !self.side_panel_visible;
             }
+            Some(Action::ToggleSidePanelTab(tab)) => {
+                if self.side_panel_visible && self.side_panel_tab == tab {
+                    self.side_panel_visible = false;
+                } else {
+                    self.side_panel_tab = tab;
+                    self.side_panel_visible = true;
+                    self.side_panel_scroll = 0;
+                }
+            }
             Some(Action::SidePanelSelectTab(tab)) => {
                 self.side_panel_tab = tab;
                 self.side_panel_scroll = 0;
@@ -1266,6 +1460,117 @@ impl<B: Backend> App<B> {
         self.terminal.scroll = self.terminal.scroll.saturating_sub(amount);
     }
 
+    fn render_status_line(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let (agent, mode, model) = self.active_agent_status();
+        let mut status = alloc::format!("[{agent}]  mode: {mode}  model: {model}");
+        if self.should_show_response_indicator() {
+            let spinner =
+                ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][(self.tick as usize / 3) % 10];
+            status.push_str("  ");
+            status.push_str(spinner);
+            status.push_str(" Agent is Responding...");
+        }
+        Text::from(clamp_tail(status.as_str(), area.width as usize))
+            .style(self.theme.agent_indicator)
+            .render(area, frame.buffer_mut());
+    }
+
+    fn merge_stream_part(&mut self, part: ocpncord_backend::Part) -> Option<usize> {
+        if self.is_echoed_user_text(&part) {
+            return None;
+        }
+
+        if let Some(index) = self
+            .partial_parts
+            .iter()
+            .rposition(|existing| parts_equivalent(existing, &part))
+        {
+            if stream_text_kind(&part).is_some() {
+                self.latest_text_part_index = Some(index);
+            }
+            return Some(index);
+        }
+
+        if let Some(kind) = stream_text_kind(&part) {
+            let incoming_text = match &part {
+                ocpncord_backend::Part::Text(text) => text.text.clone(),
+                ocpncord_backend::Part::Reasoning(reasoning) => reasoning.text.clone(),
+                _ => String::new(),
+            };
+
+            if let Some(index) = self
+                .partial_parts
+                .iter()
+                .rposition(|existing| stream_text_kind(existing) == Some(kind))
+            {
+                if incoming_text.is_empty() {
+                    self.latest_text_part_index = Some(index);
+                    return Some(index);
+                }
+                set_stream_text(&mut self.partial_parts[index], incoming_text, kind);
+                self.latest_text_part_index = Some(index);
+                return Some(index);
+            }
+        }
+
+        self.partial_parts.push(part);
+        let index = self.partial_parts.len() - 1;
+        if stream_text_kind(&self.partial_parts[index]).is_some() {
+            self.latest_text_part_index = Some(index);
+        }
+        Some(index)
+    }
+
+    fn merge_stream_delta(&mut self, part_id: String, delta: String) {
+        let text = {
+            let acc = self.partial_texts.entry(part_id.clone()).or_default();
+            acc.push_str(&delta);
+            acc.clone()
+        };
+
+        let index = self
+            .partial_part_indices
+            .get(&part_id)
+            .copied()
+            .filter(|index| *index < self.partial_parts.len())
+            .or(self.latest_text_part_index)
+            .filter(|index| *index < self.partial_parts.len());
+
+        let (index, kind) = match index {
+            Some(index) => {
+                let kind =
+                    stream_text_kind(&self.partial_parts[index]).unwrap_or(StreamTextKind::Text);
+                (index, kind)
+            }
+            None => {
+                self.partial_parts
+                    .push(ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                        text: String::new(),
+                    }));
+                (self.partial_parts.len() - 1, StreamTextKind::Text)
+            }
+        };
+
+        set_stream_text(&mut self.partial_parts[index], text, kind);
+        self.partial_part_indices.insert(part_id, index);
+        self.latest_text_part_index = Some(index);
+    }
+
+    fn is_echoed_user_text(&self, part: &ocpncord_backend::Part) -> bool {
+        let ocpncord_backend::Part::Text(incoming) = part else {
+            return false;
+        };
+
+        self.messages.last().is_some_and(|message| {
+            matches!(message.role, ocpncord_backend::MessageRole::User)
+                && message.parts.len() == 1
+                && matches!(
+                    &message.parts[0],
+                    ocpncord_backend::Part::Text(existing) if existing.text == incoming.text
+                )
+        })
+    }
+
     pub fn render(&self, frame: &mut ratatui::Frame) {
         let area = frame.area();
         let panel_width = if self.side_panel_visible {
@@ -1297,11 +1602,13 @@ impl<B: Backend> App<B> {
                     [
                         Constraint::Min(0),
                         Constraint::Length(1),
-                        Constraint::Length(7),
+                        Constraint::Length(1),
+                        Constraint::Length(6),
                     ],
                 )
                 .split(main_area);
                 let prompt_row = rows[1];
+                let status_row = rows[2];
                 let prompt_area = Rect::new(
                     prompt_row.x + prompt_row.width.saturating_sub(50) / 2,
                     prompt_row.y,
@@ -1316,20 +1623,28 @@ impl<B: Backend> App<B> {
                     self.active_agent_name(),
                     self.tick,
                 );
+                self.render_status_line(frame, status_row);
             }
             ScreenId::Chat => {
                 let rows = Layout::new(
                     Direction::Vertical,
-                    [Constraint::Min(0), Constraint::Length(1)],
+                    [
+                        Constraint::Min(0),
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                    ],
                 )
                 .split(main_area);
                 render_chat(
                     frame,
                     &self.theme,
-                    main_area,
-                    &self.messages,
-                    &self.partial_parts,
-                    self.is_streaming,
+                    rows[0],
+                    ChatTranscript {
+                        messages: &self.messages,
+                        active_parts: &self.partial_parts,
+                        queued_messages: &self.queued_messages,
+                        is_streaming: self.is_streaming,
+                    },
                     self.chat.scroll,
                 );
                 self.prompt_bar.render(
@@ -1340,6 +1655,7 @@ impl<B: Backend> App<B> {
                     self.active_agent_name(),
                     self.tick,
                 );
+                self.render_status_line(frame, rows[2]);
             }
             ScreenId::Terminal => {
                 self.render_terminal(frame, main_area);
@@ -1395,12 +1711,17 @@ impl<B: Backend> App<B> {
 
         if let Some(ref modal) = self.active_modal {
             let area = frame.area();
+            Clear.render(area, frame.buffer_mut());
+            Block::new()
+                .style(self.theme.bg)
+                .render(area, frame.buffer_mut());
             let (modal_width, modal_height) = modal.preferred_size(area);
             let modal_x = area.x + (area.width.saturating_sub(modal_width)) / 2;
             let modal_y = area.y + (area.height.saturating_sub(modal_height)) / 2;
             let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
             Clear.render(modal_area, frame.buffer_mut());
             let block = Block::bordered()
+                .style(self.theme.bg)
                 .border_type(BorderType::Rounded)
                 .border_style(self.theme.border)
                 .title_style(self.theme.text_accent)
@@ -1413,7 +1734,10 @@ impl<B: Backend> App<B> {
     }
 
     fn render_side_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let panel = Block::new().style(self.theme.side_panel_bg);
+        let panel = Block::bordered()
+            .border_type(BorderType::Plain)
+            .border_style(self.theme.side_panel_border)
+            .style(self.theme.side_panel_bg);
         let panel_inner = panel.inner(area);
         panel.render(area, frame.buffer_mut());
 
@@ -1423,9 +1747,9 @@ impl<B: Backend> App<B> {
         )
         .split(panel_inner);
         let selected = match self.side_panel_tab {
-            crate::screen::Tab::Diagnostics => 0,
-            crate::screen::Tab::Todos => 1,
-            crate::screen::Tab::Pane => 2,
+            Tab::Diagnostics => 0,
+            Tab::Todos => 1,
+            Tab::Pane => 2,
         };
         let labels = if rows[0].width < 26 {
             ["Diag", "Todo", "Term"]
@@ -1440,9 +1764,9 @@ impl<B: Backend> App<B> {
 
         let content_area = rows[1];
         match self.side_panel_tab {
-            crate::screen::Tab::Diagnostics => self.render_diagnostics_panel(frame, content_area),
-            crate::screen::Tab::Todos => self.render_todos_panel(frame, content_area),
-            crate::screen::Tab::Pane => self.render_terminal_panel(frame, content_area),
+            Tab::Diagnostics => self.render_diagnostics_panel(frame, content_area),
+            Tab::Todos => self.render_todos_panel(frame, content_area),
+            Tab::Pane => self.render_terminal_panel(frame, content_area),
         }
     }
 
@@ -1555,14 +1879,17 @@ impl<B: Backend> App<B> {
 
     fn render_terminal(&self, frame: &mut ratatui::Frame, area: Rect) {
         if self.terminal.pty_id.is_none() {
-            let msg = "No active terminal — send a prompt to the agent to create one";
-            let msg_width = msg.len() as u16;
-            let x = area.x + (area.width.saturating_sub(msg_width)) / 2;
+            let msg =
+                "No active terminal. Run a shell command or wait for the agent to create one.";
             let y = area.y + area.height / 2;
-            Text::from(msg).style(self.theme.text_dim).render(
-                Rect::new(x, y, msg_width.min(area.width), 1),
-                frame.buffer_mut(),
-            );
+            Paragraph::new(msg)
+                .style(self.theme.text_dim)
+                .alignment(ratatui::layout::Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .render(
+                    Rect::new(area.x, y, area.width, 2.min(area.height)),
+                    frame.buffer_mut(),
+                );
             Text::from("Ctrl+X T: back")
                 .style(self.theme.pty_status_bar)
                 .render(
@@ -1981,15 +2308,14 @@ mod tests {
 
         // Verify session was created
         assert_eq!(app.backend().sessions.len(), 1, "session should be created");
-        // Verify prompt_events were consumed (prompt() was called)
-        assert!(
-            app.backend().prompt_events.is_empty(),
-            "prompt_events should be consumed by prompt()"
-        );
         assert_eq!(
-            app.backend().last_prompt_agent.as_deref(),
-            Some("plan"),
-            "agent name should be passed to prompt()"
+            app.pending_prompts(),
+            &[PendingPrompt {
+                session_id: "mock-session-id".into(),
+                text: "h".into(),
+                agent: "plan".into()
+            }],
+            "prompt should be queued with the selected agent"
         );
     }
 
@@ -2053,6 +2379,162 @@ mod tests {
         );
     }
 
+    #[test]
+    fn streaming_keeps_prompt_editable_and_status_on_bottom_line() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, char_key('h'));
+        run(&mut app, char_key('i'));
+        run(&mut app, enter_key());
+        assert!(app.is_streaming());
+        assert_eq!(app.prompt_text(), "");
+
+        run(&mut app, char_key('n'));
+        run(&mut app, char_key('e'));
+        run(&mut app, char_key('x'));
+        run(&mut app, char_key('t'));
+        assert_eq!(app.prompt_text(), "next");
+
+        run(&mut app, enter_key());
+        assert_eq!(
+            app.pending_prompts().len(),
+            1,
+            "the active prompt remains the only dispatched prompt"
+        );
+        assert_eq!(
+            app.queued_prompts().len(),
+            1,
+            "Enter should queue another prompt while streaming"
+        );
+        assert_eq!(app.prompt_text(), "");
+
+        let test_backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(screen.contains(">"), "screen: {screen}");
+        assert!(screen.contains("Agent is Responding"), "screen: {screen}");
+        assert!(screen.contains("mode: primary"), "screen: {screen}");
+        assert!(screen.contains("model: default"), "screen: {screen}");
+    }
+
+    #[test]
+    fn queued_messages_render_after_active_assistant_and_dispatch_in_order() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        for ch in "first".chars() {
+            run(&mut app, char_key(ch));
+        }
+        run(&mut app, enter_key());
+        assert_eq!(app.take_pending_prompts()[0].text, "first");
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
+                session_id: "mock-session-id".into(),
+                part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                    text: "assistant one".into(),
+                }),
+            }),
+        );
+
+        for ch in "second".chars() {
+            run(&mut app, char_key(ch));
+        }
+        run(&mut app, enter_key());
+        for ch in "third".chars() {
+            run(&mut app, char_key(ch));
+        }
+        run(&mut app, enter_key());
+
+        assert_eq!(
+            app.queued_prompts()
+                .iter()
+                .map(|prompt| prompt.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "third"]
+        );
+
+        let test_backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+        let first = screen.find("first").expect(&screen);
+        let assistant = screen.find("assistant one").expect(&screen);
+        let second = screen.find("second").expect(&screen);
+        let third = screen.find("third").expect(&screen);
+        assert!(first < assistant, "screen: {screen}");
+        assert!(assistant < second, "screen: {screen}");
+        assert!(second < third, "screen: {screen}");
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::Done),
+        );
+
+        let dispatched = app.take_pending_prompts();
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].text, "second");
+        assert_eq!(app.queued_prompts()[0].text, "third");
+    }
+
+    #[test]
+    fn response_indicator_survives_early_done_for_late_sse_parts() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, char_key('h'));
+        run(&mut app, char_key('i'));
+        run(&mut app, enter_key());
+        assert!(app.is_streaming());
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::Done),
+        );
+        assert!(app.is_streaming());
+
+        let test_backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(screen.contains("Agent is Responding"), "screen: {screen}");
+    }
+
+    #[test]
+    fn queued_prompt_waits_for_assistant_activity_before_dispatching() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        for ch in "first".chars() {
+            run(&mut app, char_key(ch));
+        }
+        run(&mut app, enter_key());
+        assert_eq!(app.take_pending_prompts()[0].text, "first");
+
+        for ch in "second".chars() {
+            run(&mut app, char_key(ch));
+        }
+        run(&mut app, enter_key());
+        assert_eq!(app.queued_prompts().len(), 1);
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::Done),
+        );
+
+        assert!(
+            app.take_pending_prompts().is_empty(),
+            "early Done without assistant activity must not dispatch queued prompt"
+        );
+        assert_eq!(app.queued_prompts()[0].text, "second");
+        assert!(app.is_streaming());
+    }
+
     /// Test that the real SSE event path (MessagePartUpdated + Done) works.
     /// The SSE background task emits MessagePartUpdated (not Part), which
     /// requires is_streaming to be true.
@@ -2094,6 +2576,121 @@ mod tests {
             app.partial_parts().len(),
             1,
             "content stays in partial_parts for rendering"
+        );
+    }
+
+    #[test]
+    fn duplicate_sse_part_events_do_not_duplicate_visible_assistant_text() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        for ch in "hello from regression test".chars() {
+            run(&mut app, char_key(ch));
+        }
+        run(&mut app, enter_key());
+
+        let session_id = "mock-session-id".to_string();
+        let user_echo = ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+            text: "hello from regression test".into(),
+        });
+        for _ in 0..2 {
+            run(
+                &mut app,
+                Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
+                    session_id: session_id.clone(),
+                    part: user_echo.clone(),
+                }),
+            );
+        }
+        assert!(
+            app.partial_parts().is_empty(),
+            "echoed user text should not become assistant partials"
+        );
+
+        let step_start = ocpncord_backend::Part::StepStart(ocpncord_backend::StepStartPart {
+            snapshot: None,
+            session_id: Some(session_id.clone()),
+        });
+        for _ in 0..2 {
+            run(
+                &mut app,
+                Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
+                    session_id: session_id.clone(),
+                    part: step_start.clone(),
+                }),
+            );
+        }
+
+        for delta in ["Hello", "! 👋", " How can I help you today?"] {
+            run(
+                &mut app,
+                Event::Backend(ocpncord_backend::BackendEvent::MessagePartDelta {
+                    session_id: session_id.clone(),
+                    message_id: "msg1".into(),
+                    part_id: "prt1".into(),
+                    field: "text".into(),
+                    delta: delta.into(),
+                }),
+            );
+        }
+
+        let final_text = ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+            text: "Hello! 👋 How can I help you today?".into(),
+        });
+        for _ in 0..2 {
+            run(
+                &mut app,
+                Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
+                    session_id: session_id.clone(),
+                    part: final_text.clone(),
+                }),
+            );
+        }
+
+        let tool = ocpncord_backend::Part::Tool(ocpncord_backend::ToolPart {
+            tool: "bash".into(),
+            state: ocpncord_backend::ToolState::Pending {
+                input: Default::default(),
+                raw: String::new(),
+            },
+        });
+        for _ in 0..2 {
+            run(
+                &mut app,
+                Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
+                    session_id: session_id.clone(),
+                    part: tool.clone(),
+                }),
+            );
+        }
+
+        let assistant_text_parts: Vec<&str> = app
+            .partial_parts()
+            .iter()
+            .filter_map(|part| match part {
+                ocpncord_backend::Part::Text(text) if !text.text.is_empty() => {
+                    Some(text.text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            assistant_text_parts,
+            vec!["Hello! 👋 How can I help you today?"]
+        );
+        assert_eq!(
+            app.partial_parts()
+                .iter()
+                .filter(|part| matches!(part, ocpncord_backend::Part::Tool(_)))
+                .count(),
+            1,
+            "duplicate tool updates should be collapsed"
+        );
+        assert_eq!(
+            app.messages().len(),
+            1,
+            "only the user message is committed"
         );
     }
 
@@ -2162,6 +2759,67 @@ mod tests {
             1,
             "content stays in partial_parts for rendering"
         );
+    }
+
+    #[test]
+    fn reasoning_delta_updates_reasoning_part_in_place() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, char_key('h'));
+        run(&mut app, char_key('i'));
+        run(&mut app, enter_key());
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
+                session_id: "mock-session-id".into(),
+                part: ocpncord_backend::Part::Reasoning(ocpncord_backend::ReasoningPart {
+                    text: String::new(),
+                }),
+            }),
+        );
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::MessagePartDelta {
+                session_id: "mock-session-id".into(),
+                message_id: "msg1".into(),
+                part_id: "prt_reasoning".into(),
+                field: "text".into(),
+                delta: "thinking".into(),
+            }),
+        );
+
+        assert_eq!(app.partial_parts().len(), 1);
+        match &app.partial_parts()[0] {
+            ocpncord_backend::Part::Reasoning(reasoning) => {
+                assert_eq!(reasoning.text, "thinking");
+            }
+            other => panic!("expected reasoning part, got {other:?}"),
+        }
+
+        let final_reasoning = ocpncord_backend::Part::Reasoning(ocpncord_backend::ReasoningPart {
+            text: "thinking done".into(),
+        });
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
+                session_id: "mock-session-id".into(),
+                part: final_reasoning,
+            }),
+        );
+
+        assert_eq!(
+            app.partial_parts().len(),
+            1,
+            "final reasoning update should replace the streaming placeholder"
+        );
+        match &app.partial_parts()[0] {
+            ocpncord_backend::Part::Reasoning(reasoning) => {
+                assert_eq!(reasoning.text, "thinking done");
+            }
+            other => panic!("expected reasoning part, got {other:?}"),
+        }
     }
 
     /// Test that MessagePartUpdated is IGNORED when NOT streaming.
@@ -2532,6 +3190,52 @@ mod tests {
     }
 
     #[test]
+    fn slash_todos_selects_todos_panel_and_clears_prompt() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        for ch in "/todos".chars() {
+            run(&mut app, char_key(ch));
+        }
+        run(&mut app, enter_key());
+
+        assert!(app.side_panel_visible, "/todos should open the side panel");
+        assert_eq!(app.side_panel_tab, Tab::Todos);
+        assert_eq!(app.prompt_text(), "", "/todos should clear the prompt");
+    }
+
+    #[test]
+    fn ctrl_x_o_toggles_todos_panel() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('o'));
+        assert!(app.side_panel_visible);
+        assert_eq!(app.side_panel_tab, Tab::Todos);
+
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('o'));
+        assert!(!app.side_panel_visible);
+        assert_eq!(app.side_panel_tab, Tab::Todos);
+    }
+
+    #[test]
+    fn ctrl_x_d_selects_diagnostics_when_todos_panel_is_open() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('o'));
+        assert_eq!(app.side_panel_tab, Tab::Todos);
+
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('d'));
+        assert!(app.side_panel_visible);
+        assert_eq!(app.side_panel_tab, Tab::Diagnostics);
+    }
+
+    #[test]
     fn ctrl_x_m_opens_model_picker_modal() {
         let backend = MockBackend::default();
         let mut app = App::new(backend);
@@ -2672,6 +3376,11 @@ mod tests {
         assert!(
             !has_logo_block_inside_modal,
             "modal area should not contain logo block characters"
+        );
+        let has_logo_block_anywhere = buf.content().iter().any(|c| c.symbol() == "█");
+        assert!(
+            !has_logo_block_anywhere,
+            "modal backdrop should hide the underlying screen"
         );
 
         // Modal text should still render correctly
@@ -2843,7 +3552,7 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
         let screen = rendered_screen(&terminal);
 
-        assert!(screen.contains("line-4"), "screen: {screen}");
+        assert!(screen.contains("line-5"), "screen: {screen}");
         assert!(screen.contains("line-8"), "screen: {screen}");
         assert!(!screen.contains("line-11"), "screen: {screen}");
     }
@@ -2903,14 +3612,14 @@ mod tests {
         assert!(screen.contains("[ ] active task"), "screen: {screen}");
 
         let buf = terminal.backend().buffer();
-        let panel_x = 56;
+        let panel_x = 57;
         assert_eq!(
-            buf[(panel_x, 1)].style().fg,
+            buf[(panel_x, 2)].style().fg,
             app.theme.text_dim.fg,
             "completed todo should use dim style"
         );
         assert_eq!(
-            buf[(panel_x, 2)].style().fg,
+            buf[(panel_x, 3)].style().fg,
             app.theme.text.fg,
             "active todo should use normal text style"
         );
@@ -2937,7 +3646,7 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
         let screen = rendered_screen(&terminal);
 
-        assert!(screen.contains("line-3"), "screen: {screen}");
+        assert!(screen.contains("line-5"), "screen: {screen}");
         assert!(screen.contains("line-7"), "screen: {screen}");
         assert!(!screen.contains("line-2"), "screen: {screen}");
         assert!(!screen.contains("line-9"), "screen: {screen}");
@@ -3010,15 +3719,15 @@ mod tests {
         let test_backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(test_backend).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
-        let buf = terminal.backend().buffer();
-
-        let has_help = buf.content().iter().any(|c| c.symbol() == "a")
-            && buf.content().iter().any(|c| c.symbol() == "g")
-            && buf.content().iter().any(|c| c.symbol() == "e")
-            && buf.content().iter().any(|c| c.symbol() == "n");
+        let screen = rendered_screen(&terminal);
+        let has_help = screen.contains("No active terminal");
         assert!(
             has_help,
             "terminal should show a helpful message when no PTY"
+        );
+        assert!(
+            !screen.contains("send a prompt"),
+            "terminal empty state should not imply every prompt creates a PTY: {screen}"
         );
     }
 

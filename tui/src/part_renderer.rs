@@ -18,7 +18,7 @@ pub fn render_part<'a>(
         ocpncord_backend::Part::Text(tp) => styled_lines(tp.text.as_str(), theme.part_text),
         ocpncord_backend::Part::Reasoning(rp) => {
             if show_details {
-                styled_lines(rp.text.as_str(), theme.part_reasoning)
+                reasoning_lines(rp.text.as_str(), theme.part_reasoning)
             } else {
                 vec![Line::from("reasoning hidden").style(theme.text_dim)]
             }
@@ -101,6 +101,23 @@ fn styled_lines_owned(text: alloc::string::String, style: Style) -> Vec<Line<'st
     lines
 }
 
+fn reasoning_lines(text: &str, style: Style) -> Vec<Line<'_>> {
+    if text.is_empty() {
+        return vec![Line::from("... reasoning").style(style)];
+    }
+
+    let mut lines = Vec::new();
+    for (index, line) in text.split('\n').enumerate() {
+        let prefix = if index == 0 {
+            "... reasoning: "
+        } else {
+            "    "
+        };
+        lines.push(Line::from(alloc::format!("{prefix}{line}")).style(style));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,7 +154,18 @@ mod tests {
         });
         let lines = render_part(&part, &theme, true);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].to_string(), "thinking...");
+        assert_eq!(lines[0].to_string(), "... reasoning: thinking...");
+    }
+
+    #[test]
+    fn empty_reasoning_part_has_stable_placeholder_line() {
+        let theme = Theme::default();
+        let part = Part::Reasoning(ReasoningPart {
+            text: String::new(),
+        });
+        let lines = render_part(&part, &theme, true);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].to_string(), "... reasoning");
     }
 
     #[test]

@@ -12,26 +12,28 @@ use crate::part_renderer::render_part;
 use crate::screen::{Action, Screen};
 use crate::theme::Theme;
 
-const PROMPT_BAR_LINES: u16 = 1;
+pub struct ChatTranscript<'a> {
+    pub messages: &'a [LoadedMessage],
+    pub active_parts: &'a [ocpncord_backend::Part],
+    pub queued_messages: &'a [LoadedMessage],
+    pub is_streaming: bool,
+}
 
 /// Renders the Chat message area using the provided data.
 pub fn render_chat(
     frame: &mut ratatui::Frame,
     theme: &Theme,
     area: Rect,
-    messages: &[LoadedMessage],
-    partial_parts: &[ocpncord_backend::Part],
-    is_streaming: bool,
+    transcript: ChatTranscript<'_>,
     scroll: u16,
 ) {
-    let msg_area = Rect::new(
-        area.x,
-        area.y,
-        area.width,
-        area.height.saturating_sub(PROMPT_BAR_LINES),
-    );
+    let msg_area = area;
 
-    if messages.is_empty() && !is_streaming {
+    if transcript.messages.is_empty()
+        && transcript.active_parts.is_empty()
+        && transcript.queued_messages.is_empty()
+        && !transcript.is_streaming
+    {
         Text::from("No messages yet")
             .style(theme.text_dim)
             .alignment(Alignment::Center)
@@ -40,14 +42,16 @@ pub fn render_chat(
     }
 
     let mut lines: Vec<Line<'_>> = Vec::new();
-    for msg in messages {
-        for part in &msg.parts {
-            lines.extend(render_part(part, theme, true));
-        }
+    for msg in transcript.messages {
+        render_message(&mut lines, msg, theme);
     }
 
-    for part in partial_parts {
+    for part in transcript.active_parts {
         lines.extend(render_part(part, theme, true));
+    }
+
+    for msg in transcript.queued_messages {
+        render_queued_message(&mut lines, msg, theme);
     }
 
     let full_width_height = wrapped_height(&lines, msg_area.width);
@@ -75,6 +79,44 @@ pub fn render_chat(
             .thumb_style(theme.scrollbar)
             .track_style(theme.text_dim)
             .render(msg_area, frame.buffer_mut(), &mut state);
+    }
+}
+
+fn render_message<'a>(lines: &mut Vec<Line<'a>>, msg: &'a LoadedMessage, theme: &'a Theme) {
+    match msg.role {
+        ocpncord_backend::MessageRole::User => render_user_message(lines, msg, theme, false),
+        ocpncord_backend::MessageRole::Assistant => {
+            for part in &msg.parts {
+                lines.extend(render_part(part, theme, true));
+            }
+        }
+    }
+}
+
+fn render_queued_message<'a>(lines: &mut Vec<Line<'a>>, msg: &'a LoadedMessage, theme: &'a Theme) {
+    render_user_message(lines, msg, theme, true);
+}
+
+fn render_user_message<'a>(
+    lines: &mut Vec<Line<'a>>,
+    msg: &'a LoadedMessage,
+    theme: &'a Theme,
+    queued: bool,
+) {
+    for part in &msg.parts {
+        match part {
+            ocpncord_backend::Part::Text(text) => {
+                let suffix = if queued { " [queued]" } else { "" };
+                for (line_index, line) in text.text.split('\n').enumerate() {
+                    let prefix = if line_index == 0 { "> " } else { "  " };
+                    lines.push(
+                        Line::from(alloc::format!("{prefix}{line}{suffix}"))
+                            .style(theme.message_user),
+                    );
+                }
+            }
+            _ => lines.extend(render_part(part, theme, true)),
+        }
     }
 }
 
@@ -138,7 +180,18 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_chat(frame, &theme, frame.area(), &[], &[], false, 0);
+                render_chat(
+                    frame,
+                    &theme,
+                    frame.area(),
+                    ChatTranscript {
+                        messages: &[],
+                        active_parts: &[],
+                        queued_messages: &[],
+                        is_streaming: false,
+                    },
+                    0,
+                );
             })
             .unwrap();
 
@@ -161,7 +214,18 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_chat(frame, &theme, frame.area(), &msgs, &[], false, 0);
+                render_chat(
+                    frame,
+                    &theme,
+                    frame.area(),
+                    ChatTranscript {
+                        messages: &msgs,
+                        active_parts: &[],
+                        queued_messages: &[],
+                        is_streaming: false,
+                    },
+                    0,
+                );
             })
             .unwrap();
 
@@ -181,7 +245,18 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_chat(frame, &theme, frame.area(), &[], &partial, true, 0);
+                render_chat(
+                    frame,
+                    &theme,
+                    frame.area(),
+                    ChatTranscript {
+                        messages: &[],
+                        active_parts: &partial,
+                        queued_messages: &[],
+                        is_streaming: true,
+                    },
+                    0,
+                );
             })
             .unwrap();
 
