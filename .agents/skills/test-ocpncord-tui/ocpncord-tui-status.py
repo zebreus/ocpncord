@@ -33,6 +33,20 @@ def is_pid_alive(pidfile):
         return False
 
 
+def is_pid_cmd(pidfile, pattern):
+    if not os.path.isfile(pidfile):
+        return False
+    try:
+        with open(pidfile) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().replace(b"\0", b" ").decode(errors="replace")
+        return pattern in cmdline
+    except (ValueError, OSError, ProcessLookupError):
+        return False
+
+
 def is_opencode_reachable():
     try:
         with socket.create_connection((socket.gethostbyname("localhost"), 7774), timeout=2):
@@ -47,8 +61,8 @@ def main():
     )
     parser.parse_args()
 
-    tui_running = is_tmux_alive() and is_pid_alive(PID_FILE_TUI)
-    opencode_running = is_pid_alive(PID_FILE_OPENCODE) and is_opencode_reachable()
+    tui_running = is_tmux_alive() and is_pid_cmd(PID_FILE_TUI, "ocpncord-native")
+    opencode_running = is_pid_cmd(PID_FILE_OPENCODE, "opencode serve --port 7774") and is_opencode_reachable()
 
     print("Running" if tui_running and opencode_running else "Not Running")
     return 0
