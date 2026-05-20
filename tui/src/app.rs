@@ -18,7 +18,8 @@ use crate::screen::{Action, ModalId, ScreenId, Tab};
 use crate::start_page::StartPage;
 use crate::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::{Line, Text};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Cell as TableCell, Clear, List, ListItem, ListState, Paragraph, Row,
     Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Table, Tabs, Widget, Wrap,
@@ -148,14 +149,6 @@ fn tool_states_equivalent(
         ) => left_error == right_error,
         _ => false,
     }
-}
-
-fn clamp_tail(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let len = text.chars().count();
-    text.chars().skip(len.saturating_sub(width)).collect()
 }
 
 fn user_loaded_message(text: &str) -> LoadedMessage {
@@ -1462,17 +1455,31 @@ impl<B: Backend> App<B> {
 
     fn render_status_line(&self, frame: &mut ratatui::Frame, area: Rect) {
         let (agent, mode, model) = self.active_agent_status();
-        let mut status = alloc::format!("[{agent}]  mode: {mode}  model: {model}");
+        let mut spans = vec![
+            Span::styled("[", self.theme.text_dim),
+            Span::styled(agent, self.theme.text_accent),
+            Span::styled("]  mode: ", self.theme.text_dim),
+            Span::styled(mode, self.mode_status_style(mode)),
+            Span::styled("  model: ", self.theme.text_dim),
+            Span::styled(model, self.theme.text_dim),
+        ];
         if self.should_show_response_indicator() {
             let spinner =
                 ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][(self.tick as usize / 3) % 10];
-            status.push_str("  ");
-            status.push_str(spinner);
-            status.push_str(" Agent is Responding...");
+            spans.push(Span::styled("  ", self.theme.text_dim));
+            spans.push(Span::styled(spinner, self.theme.text_accent));
+            spans.push(Span::styled(" Agent is Responding...", self.theme.text_dim));
         }
-        Text::from(clamp_tail(status.as_str(), area.width as usize))
-            .style(self.theme.agent_indicator)
-            .render(area, frame.buffer_mut());
+        Line::from(spans).render(area, frame.buffer_mut());
+    }
+
+    fn mode_status_style(&self, mode: &str) -> Style {
+        match mode {
+            "primary" => self.theme.part_tool_done,
+            "subagent" => self.theme.part_subtask,
+            "all" => self.theme.text_accent,
+            _ => self.theme.text_dim,
+        }
     }
 
     fn merge_stream_part(&mut self, part: ocpncord_backend::Part) -> Option<usize> {
@@ -1623,7 +1630,8 @@ impl<B: Backend> App<B> {
                     self.active_agent_name(),
                     self.tick,
                 );
-                self.render_status_line(frame, status_row);
+                let status_area = Rect::new(prompt_area.x, status_row.y, prompt_area.width, 1);
+                self.render_status_line(frame, status_area);
             }
             ScreenId::Chat => {
                 let rows = Layout::new(
@@ -2418,6 +2426,92 @@ mod tests {
         assert!(screen.contains("Agent is Responding"), "screen: {screen}");
         assert!(screen.contains("mode: primary"), "screen: {screen}");
         assert!(screen.contains("model: default"), "screen: {screen}");
+    }
+
+    #[test]
+    fn start_page_status_line_matches_prompt_width_without_prompt_background() {
+        let backend = MockBackend::default();
+        let app = App::new(backend);
+
+        let test_backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let status_y = 17;
+        let prompt_x = 15;
+        let prompt_width = 50;
+        let row: String = (0..80)
+            .map(|x| buf.cell((x, status_y)).map_or(" ", |c| c.symbol()))
+            .collect();
+        assert!(row.contains("mode: primary"), "row: {row}");
+
+        for x in 0..80 {
+            let cell = buf.cell((x, status_y)).unwrap();
+            if x < prompt_x || x >= prompt_x + prompt_width {
+                assert_eq!(
+                    cell.symbol(),
+                    " ",
+                    "status leaked outside prompt width at x={x}"
+                );
+            }
+            if cell.symbol() != " " {
+                assert_ne!(
+                    cell.style().bg,
+                    app.theme.input.bg,
+                    "status line should not use prompt input background at x={x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn status_line_uses_distinct_mode_colours() {
+        fn mode_style(
+            mode: ocpncord_backend::AgentMode,
+            label: &str,
+        ) -> Option<ratatui::style::Color> {
+            let backend = MockBackend::default();
+            let mut app = App::new(backend);
+            app.agents = vec![ocpncord_backend::Agent {
+                name: "agent".into(),
+                description: None,
+                mode,
+                native: None,
+                hidden: None,
+                model: None,
+                color: None,
+                variant: None,
+                prompt: None,
+                steps: None,
+            }];
+
+            let test_backend = TestBackend::new(80, 1);
+            let mut terminal = Terminal::new(test_backend).unwrap();
+            terminal
+                .draw(|frame| app.render_status_line(frame, Rect::new(0, 0, 80, 1)))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let row: String = (0..80)
+                .map(|x| buf.cell((x, 0)).map_or(" ", |c| c.symbol()))
+                .collect();
+            let start = row.find(label).expect("mode label should render") as u16;
+            let cell = buf.cell((start, 0)).unwrap();
+            assert_ne!(
+                cell.style().bg,
+                app.theme.input.bg,
+                "mode label should not use prompt input background"
+            );
+            cell.style().fg
+        }
+
+        let primary = mode_style(ocpncord_backend::AgentMode::Primary, "primary");
+        let subagent = mode_style(ocpncord_backend::AgentMode::Subagent, "subagent");
+        let all = mode_style(ocpncord_backend::AgentMode::All, "all");
+
+        assert_ne!(primary, subagent);
+        assert_ne!(primary, all);
+        assert_ne!(subagent, all);
     }
 
     #[test]
