@@ -1,17 +1,27 @@
 [package]
 name = "ocpncord-tui"
+description = "Platform-agnostic no_std Ratatui UI for ocpncord."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["ocpncord", "opencode", "ratatui", "tui", "no-std"]
+categories = ["command-line-interface", "embedded", "no-std"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-log = { version = "0.4", default-features = false }
+log.workspace = true
 ocpncord-types.workspace = true
-ocpncord-backend = { path = "../backend", features = ["mock"] }
+ocpncord-backend = { workspace = true, features = ["mock"] }
 ratatui-core.workspace = true
 ratatui.workspace = true
 futures-core.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
-futures = "0.3"
+futures = { workspace = true, features = ["executor", "std"] }

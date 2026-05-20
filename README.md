@@ -10,9 +10,9 @@ Connects to a running `opencode serve` instance over HTTP. Targets desktop (toki
 |---|---|---|---|
 | [`ocpncord-types`](./types/) | Pure data types, serde, JSON contract types | yes | yes |
 | [`ocpncord-backend`](./backend/) | `Backend` trait + streaming types + mock backend | yes | yes |
-| [`ocpncord-backend-opencode`](./backend-opencode/) | HTTP implementation via reqwless over any TCP transport | yes (opt-in `std`) | — |
-| [`ocpncord-tui`](./tui/) | Ratatui widgets, platform-agnostic key events | yes | — |
-| [`ocpncord-native`](./native/) | Binary: tokio + crossterm | no | — |
+| [`ocpncord-backend-opencode`](./backend-opencode/) | HTTP implementation via reqwless over any TCP transport | yes | yes |
+| [`ocpncord-tui`](./tui/) | Ratatui widgets, platform-agnostic key events | yes | yes |
+| [`ocpncord-native`](./native/) | Binary: tokio + crossterm | no | yes |
 
 ## Quick start
 
@@ -52,13 +52,13 @@ The `Backend` trait in `ocpncord-backend` abstracts the opencode server protocol
 
 ```toml
 # pure types (serde, no_std)
-ocpncord-types = { git = "https://github.com/zebreus/ocpncord" }
+ocpncord-types = "0.1"
 
 # Backend trait + streaming types (futures-core, no_std)
-ocpncord-backend = { git = "..." }
+ocpncord-backend = "0.1"
 
-# HTTP backend (reqwless, no_std without "std" feature)
-ocpncord-backend-opencode = { git = "...", default-features = false }
+# HTTP backend (reqwless, no_std)
+ocpncord-backend-opencode = "0.1"
 ```
 
 ## Status
@@ -67,4 +67,4 @@ The Backend trait and HTTP implementation are complete (14/14 integration tests 
 
 ## License
 
-MIT
+AGPL-3.0-only
