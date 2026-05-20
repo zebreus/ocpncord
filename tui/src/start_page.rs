@@ -6,13 +6,11 @@ use crate::event::Event;
 use crate::screen::{Action, Screen};
 use crate::theme::Theme;
 
-const LOGO: &str = r#"
-        ██████   ██████ ██████  ███    ██ ██████  ██████  ██████  ██████
-       ██    ██ ██      ██   ██ ████   ██ ██      ██    ██ ██   ██ ██   ██
-       ██    ██ ██      ██████  ██ ██  ██ ██      ██    ██ ██████  ██   ██
-       ██    ██ ██      ██      ██  ██ ██ ██      ██    ██ ██   ██ ██   ██
-        ██████   ██████ ██      ██   ████  ██████  ██████  ██   ██ ██████
-"#;
+const LOGO: &str = r#"██████   ██████ ██████  ███    ██ ██████  ██████  ██████  ██████
+██    ██ ██      ██   ██ ████   ██ ██      ██    ██ ██   ██ ██   ██
+██    ██ ██      ██████  ██ ██  ██ ██      ██    ██ ██████  ██   ██
+██    ██ ██      ██      ██  ██ ██ ██      ██    ██ ██   ██ ██   ██
+██████   ██████ ██      ██   ████  ██████  ██████  ██   ██ ██████"#;
 
 const TIP: &str = "Tip: Ctrl+X H for help, Ctrl+X Q to quit";
 
@@ -75,6 +73,39 @@ mod tests {
             has_tip,
             "tip line (starting with 'T') should appear on screen"
         );
+    }
+
+    #[test]
+    fn logo_is_centered_horizontally() {
+        let start_page = StartPage;
+        let theme = Theme::default();
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                start_page.render(frame, &theme);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        for y in 0..24 {
+            let occupied: Vec<u16> = (0..100)
+                .filter(|&x| buf.cell((x, y)).is_some_and(|c| c.symbol() == "█"))
+                .collect();
+            if occupied.is_empty() {
+                continue;
+            }
+
+            let left = occupied[0];
+            let right = *occupied.last().unwrap();
+            let left_margin = left;
+            let right_margin = 99 - right;
+            assert!(
+                left_margin.abs_diff(right_margin) <= 1,
+                "logo row {y} should be horizontally centered: left={left_margin}, right={right_margin}"
+            );
+        }
     }
 
     #[test]
