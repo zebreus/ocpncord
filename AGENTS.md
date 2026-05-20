@@ -8,8 +8,7 @@ All `no_std` crates use `#![cfg_attr(not(test), no_std)]` + `extern crate alloc;
 
 | Crate | Dir | `no_std` | Role |
 |---|---|---|---|
-| `ocpncord-types` | `types/` | yes | Pure data types, serde only dep, publishable |
-| `ocpncord-backend` | `backend/` | yes (`not(test)`) | `Backend` trait + event/error/mock; re-exports `ocpncord_types` via `pub use` |
+| `ocpncord-backend` | `backend/` | yes (`not(test)`) | `Backend` trait + event/error/mock + JSON contract types |
 | `ocpncord-backend-opencode` | `backend-opencode/` | yes | HTTP impl via reqwless + embedded-nal-async, generic over TCP transport |
 | `ocpncord-tui` | `tui/` | yes (`not(test)`) | Ratatui widgets, platform-agnostic key events |
 | `ocpncord-native` | `native/` | no | **Single binary** via `[[bin]]` (no `lib.rs`) — tokio + Crossterm |

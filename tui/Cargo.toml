@@ -16,7 +16,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 log.workspace = true
-ocpncord-types.workspace = true
 ocpncord-backend = { workspace = true, features = ["mock"] }
 ratatui-core.workspace = true
 ratatui.workspace = true

@@ -723,7 +723,7 @@ name = "ocpncord-backend"
 version = "0.1.0"
 dependencies = [
  "futures-core",
- "ocpncord-types",
+ "serde",
 ]
 
 [[package]]
@@ -735,7 +735,6 @@ dependencies = [
  "futures",
  "futures-core",
  "ocpncord-backend",
- "ocpncord-types",
  "reqwless",
  "serde",
  "serde_json",
@@ -755,7 +754,6 @@ dependencies = [
  "ocpncord-backend",
  "ocpncord-backend-opencode",
  "ocpncord-tui",
- "ocpncord-types",
  "ratatui-core",
  "tokio",
 ]
@@ -768,16 +766,8 @@ dependencies = [
  "futures-core",
  "log",
  "ocpncord-backend",
- "ocpncord-types",
  "ratatui",
  "ratatui-core",
-]
-
-[[package]]
-name = "ocpncord-types"
-version = "0.1.0"
-dependencies = [
- "serde",
 ]
 
 [[package]]

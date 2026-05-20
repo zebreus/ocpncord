@@ -8,8 +8,7 @@ Connects to a running `opencode serve` instance over HTTP. Targets desktop (toki
 
 | Crate | Role | `no_std` | Publishable |
 |---|---|---|---|
-| [`ocpncord-types`](./types/) | Pure data types, serde, JSON contract types | yes | yes |
-| [`ocpncord-backend`](./backend/) | `Backend` trait + streaming types + mock backend | yes | yes |
+| [`ocpncord-backend`](./backend/) | `Backend` trait + streaming types + JSON contract types + mock backend | yes | yes |
 | [`ocpncord-backend-opencode`](./backend-opencode/) | HTTP implementation via reqwless over any TCP transport | yes | yes |
 | [`ocpncord-tui`](./tui/) | Ratatui widgets, platform-agnostic key events | yes | yes |
 | [`ocpncord-native`](./native/) | Binary: tokio + crossterm | no | yes |
@@ -51,10 +50,7 @@ The `Backend` trait in `ocpncord-backend` abstracts the opencode server protocol
 ## Using the crates
 
 ```toml
-# pure types (serde, no_std)
-ocpncord-types = "0.1"
-
-# Backend trait + streaming types (futures-core, no_std)
+# Backend trait, streaming types, and JSON contract types (no_std)
 ocpncord-backend = "0.1"
 
 # HTTP backend (reqwless, no_std)

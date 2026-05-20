@@ -11,8 +11,8 @@ keywords = ["ocpncord", "opencode", "backend", "async", "no-std"]
 categories = ["api-bindings", "asynchronous", "no-std"]
 
 [dependencies]
-ocpncord-types.workspace = true
 futures-core.workspace = true
+serde.workspace = true
 
 [features]
 mock = []

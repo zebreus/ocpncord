@@ -15,7 +15,6 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-ocpncord-types.workspace = true
 ocpncord-backend.workspace = true
 futures-core.workspace = true
 serde.workspace = true

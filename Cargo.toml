@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "types",
     "backend",
     "backend-opencode",
     "tui",
@@ -27,7 +26,6 @@ log = { version = "0.4", default-features = false }
 ocpncord-backend = { version = "0.1.0", path = "backend" }
 ocpncord-backend-opencode = { version = "0.1.0", path = "backend-opencode" }
 ocpncord-tui = { version = "0.1.0", path = "tui" }
-ocpncord-types = { version = "0.1.0", path = "types" }
 ratatui = { version = "0.30", default-features = false }
 ratatui-core = { version = "0.1", default-features = false }
 reqwless = { version = "0.14", default-features = false }

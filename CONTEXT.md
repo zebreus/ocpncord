@@ -73,13 +73,12 @@ The primary interaction screen. Shows a scrollable list of **Messages** (user + 
 - **Prompt** and **Command** both yield a **PromptStream**
 - The **EventStream** is a separate out-of-band channel for server-side events
 - The **Backend** trait is implemented by `ocpncord-backend-opencode` for the real **Agent**
-- The `types` crate holds pure data types and is publishable independently
+- The `backend` crate owns the Backend trait and the shared JSON contract types
 
 ## Workspace layout
 
 ```
-types/          — pure data types, serde, no_std+alloc, publishable
-backend/        — Backend trait, data types, streaming types, no_std+alloc
+backend/        — Backend trait, JSON contract types, streaming types, no_std+alloc
 ocpncord-backend-opencode/ — HTTP implementation of Backend using reqwless
 tui/            — Ratatui widgets, no_std via mousefood, std via Crossterm
 native/         — Binary: tokio + Crossterm, the only binary crate

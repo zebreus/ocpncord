@@ -8,7 +8,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 use futures_core::Stream;
-pub use ocpncord_types::*;
+
+mod types;
+pub use types::*;
 
 #[cfg(feature = "mock")]
 pub mod mock;

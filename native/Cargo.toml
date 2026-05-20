@@ -15,7 +15,6 @@ name = "ocpncord-native"
 path = "src/main.rs"
 
 [dependencies]
-ocpncord-types.workspace = true
 ocpncord-backend.workspace = true
 ocpncord-backend-opencode.workspace = true
 ocpncord-tui.workspace = true
