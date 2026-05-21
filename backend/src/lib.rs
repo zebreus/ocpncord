@@ -92,7 +92,7 @@ pub enum BackendEvent {
     QuestionReplied {
         session_id: SessionId,
         request_id: String,
-        answers: Vec<String>,
+        answers: Vec<Vec<String>>,
     },
     CommandExecuted {
         name: String,
@@ -343,6 +343,12 @@ pub trait Backend {
         text: &str,
         agent: Option<&str>,
     ) -> Result<Self::PromptStream>;
+
+    async fn reply_permission(&mut self, reply: &PermissionReply) -> Result<()>;
+
+    async fn reply_question(&mut self, reply: &QuestionReply) -> Result<()>;
+
+    async fn reject_question(&mut self, request_id: &str) -> Result<()>;
 
     async fn find_text(&mut self, pattern: &str) -> Result<Vec<TextMatch>>;
 

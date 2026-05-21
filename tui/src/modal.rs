@@ -830,6 +830,52 @@ mod tests {
         }
     }
 
+    fn key(scancode: Scancode) -> Event {
+        Event::Key(crate::event::KeyEvent {
+            scancode,
+            modifiers: Default::default(),
+        })
+    }
+
+    fn permission_request(id: &str) -> PermissionRequest {
+        PermissionRequest {
+            id: id.into(),
+            session_id: "session-1".into(),
+            permission: "bash".into(),
+            patterns: vec!["/tmp/**".into()],
+            metadata: BTreeMap::new(),
+            always: Vec::new(),
+            tool: Some(PermissionToolInfo {
+                message_id: "m1".into(),
+                call_id: "c1".into(),
+            }),
+        }
+    }
+
+    fn single_question_request(id: &str) -> QuestionRequest {
+        QuestionRequest {
+            id: id.into(),
+            session_id: "session-1".into(),
+            questions: vec![QuestionInfo {
+                question: "Proceed?".into(),
+                header: "Confirm".into(),
+                options: vec![
+                    QuestionOption {
+                        label: "A".into(),
+                        description: "first".into(),
+                    },
+                    QuestionOption {
+                        label: "B".into(),
+                        description: "second".into(),
+                    },
+                ],
+                multiple: false,
+                custom: false,
+            }],
+            tool: None,
+        }
+    }
+
     #[test]
     fn session_list_starts_in_loading_state() {
         let modal = SessionListModal::new();
@@ -1441,6 +1487,197 @@ mod tests {
         assert!(screen.contains("Decision"));
         assert!(screen.contains("A -"));
     }
+
+    #[test]
+    fn permission_modal_escape_returns_reject_reply() {
+        let mut modal = PermissionModal::new(permission_request("permission-1"));
+
+        let action = modal.handle_event(key(Scancode::Escape));
+
+        assert!(matches!(
+            action,
+            Action::ReplyPermission(session_id, request_id, crate::screen::PermissionReplyAction::Reject)
+                if session_id == "session-1" && request_id == "permission-1"
+        ));
+    }
+
+    #[test]
+    fn question_modal_single_select_returns_nested_answer() {
+        let mut modal = QuestionModal::new(single_question_request("question-1"));
+
+        let action = modal.handle_event(key(Scancode::Enter));
+
+        assert!(matches!(
+            action,
+            Action::ReplyQuestion(session_id, request_id, answers)
+                if session_id == "session-1"
+                    && request_id == "question-1"
+                    && answers == vec![vec!["A".to_string()]]
+        ));
+    }
+
+    #[test]
+    fn question_modal_multi_select_collects_toggled_answers() {
+        let request = QuestionRequest {
+            id: "question-1".into(),
+            session_id: "session-1".into(),
+            questions: vec![QuestionInfo {
+                question: "Choose several".into(),
+                header: "Multi".into(),
+                options: vec![
+                    QuestionOption {
+                        label: "A".into(),
+                        description: "first".into(),
+                    },
+                    QuestionOption {
+                        label: "B".into(),
+                        description: "second".into(),
+                    },
+                ],
+                multiple: true,
+                custom: false,
+            }],
+            tool: None,
+        };
+        let mut modal = QuestionModal::new(request);
+
+        assert!(matches!(
+            modal.handle_event(key(Scancode::Char(' '))),
+            Action::None
+        ));
+        assert!(matches!(
+            modal.handle_event(key(Scancode::Down)),
+            Action::None
+        ));
+        assert!(matches!(
+            modal.handle_event(key(Scancode::Char(' '))),
+            Action::None
+        ));
+
+        let action = modal.handle_event(key(Scancode::Enter));
+
+        assert!(matches!(
+            action,
+            Action::ReplyQuestion(_, _, answers) if answers == vec![vec!["A".to_string(), "B".to_string()]]
+        ));
+    }
+
+    #[test]
+    fn question_modal_custom_input_returns_custom_answer() {
+        let request = QuestionRequest {
+            id: "question-1".into(),
+            session_id: "session-1".into(),
+            questions: vec![QuestionInfo {
+                question: "Type your answer".into(),
+                header: "Custom".into(),
+                options: Vec::new(),
+                multiple: false,
+                custom: true,
+            }],
+            tool: None,
+        };
+        let mut modal = QuestionModal::new(request);
+
+        assert!(matches!(
+            modal.handle_event(key(Scancode::Char('o'))),
+            Action::None
+        ));
+        assert!(matches!(
+            modal.handle_event(key(Scancode::Char('k'))),
+            Action::None
+        ));
+
+        let action = modal.handle_event(key(Scancode::Enter));
+
+        assert!(matches!(
+            action,
+            Action::ReplyQuestion(_, _, answers) if answers == vec![vec!["ok".to_string()]]
+        ));
+    }
+
+    #[test]
+    fn question_modal_supports_multiple_questions_and_back_navigation() {
+        let request = QuestionRequest {
+            id: "question-1".into(),
+            session_id: "session-1".into(),
+            questions: vec![
+                QuestionInfo {
+                    question: "First".into(),
+                    header: "One".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "A".into(),
+                            description: "first".into(),
+                        },
+                        QuestionOption {
+                            label: "B".into(),
+                            description: "second".into(),
+                        },
+                    ],
+                    multiple: false,
+                    custom: false,
+                },
+                QuestionInfo {
+                    question: "Second".into(),
+                    header: "Two".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "C".into(),
+                            description: "third".into(),
+                        },
+                        QuestionOption {
+                            label: "D".into(),
+                            description: "fourth".into(),
+                        },
+                    ],
+                    multiple: false,
+                    custom: false,
+                },
+            ],
+            tool: None,
+        };
+        let mut modal = QuestionModal::new(request);
+
+        assert!(matches!(
+            modal.handle_event(key(Scancode::Enter)),
+            Action::None
+        ));
+        assert_eq!(modal.current_q, 1);
+        assert!(matches!(
+            modal.handle_event(key(Scancode::Left)),
+            Action::None
+        ));
+        assert_eq!(modal.current_q, 0);
+        assert!(matches!(
+            modal.handle_event(key(Scancode::Right)),
+            Action::None
+        ));
+        assert_eq!(modal.current_q, 1);
+        assert!(matches!(
+            modal.handle_event(key(Scancode::Down)),
+            Action::None
+        ));
+
+        let action = modal.handle_event(key(Scancode::Enter));
+
+        assert!(matches!(
+            action,
+            Action::ReplyQuestion(_, _, answers)
+                if answers == vec![vec!["A".to_string()], vec!["D".to_string()]]
+        ));
+    }
+
+    #[test]
+    fn question_modal_escape_returns_reject_action() {
+        let mut modal = QuestionModal::new(single_question_request("question-escape"));
+
+        let action = modal.handle_event(key(Scancode::Escape));
+
+        assert!(matches!(
+            action,
+            Action::RejectQuestion(request_id) if request_id == "question-escape"
+        ));
+    }
 }
 
 // --- Permission approval modal ---
@@ -1475,6 +1712,31 @@ impl Modal for PermissionModal {
                 lines.push(Line::from(alloc::format!("  {pattern}")).style(theme.text));
             }
         }
+        if !self.request.always.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("Always Rules:").style(theme.text_dim));
+            for rule in self.request.always.iter() {
+                lines.push(Line::from(alloc::format!("  {rule}")).style(theme.text));
+            }
+        }
+        if !self.request.metadata.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("Metadata:").style(theme.text_dim));
+            for (key, value) in self.request.metadata.iter() {
+                lines.push(Line::from(alloc::format!("  {key}: {value}")).style(theme.text));
+            }
+        }
+        if let Some(tool) = self.request.tool.as_ref() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("Tool Call:").style(theme.text_dim));
+            lines.push(
+                Line::from(alloc::format!("  Message ID: {}", tool.message_id)).style(theme.text),
+            );
+            lines.push(Line::from(alloc::format!("  Call ID: {}", tool.call_id)).style(theme.text));
+        }
+        lines.push(Line::from(""));
+        lines
+            .push(Line::from("Left/Right: choose  Enter: submit  Esc: deny").style(theme.text_dim));
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
             .render(content_area, frame.buffer_mut());
@@ -1519,7 +1781,11 @@ impl Modal for PermissionModal {
                         reply,
                     )
                 }
-                Scancode::Escape => Action::CloseModal,
+                Scancode::Escape => Action::ReplyPermission(
+                    self.request.session_id.clone(),
+                    self.request.id.clone(),
+                    crate::screen::PermissionReplyAction::Reject,
+                ),
                 _ => Action::None,
             },
             _ => Action::None,
@@ -1533,39 +1799,303 @@ impl Modal for PermissionModal {
 
 // --- Question modal ---
 
+#[derive(Debug, Clone)]
+struct QuestionDraft {
+    cursor: usize,
+    selected_option: Option<usize>,
+    selected_options: Vec<bool>,
+    custom_input: String,
+    custom_selected: bool,
+}
+
+impl QuestionDraft {
+    fn new(question: &ocpncord_backend::QuestionInfo) -> Self {
+        Self {
+            cursor: 0,
+            selected_option: None,
+            selected_options: alloc::vec![false; question.options.len()],
+            custom_input: String::new(),
+            custom_selected: false,
+        }
+    }
+}
+
 pub struct QuestionModal {
     request: ocpncord_backend::QuestionRequest,
     current_q: usize,
-    selected: usize,
-    custom_input: String,
+    drafts: Vec<QuestionDraft>,
 }
 
 impl QuestionModal {
     pub fn new(request: ocpncord_backend::QuestionRequest) -> Self {
+        let drafts = request.questions.iter().map(QuestionDraft::new).collect();
         Self {
             request,
             current_q: 0,
-            selected: 0,
-            custom_input: String::new(),
+            drafts,
         }
+    }
+
+    fn current_question(&self) -> Option<&ocpncord_backend::QuestionInfo> {
+        self.request.questions.get(self.current_q)
+    }
+
+    fn current_draft(&self) -> Option<&QuestionDraft> {
+        self.drafts.get(self.current_q)
+    }
+
+    fn row_count(question: &ocpncord_backend::QuestionInfo) -> usize {
+        question.options.len() + usize::from(question.custom)
+    }
+
+    fn custom_row_index(question: &ocpncord_backend::QuestionInfo) -> Option<usize> {
+        question.custom.then_some(question.options.len())
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        let Some(question) = self.current_question() else {
+            return;
+        };
+        let row_count = Self::row_count(question);
+        if row_count == 0 {
+            return;
+        }
+        let draft = &mut self.drafts[self.current_q];
+        if delta < 0 {
+            draft.cursor = draft.cursor.saturating_sub(delta.unsigned_abs());
+        } else {
+            draft.cursor = (draft.cursor + delta as usize).min(row_count.saturating_sub(1));
+        }
+    }
+
+    fn append_custom_char(&mut self, ch: char) -> bool {
+        let current_q = self.current_q;
+        let Some(question) = self.request.questions.get(current_q) else {
+            return false;
+        };
+        let Some(custom_index) = Self::custom_row_index(question) else {
+            return false;
+        };
+        let multiple = question.multiple;
+        let draft = &mut self.drafts[current_q];
+        if draft.cursor != custom_index {
+            return false;
+        }
+        draft.custom_input.push(ch);
+        draft.custom_selected = true;
+        if !multiple {
+            draft.selected_option = None;
+        }
+        true
+    }
+
+    fn backspace_custom_input(&mut self) -> bool {
+        let current_q = self.current_q;
+        let Some(question) = self.request.questions.get(current_q) else {
+            return false;
+        };
+        let Some(custom_index) = Self::custom_row_index(question) else {
+            return false;
+        };
+        let draft = &mut self.drafts[current_q];
+        if draft.cursor != custom_index {
+            return false;
+        }
+        draft.custom_input.pop();
+        if draft.custom_input.is_empty() {
+            draft.custom_selected = false;
+        }
+        true
+    }
+
+    fn toggle_current_multi_selection(&mut self) -> bool {
+        let current_q = self.current_q;
+        let Some(question) = self.request.questions.get(current_q) else {
+            return false;
+        };
+        if !question.multiple {
+            return false;
+        }
+        let options_len = question.options.len();
+        let custom_index = Self::custom_row_index(question);
+        let draft = &mut self.drafts[current_q];
+        if draft.cursor < options_len {
+            if let Some(selected) = draft.selected_options.get_mut(draft.cursor) {
+                *selected = !*selected;
+                return true;
+            }
+            return false;
+        }
+        if custom_index == Some(draft.cursor) {
+            draft.custom_selected = !draft.custom_selected;
+            return true;
+        }
+        false
+    }
+
+    fn go_back(&mut self) {
+        if self.current_q > 0 {
+            self.current_q -= 1;
+        }
+    }
+
+    fn advance_or_submit(&mut self) -> Action {
+        if self.current_q + 1 < self.request.questions.len() {
+            self.current_q += 1;
+            Action::None
+        } else {
+            Action::ReplyQuestion(
+                self.request.session_id.clone(),
+                self.request.id.clone(),
+                self.collect_answers(),
+            )
+        }
+    }
+
+    fn submit_current_question(&mut self) -> Action {
+        let current_q = self.current_q;
+        let Some(question) = self.request.questions.get(current_q) else {
+            return Action::None;
+        };
+
+        if question.multiple {
+            return self.advance_or_submit();
+        }
+
+        let custom_index = Self::custom_row_index(question);
+        let options_len = question.options.len();
+        let draft = &mut self.drafts[current_q];
+        if custom_index == Some(draft.cursor) {
+            if draft.custom_input.is_empty() {
+                return Action::None;
+            }
+            draft.custom_selected = true;
+            draft.selected_option = None;
+        } else if draft.cursor < options_len {
+            draft.selected_option = Some(draft.cursor);
+            draft.custom_selected = false;
+        } else {
+            return Action::None;
+        }
+
+        self.advance_or_submit()
+    }
+
+    fn collect_answers(&self) -> Vec<Vec<String>> {
+        let mut answers = Vec::with_capacity(self.request.questions.len());
+
+        for (question, draft) in self.request.questions.iter().zip(self.drafts.iter()) {
+            let mut question_answers = Vec::new();
+            if question.multiple {
+                for (index, option) in question.options.iter().enumerate() {
+                    if draft.selected_options.get(index).copied().unwrap_or(false) {
+                        question_answers.push(option.label.clone());
+                    }
+                }
+                if question.custom && draft.custom_selected && !draft.custom_input.is_empty() {
+                    question_answers.push(draft.custom_input.clone());
+                }
+            } else if draft.custom_selected {
+                if !draft.custom_input.is_empty() {
+                    question_answers.push(draft.custom_input.clone());
+                }
+            } else if let Some(index) = draft.selected_option {
+                if let Some(option) = question.options.get(index) {
+                    question_answers.push(option.label.clone());
+                }
+            }
+            answers.push(question_answers);
+        }
+
+        answers
     }
 }
 
 impl Modal for QuestionModal {
     fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect) {
-        if let Some(qinfo) = self.request.questions.get(self.current_q) {
+        if let (Some(qinfo), Some(draft)) = (self.current_question(), self.current_draft()) {
             let mut lines: Vec<Line<'_>> = Vec::new();
+            lines.push(
+                Line::from(alloc::format!(
+                    "Question {}/{}",
+                    self.current_q + 1,
+                    self.request.questions.len()
+                ))
+                .style(theme.text_dim),
+            );
             lines.push(Line::from(qinfo.header.as_str()).style(theme.text_accent));
             lines.push(Line::from(qinfo.question.as_str()).style(theme.text));
             lines.push(Line::from(""));
             for (i, opt) in qinfo.options.iter().enumerate() {
-                let style = if i == self.selected {
+                let style = if i == draft.cursor {
                     theme.dialog_button_focused
                 } else {
                     theme.dialog_button
                 };
-                let display = alloc::format!("  {} - {}", opt.label, opt.description);
+                let marker = if qinfo.multiple {
+                    if draft.selected_options.get(i).copied().unwrap_or(false) {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    }
+                } else if draft.selected_option == Some(i) {
+                    "(x)"
+                } else {
+                    "( )"
+                };
+                let display = alloc::format!(" {marker} {} - {}", opt.label, opt.description);
                 lines.push(Line::from(display).style(style));
+            }
+            if let Some(custom_index) = Self::custom_row_index(qinfo) {
+                let style = if custom_index == draft.cursor {
+                    theme.dialog_button_focused
+                } else {
+                    theme.dialog_button
+                };
+                let marker = if qinfo.multiple {
+                    if draft.custom_selected {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    }
+                } else if draft.custom_selected {
+                    "(x)"
+                } else {
+                    "( )"
+                };
+                let custom_text = if draft.custom_input.is_empty() {
+                    "type a custom answer"
+                } else {
+                    draft.custom_input.as_str()
+                };
+                let display = alloc::format!(" {marker} Custom: {custom_text}");
+                lines.push(Line::from(display).style(style));
+            }
+            if let Some(tool) = self.request.tool.as_ref() {
+                lines.push(Line::from(""));
+                lines.push(Line::from("Tool Call:").style(theme.text_dim));
+                lines.push(
+                    Line::from(alloc::format!("  Message ID: {}", tool.message_id))
+                        .style(theme.text),
+                );
+                lines.push(
+                    Line::from(alloc::format!("  Call ID: {}", tool.call_id)).style(theme.text),
+                );
+            }
+            lines.push(Line::from(""));
+            lines.push(
+                Line::from(if qinfo.multiple {
+                    "Up/Down: move  Space: toggle  Left: back  Enter/Right: next"
+                } else {
+                    "Up/Down: move  Left: back  Enter/Right: next"
+                })
+                .style(theme.text_dim),
+            );
+            if qinfo.custom {
+                lines.push(
+                    Line::from("Type while Custom is selected. Backspace edits custom input.")
+                        .style(theme.text_dim),
+                );
             }
             Paragraph::new(Text::from(lines))
                 .wrap(Wrap { trim: false })
@@ -1577,36 +2107,31 @@ impl Modal for QuestionModal {
         match event {
             Event::Key(ref ke) => match ke.scancode {
                 Scancode::Up => {
-                    self.selected = self.selected.saturating_sub(1);
+                    self.move_cursor(-1);
                     Action::None
                 }
                 Scancode::Down => {
-                    let max = self
-                        .request
-                        .questions
-                        .get(self.current_q)
-                        .map(|q| q.options.len().saturating_sub(1))
-                        .unwrap_or(0);
-                    self.selected = (self.selected + 1).min(max);
+                    self.move_cursor(1);
                     Action::None
                 }
-                Scancode::Enter => {
-                    let answer = if let Some(qinfo) = self.request.questions.get(self.current_q) {
-                        if let Some(opt) = qinfo.options.get(self.selected) {
-                            opt.label.clone()
-                        } else {
-                            String::new()
-                        }
-                    } else {
-                        String::new()
-                    };
-                    Action::ReplyQuestion(
-                        self.request.session_id.clone(),
-                        self.request.id.clone(),
-                        alloc::vec::Vec::from([answer]),
-                    )
+                Scancode::Left => {
+                    self.go_back();
+                    Action::None
                 }
-                Scancode::Escape => Action::CloseModal,
+                Scancode::Right | Scancode::Enter => self.submit_current_question(),
+                Scancode::Backspace => {
+                    self.backspace_custom_input();
+                    Action::None
+                }
+                Scancode::Char(' ') => {
+                    self.toggle_current_multi_selection();
+                    Action::None
+                }
+                Scancode::Char(c) => {
+                    self.append_custom_char(c);
+                    Action::None
+                }
+                Scancode::Escape => Action::RejectQuestion(self.request.id.clone()),
                 _ => Action::None,
             },
             _ => Action::None,

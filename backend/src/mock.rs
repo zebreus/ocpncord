@@ -19,6 +19,9 @@ pub struct MockBackend {
     pub text_matches: Vec<TextMatch>,
     pub fail_create_session: Option<BackendError>,
     pub last_prompt_agent: Option<alloc::string::String>,
+    pub permission_replies: Vec<PermissionReply>,
+    pub question_replies: Vec<QuestionReply>,
+    pub rejected_questions: Vec<String>,
 }
 
 impl Default for MockBackend {
@@ -45,6 +48,9 @@ impl Default for MockBackend {
             text_matches: Vec::new(),
             fail_create_session: None,
             last_prompt_agent: None,
+            permission_replies: Vec::new(),
+            question_replies: Vec::new(),
+            rejected_questions: Vec::new(),
         }
     }
 }
@@ -167,6 +173,21 @@ impl Backend for MockBackend {
     ) -> Result<Self::PromptStream> {
         let events = core::mem::take(&mut self.prompt_events);
         Ok(MockStream { events, pos: 0 })
+    }
+
+    async fn reply_permission(&mut self, reply: &PermissionReply) -> Result<()> {
+        self.permission_replies.push(reply.clone());
+        Ok(())
+    }
+
+    async fn reply_question(&mut self, reply: &QuestionReply) -> Result<()> {
+        self.question_replies.push(reply.clone());
+        Ok(())
+    }
+
+    async fn reject_question(&mut self, request_id: &str) -> Result<()> {
+        self.rejected_questions.push(request_id.into());
+        Ok(())
     }
 
     async fn find_text(&mut self, _pattern: &str) -> Result<Vec<TextMatch>> {

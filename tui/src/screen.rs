@@ -43,7 +43,8 @@ pub enum Action {
     SidePanelSelectTab(Tab),
     // --- New: modal replies ---
     ReplyPermission(String, String, PermissionReplyAction), // session_id, request_id, reply
-    ReplyQuestion(String, String, Vec<String>),             // session_id, request_id, answers
+    ReplyQuestion(String, String, Vec<Vec<String>>),        // session_id, request_id, answers
+    RejectQuestion(String),                                 // request_id
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

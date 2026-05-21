@@ -845,6 +845,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_question_replied_with_nested_answers() {
+        let data = wrap_sse_data(
+            "question.replied",
+            "{\"sessionID\":\"ses1\",\"requestID\":\"que1\",\"answers\":[[\"Yes\"],[\"custom\",\"extra\"]]}",
+        );
+        let sse = format!("event: question.replied\ndata: {data}\n\n");
+        let events = BufferedStream::parse_sse(sse.as_bytes());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Ok(BackendEvent::QuestionReplied {
+                session_id,
+                request_id,
+                answers,
+            }) => {
+                assert_eq!(session_id, "ses1");
+                assert_eq!(request_id, "que1");
+                assert_eq!(
+                    answers,
+                    &alloc::vec![
+                        alloc::vec!["Yes".to_string()],
+                        alloc::vec!["custom".to_string(), "extra".to_string()]
+                    ]
+                );
+            }
+            _ => panic!("expected question.replied"),
+        }
+    }
+
+    #[test]
     fn parse_command_executed() {
         let data = wrap_sse_data("command.executed", "{\"name\":\"build\",\"sessionID\":\"ses1\",\"arguments\":\"--release\",\"messageID\":\"msg1\"}");
         let sse = format!("event: command.executed\ndata: {data}\n\n");

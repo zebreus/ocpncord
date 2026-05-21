@@ -529,6 +529,18 @@ pub struct LogBody<'a> {
     pub message: &'a str,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionReplyBody<'a> {
+    pub reply: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionReplyBody<'a> {
+    pub answers: &'a [Vec<String>],
+}
+
 // --- Error responses ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -640,7 +652,7 @@ pub struct QuestionReply {
     pub session_id: SessionId,
     #[serde(rename = "requestID")]
     pub request_id: String,
-    pub answers: Vec<String>,
+    pub answers: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,9 +12,11 @@ use crate::chat::{render_chat, Chat, ChatTranscript};
 use crate::command_palette::CommandPaletteModal;
 use crate::event::{Event, Scancode};
 use crate::key_chord::KeyChord;
-use crate::modal::{HelpModal, Modal, ModelPickerModal, SessionListModal};
+use crate::modal::{
+    HelpModal, Modal, ModelPickerModal, PermissionModal, QuestionModal, SessionListModal,
+};
 use crate::prompt_bar::PromptBar;
-use crate::screen::{Action, ModalId, ScreenId, Tab};
+use crate::screen::{Action, ModalId, PermissionReplyAction, ScreenId, Tab};
 use crate::start_page::StartPage;
 use crate::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -41,6 +43,15 @@ pub enum ToastVariant {
     Success,
     Warning,
     Error,
+}
+
+const MAX_STORED_TOASTS: usize = 16;
+const MAX_VISIBLE_TOASTS: usize = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActiveBlockingPrompt {
+    Permission(String),
+    Question(String),
 }
 
 /// A message held in memory, built from streaming Parts.
@@ -239,6 +250,7 @@ pub struct App<B: Backend> {
     stream: Option<B::PromptStream>,
     sync_stream: Option<B::EventStream>,
     active_modal: Option<Box<dyn Modal>>,
+    active_blocking_prompt: Option<ActiveBlockingPrompt>,
     agents: Vec<ocpncord_backend::Agent>,
     active_agent: usize,
     // --- New fields for full API integration ---
@@ -247,9 +259,8 @@ pub struct App<B: Backend> {
     cached_sessions: Vec<ocpncord_backend::Session>,
     model_cache: Option<Vec<ocpncord_backend::ModelSummary>>,
     // Permission & Question pending queues
-    pending_permissions:
-        alloc::collections::VecDeque<(ocpncord_backend::PermissionRequest, String)>,
-    pending_questions: alloc::collections::VecDeque<(ocpncord_backend::QuestionRequest, String)>,
+    pending_permissions: alloc::collections::VecDeque<ocpncord_backend::PermissionRequest>,
+    pending_questions: alloc::collections::VecDeque<ocpncord_backend::QuestionRequest>,
     // Toast notifications
     toasts: alloc::collections::VecDeque<Toast>,
     // Side panel state
@@ -295,6 +306,7 @@ impl<B: Backend> App<B> {
             response_seen_assistant_activity: false,
             stream: None,
             active_modal: None,
+            active_blocking_prompt: None,
             agents: Vec::new(),
             active_agent: 0,
             terminal: TerminalPane::new(),
@@ -318,10 +330,94 @@ impl<B: Backend> App<B> {
 
     pub fn set_active_modal(&mut self, modal: Box<dyn Modal>) {
         self.active_modal = Some(modal);
+        self.active_blocking_prompt = None;
     }
 
     pub fn active_modal(&self) -> Option<&dyn Modal> {
         self.active_modal.as_deref()
+    }
+
+    fn set_blocking_modal(&mut self, modal: Box<dyn Modal>, prompt: ActiveBlockingPrompt) {
+        self.active_modal = Some(modal);
+        self.active_blocking_prompt = Some(prompt);
+    }
+
+    fn clear_active_modal(&mut self) {
+        self.active_modal = None;
+        self.active_blocking_prompt = None;
+    }
+
+    fn push_toast(&mut self, toast: Toast) {
+        if self.toasts.len() >= MAX_STORED_TOASTS {
+            self.toasts.pop_front();
+        }
+        self.toasts.push_back(toast);
+    }
+
+    fn truncate_toast_text(display: &str, max_width: usize) -> String {
+        if max_width == 0 {
+            return String::new();
+        }
+
+        let chars: Vec<char> = display.chars().collect();
+        if chars.len() <= max_width {
+            return display.into();
+        }
+
+        if max_width <= 3 {
+            return chars.into_iter().take(max_width).collect();
+        }
+
+        let mut truncated: String = chars.into_iter().take(max_width - 3).collect();
+        truncated.push_str("...");
+        truncated
+    }
+
+    fn render_toasts(&self, frame: &mut ratatui::Frame, area: Rect) {
+        if self.active_modal.is_some() || area.width == 0 || area.height <= 2 {
+            return;
+        }
+
+        let max_width = area.width.saturating_sub(2) as usize;
+        if max_width == 0 {
+            return;
+        }
+
+        let bottom_limit = area.y + area.height.saturating_sub(1);
+        let mut toast_y = area.y + 2;
+
+        for toast in self.toasts.iter().rev().take(MAX_VISIBLE_TOASTS) {
+            if toast_y >= bottom_limit {
+                break;
+            }
+
+            let style = match toast.variant {
+                ToastVariant::Info => self.theme.toast_info,
+                ToastVariant::Success => self.theme.toast_success,
+                ToastVariant::Warning => self.theme.toast_warning,
+                ToastVariant::Error => self.theme.toast_error,
+            };
+            let display = if let Some(ref title) = toast.title {
+                alloc::format!(" {}: {} ", title, toast.message)
+            } else {
+                alloc::format!(" {} ", toast.message)
+            };
+            let display = Self::truncate_toast_text(&display, max_width);
+            if display.is_empty() {
+                continue;
+            }
+
+            let display_width = display.chars().count() as u16;
+            if display_width == 0 {
+                continue;
+            }
+
+            let x = area.x + area.width.saturating_sub(display_width.saturating_add(1));
+            Text::from(display)
+                .style(style)
+                .render(Rect::new(x, toast_y, display_width, 1), frame.buffer_mut());
+            toast_y += 1;
+        }
     }
 
     pub fn backend(&self) -> &B {
@@ -565,6 +661,88 @@ impl<B: Backend> App<B> {
         self.dispatch_prompt(prompt, message);
     }
 
+    fn open_permission_modal_if_idle(&mut self) -> bool {
+        if self.active_modal.is_some() {
+            return false;
+        }
+
+        let Some(request) = self.pending_permissions.front().cloned() else {
+            return false;
+        };
+
+        let request_id = request.id.clone();
+        self.set_blocking_modal(
+            Box::new(PermissionModal::new(request)),
+            ActiveBlockingPrompt::Permission(request_id),
+        );
+        true
+    }
+
+    fn open_question_modal_if_idle(&mut self) -> bool {
+        if self.active_modal.is_some() {
+            return false;
+        }
+
+        let Some(request) = self.pending_questions.front().cloned() else {
+            return false;
+        };
+
+        let request_id = request.id.clone();
+        self.set_blocking_modal(
+            Box::new(QuestionModal::new(request)),
+            ActiveBlockingPrompt::Question(request_id),
+        );
+        true
+    }
+
+    fn open_next_blocking_modal_if_idle(&mut self) -> bool {
+        self.open_permission_modal_if_idle() || self.open_question_modal_if_idle()
+    }
+
+    fn remove_pending_permission_by_id(&mut self, request_id: &str) -> bool {
+        let Some(index) = self
+            .pending_permissions
+            .iter()
+            .position(|request| request.id == request_id)
+        else {
+            return false;
+        };
+
+        self.pending_permissions.remove(index);
+        true
+    }
+
+    fn remove_pending_question_by_id(&mut self, request_id: &str) -> bool {
+        let Some(index) = self
+            .pending_questions
+            .iter()
+            .position(|request| request.id == request_id)
+        else {
+            return false;
+        };
+
+        self.pending_questions.remove(index);
+        true
+    }
+
+    fn close_permission_modal_if_matches(&mut self, request_id: &str) {
+        if matches!(
+            self.active_blocking_prompt.as_ref(),
+            Some(ActiveBlockingPrompt::Permission(active_id)) if active_id == request_id
+        ) {
+            self.clear_active_modal();
+        }
+    }
+
+    fn close_question_modal_if_matches(&mut self, request_id: &str) {
+        if matches!(
+            self.active_blocking_prompt.as_ref(),
+            Some(ActiveBlockingPrompt::Question(active_id)) if active_id == request_id
+        ) {
+            self.clear_active_modal();
+        }
+    }
+
     /// Returns `false` when the application should quit.
     pub async fn handle_event(&mut self, event: Event) -> bool {
         match event {
@@ -572,16 +750,21 @@ impl<B: Backend> App<B> {
                 self.error = None;
 
                 if let Some(ref mut modal) = self.active_modal {
-                    if key.scancode == Scancode::Escape {
-                        self.active_modal = None;
-                        return true;
-                    }
                     let action = modal.handle_event(Event::Key(key.clone()));
                     match action {
-                        Action::CloseModal => self.active_modal = None,
+                        Action::CloseModal => {
+                            self.clear_active_modal();
+                            self.open_next_blocking_modal_if_idle();
+                        }
+                        Action::None
+                            if key.scancode == Scancode::Escape
+                                && self.active_blocking_prompt.is_none() =>
+                        {
+                            self.clear_active_modal();
+                            self.open_next_blocking_modal_if_idle();
+                        }
                         Action::None => {}
                         other => {
-                            self.active_modal = None;
                             return self.apply_action(Some(other)).await;
                         }
                     }
@@ -793,34 +976,32 @@ impl<B: Backend> App<B> {
                     ocpncord_backend::BackendEvent::MessagePartDelta { .. } => {}
                     ocpncord_backend::BackendEvent::MessagePartRemoved { .. } => {}
                     ocpncord_backend::BackendEvent::PermissionAsked { request } => {
-                        let sid = self
-                            .active_session
-                            .as_ref()
-                            .map(|s| s.id.clone())
-                            .unwrap_or_default();
-                        self.pending_permissions.push_back((request.clone(), sid));
+                        self.pending_permissions.push_back(request);
+                        self.open_next_blocking_modal_if_idle();
                     }
-                    ocpncord_backend::BackendEvent::PermissionReplied { .. } => {
-                        self.pending_permissions.pop_front();
+                    ocpncord_backend::BackendEvent::PermissionReplied { request_id, .. } => {
+                        self.remove_pending_permission_by_id(&request_id);
+                        self.close_permission_modal_if_matches(&request_id);
+                        self.open_next_blocking_modal_if_idle();
                     }
                     ocpncord_backend::BackendEvent::QuestionAsked { request } => {
-                        let sid = self
-                            .active_session
-                            .as_ref()
-                            .map(|s| s.id.clone())
-                            .unwrap_or_default();
-                        self.pending_questions.push_back((request.clone(), sid));
+                        self.pending_questions.push_back(request);
+                        self.open_next_blocking_modal_if_idle();
                     }
-                    ocpncord_backend::BackendEvent::QuestionRejected { .. } => {
-                        self.pending_questions.pop_front();
+                    ocpncord_backend::BackendEvent::QuestionRejected { request_id, .. } => {
+                        self.remove_pending_question_by_id(&request_id);
+                        self.close_question_modal_if_matches(&request_id);
+                        self.open_next_blocking_modal_if_idle();
                     }
-                    ocpncord_backend::BackendEvent::QuestionReplied { .. } => {
-                        self.pending_questions.pop_front();
+                    ocpncord_backend::BackendEvent::QuestionReplied { request_id, .. } => {
+                        self.remove_pending_question_by_id(&request_id);
+                        self.close_question_modal_if_matches(&request_id);
+                        self.open_next_blocking_modal_if_idle();
                     }
                     ocpncord_backend::BackendEvent::CommandExecuted {
                         name, arguments, ..
                     } => {
-                        self.toasts.push_back(Toast {
+                        self.push_toast(Toast {
                             title: Some("Command".into()),
                             message: alloc::format!("{name} {arguments}"),
                             variant: ToastVariant::Info,
@@ -829,7 +1010,7 @@ impl<B: Backend> App<B> {
                         });
                     }
                     ocpncord_backend::BackendEvent::FileEdited { file } => {
-                        self.toasts.push_back(Toast {
+                        self.push_toast(Toast {
                             title: Some("File Edited".into()),
                             message: file,
                             variant: ToastVariant::Info,
@@ -838,7 +1019,7 @@ impl<B: Backend> App<B> {
                         });
                     }
                     ocpncord_backend::BackendEvent::FileWatcherUpdated { file, event } => {
-                        self.toasts.push_back(Toast {
+                        self.push_toast(Toast {
                             title: Some("File Watcher".into()),
                             message: alloc::format!("{file}: {event}"),
                             variant: ToastVariant::Info,
@@ -858,7 +1039,7 @@ impl<B: Backend> App<B> {
                     ocpncord_backend::BackendEvent::PtyExited { exit_code, .. } => {
                         self.terminal.status = ocpncord_backend::PtyStatus::Exited;
                         self.terminal.exit_code = Some(exit_code);
-                        self.toasts.push_back(Toast {
+                        self.push_toast(Toast {
                             title: Some("Terminal".into()),
                             message: alloc::format!("exit code: {exit_code}"),
                             variant: if exit_code == 0 {
@@ -876,7 +1057,7 @@ impl<B: Backend> App<B> {
                     }
                     ocpncord_backend::BackendEvent::LspUpdated => {}
                     ocpncord_backend::BackendEvent::McpBrowserOpenFailed { mcp_name, url } => {
-                        self.toasts.push_back(Toast {
+                        self.push_toast(Toast {
                             title: Some("MCP Error".into()),
                             message: alloc::format!("{mcp_name}: {url}"),
                             variant: ToastVariant::Error,
@@ -885,7 +1066,7 @@ impl<B: Backend> App<B> {
                         });
                     }
                     ocpncord_backend::BackendEvent::McpToolsChanged { server } => {
-                        self.toasts.push_back(Toast {
+                        self.push_toast(Toast {
                             title: Some("MCP Tools".into()),
                             message: alloc::format!("Updated from {server}"),
                             variant: ToastVariant::Info,
@@ -894,7 +1075,7 @@ impl<B: Backend> App<B> {
                         });
                     }
                     ocpncord_backend::BackendEvent::InstallationUpdateAvailable { version } => {
-                        self.toasts.push_back(Toast {
+                        self.push_toast(Toast {
                             title: Some("Update Available".into()),
                             message: alloc::format!("version {version}"),
                             variant: ToastVariant::Info,
@@ -903,7 +1084,7 @@ impl<B: Backend> App<B> {
                         });
                     }
                     ocpncord_backend::BackendEvent::InstallationUpdated { version } => {
-                        self.toasts.push_back(Toast {
+                        self.push_toast(Toast {
                             title: Some("Updated".into()),
                             message: alloc::format!("now on {version}"),
                             variant: ToastVariant::Success,
@@ -941,7 +1122,7 @@ impl<B: Backend> App<B> {
                         title,
                         duration,
                     } => {
-                        self.toasts.push_back(Toast {
+                        self.push_toast(Toast {
                             title,
                             message,
                             variant: match variant.as_str() {
@@ -958,7 +1139,7 @@ impl<B: Backend> App<B> {
                         self.handle_select_session(session_id).await;
                     }
                     ocpncord_backend::BackendEvent::ServerConnected => {
-                        self.toasts.push_back(Toast {
+                        self.push_toast(Toast {
                             title: Some("Server".into()),
                             message: "Connected".into(),
                             variant: ToastVariant::Success,
@@ -970,7 +1151,7 @@ impl<B: Backend> App<B> {
                         self.error = Some("Server disposed all instances".into());
                     }
                     ocpncord_backend::BackendEvent::ServerInstanceDisposed { directory } => {
-                        self.toasts.push_back(Toast {
+                        self.push_toast(Toast {
                             title: Some("Instance Disposed".into()),
                             message: directory,
                             variant: ToastVariant::Warning,
@@ -989,6 +1170,9 @@ impl<B: Backend> App<B> {
                 let tick = self.tick;
                 self.toasts
                     .retain(|toast| tick.saturating_sub(toast.created_at) <= toast.duration);
+                while self.toasts.len() > MAX_STORED_TOASTS {
+                    self.toasts.pop_front();
+                }
                 if let Some(action) = self.key_chord.tick(self.tick) {
                     return self.apply_action(Some(action)).await;
                 }
@@ -1262,10 +1446,13 @@ impl<B: Backend> App<B> {
         match action {
             Some(Action::Quit) => return false,
             Some(Action::SwitchScreen(id)) => self.active_screen = id,
-            Some(Action::CloseModal) => self.active_modal = None,
+            Some(Action::CloseModal) => {
+                self.clear_active_modal();
+                self.open_next_blocking_modal_if_idle();
+            }
             Some(Action::OpenPalette) => {
                 let modal = CommandPaletteModal::new(crate::command_palette::default_commands());
-                self.active_modal = Some(Box::new(modal));
+                self.set_active_modal(Box::new(modal));
             }
             Some(Action::OpenModal(ModalId::SessionList)) => {
                 let mut modal = SessionListModal::new();
@@ -1273,19 +1460,23 @@ impl<B: Backend> App<B> {
                     Ok(sessions) => modal.set_sessions(sessions),
                     Err(e) => modal.set_error(alloc::format!("{}", e)),
                 }
-                self.active_modal = Some(Box::new(modal));
+                self.set_active_modal(Box::new(modal));
             }
             Some(Action::OpenModal(ModalId::ModelPicker)) => {
                 self.open_model_picker().await;
             }
             Some(Action::OpenModal(ModalId::Help)) => {
-                self.active_modal = Some(Box::new(HelpModal::new()));
+                self.set_active_modal(Box::new(HelpModal::new()));
             }
             Some(Action::OpenModal(ModalId::Settings)) => {
                 self.open_model_picker().await;
             }
-            Some(Action::OpenModal(ModalId::PermissionApproval)) => {}
-            Some(Action::OpenModal(ModalId::QuestionApproval)) => {}
+            Some(Action::OpenModal(ModalId::PermissionApproval)) => {
+                self.open_permission_modal_if_idle();
+            }
+            Some(Action::OpenModal(ModalId::QuestionApproval)) => {
+                self.open_question_modal_if_idle();
+            }
             Some(Action::OpenModal(_)) => {}
             Some(Action::LoadSession(ref id)) => {
                 let session_id = id.clone();
@@ -1310,8 +1501,9 @@ impl<B: Backend> App<B> {
                     }
                 }
                 self.active_session = self.backend.get_session(&session_id).await.ok();
-                self.active_modal = None;
+                self.clear_active_modal();
                 self.active_screen = ScreenId::Chat;
+                self.open_next_blocking_modal_if_idle();
             }
             Some(Action::DeleteSession(ref id)) => {
                 let _ = self.backend.delete_session(&id).await;
@@ -1321,7 +1513,7 @@ impl<B: Backend> App<B> {
                     Ok(sessions) => modal.set_sessions(sessions),
                     Err(e) => modal.set_error(alloc::format!("{}", e)),
                 }
-                self.active_modal = Some(Box::new(modal));
+                self.set_active_modal(Box::new(modal));
             }
             Some(Action::Interrupt) => {
                 return self.handle_interrupt().await;
@@ -1386,6 +1578,87 @@ impl<B: Backend> App<B> {
             Some(Action::OpenSettings) => {
                 self.open_model_picker().await;
             }
+            Some(Action::ReplyPermission(ref session_id, ref request_id, reply_action)) => {
+                let (reply_value, message) = match reply_action {
+                    PermissionReplyAction::Once => ("once", "Permission allowed once"),
+                    PermissionReplyAction::Always => ("always", "Permission allowed always"),
+                    PermissionReplyAction::Reject => ("reject", "Permission denied"),
+                };
+                let reply = ocpncord_backend::PermissionReply {
+                    session_id: session_id.clone(),
+                    request_id: request_id.clone(),
+                    reply: reply_value.into(),
+                };
+                let result = self.backend.reply_permission(&reply).await;
+                self.remove_pending_permission_by_id(request_id);
+                self.clear_active_modal();
+                match result {
+                    Ok(()) => self.push_toast(Toast {
+                        title: Some("Permission".into()),
+                        message: message.into(),
+                        variant: ToastVariant::Success,
+                        created_at: self.tick,
+                        duration: 6,
+                    }),
+                    Err(e) => self.push_toast(Toast {
+                        title: Some("Permission".into()),
+                        message: alloc::format!("{message}: {e}"),
+                        variant: ToastVariant::Error,
+                        created_at: self.tick,
+                        duration: 8,
+                    }),
+                }
+                self.open_next_blocking_modal_if_idle();
+            }
+            Some(Action::ReplyQuestion(ref session_id, ref request_id, ref answers)) => {
+                let reply = ocpncord_backend::QuestionReply {
+                    session_id: session_id.clone(),
+                    request_id: request_id.clone(),
+                    answers: answers.clone(),
+                };
+                let result = self.backend.reply_question(&reply).await;
+                self.remove_pending_question_by_id(request_id);
+                self.clear_active_modal();
+                match result {
+                    Ok(()) => self.push_toast(Toast {
+                        title: Some("Question".into()),
+                        message: "Answer submitted".into(),
+                        variant: ToastVariant::Success,
+                        created_at: self.tick,
+                        duration: 6,
+                    }),
+                    Err(e) => self.push_toast(Toast {
+                        title: Some("Question".into()),
+                        message: alloc::format!("Answer failed: {e}"),
+                        variant: ToastVariant::Error,
+                        created_at: self.tick,
+                        duration: 8,
+                    }),
+                }
+                self.open_next_blocking_modal_if_idle();
+            }
+            Some(Action::RejectQuestion(ref request_id)) => {
+                let result = self.backend.reject_question(request_id).await;
+                self.remove_pending_question_by_id(request_id);
+                self.clear_active_modal();
+                match result {
+                    Ok(()) => self.push_toast(Toast {
+                        title: Some("Question".into()),
+                        message: "Question rejected".into(),
+                        variant: ToastVariant::Success,
+                        created_at: self.tick,
+                        duration: 6,
+                    }),
+                    Err(e) => self.push_toast(Toast {
+                        title: Some("Question".into()),
+                        message: alloc::format!("Reject failed: {e}"),
+                        variant: ToastVariant::Error,
+                        created_at: self.tick,
+                        duration: 8,
+                    }),
+                }
+                self.open_next_blocking_modal_if_idle();
+            }
             Some(Action::SelectModel(ref model)) => {
                 let mut modal = ModelPickerModal::new();
                 match self.backend.get_config().await {
@@ -1410,7 +1683,7 @@ impl<B: Backend> App<B> {
                     }
                     Err(e) => modal.set_error(alloc::format!("{}", e)),
                 }
-                self.active_modal = Some(Box::new(modal));
+                self.set_active_modal(Box::new(modal));
             }
             Some(Action::AbortSession(ref id)) => {
                 let _ = self.backend.abort_session(id).await;
@@ -1684,35 +1957,7 @@ impl<B: Backend> App<B> {
                 .render(err_area, frame.buffer_mut());
         }
 
-        // Render toasts (top-right corner)
-        {
-            let area = frame.area();
-            let mut toast_y = 2u16;
-            for toast in self.toasts.iter().rev().take(5) {
-                if toast_y >= area.height.saturating_sub(2) {
-                    break;
-                }
-                let style = match toast.variant {
-                    ToastVariant::Info => self.theme.toast_info,
-                    ToastVariant::Success => self.theme.toast_success,
-                    ToastVariant::Warning => self.theme.toast_warning,
-                    ToastVariant::Error => self.theme.toast_error,
-                };
-                let display = if let Some(ref title) = toast.title {
-                    alloc::format!(" {}: {} ", title, toast.message)
-                } else {
-                    alloc::format!(" {} ", toast.message)
-                };
-                let max_width = area.width.saturating_sub(4);
-                let display: String = display.chars().take(max_width as usize).collect();
-                let display_width = display.len() as u16;
-                let x = area.width.saturating_sub(display_width + 2);
-                Text::from(display)
-                    .style(style)
-                    .render(Rect::new(x, toast_y, display_width, 1), frame.buffer_mut());
-                toast_y += 1;
-            }
-        }
+        self.render_toasts(frame, frame.area());
 
         // Render side panel (right 30% when visible)
         if self.side_panel_visible {
@@ -2340,6 +2585,13 @@ mod tests {
     fn enter_key() -> Event {
         Event::Key(KeyEvent {
             scancode: Scancode::Enter,
+            modifiers: Modifiers::default(),
+        })
+    }
+
+    fn escape_key() -> Event {
+        Event::Key(KeyEvent {
+            scancode: Scancode::Escape,
             modifiers: Modifiers::default(),
         })
     }
@@ -3917,5 +4169,260 @@ mod tests {
             "ctrl+c during streaming should interrupt, not quit"
         );
         assert!(!app.is_streaming(), "streaming should be stopped");
+    }
+
+    fn permission_request(id: &str) -> ocpncord_backend::PermissionRequest {
+        ocpncord_backend::PermissionRequest {
+            id: id.into(),
+            session_id: "session-1".into(),
+            permission: "bash".into(),
+            patterns: vec!["/tmp/**".into()],
+            metadata: Default::default(),
+            always: Vec::new(),
+            tool: None,
+        }
+    }
+
+    fn question_request(id: &str) -> ocpncord_backend::QuestionRequest {
+        ocpncord_backend::QuestionRequest {
+            id: id.into(),
+            session_id: "session-1".into(),
+            questions: vec![ocpncord_backend::QuestionInfo {
+                header: "Confirm".into(),
+                question: "Continue?".into(),
+                options: vec![
+                    ocpncord_backend::QuestionOption {
+                        label: "Yes".into(),
+                        description: "continue".into(),
+                    },
+                    ocpncord_backend::QuestionOption {
+                        label: "No".into(),
+                        description: "stop".into(),
+                    },
+                ],
+                multiple: false,
+                custom: false,
+            }],
+            tool: None,
+        }
+    }
+
+    #[test]
+    fn toast_renderer_shows_newest_first_and_caps_visible_count() {
+        let mut app = App::new(MockBackend::default());
+        for idx in 0..6 {
+            app.push_toast(Toast {
+                title: Some(alloc::format!("Toast{idx}")),
+                message: alloc::format!("message-{idx}"),
+                variant: ToastVariant::Info,
+                created_at: 0,
+                duration: 10,
+            });
+        }
+
+        let test_backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal
+            .draw(|frame| app.render_toasts(frame, Rect::new(0, 0, 80, 10)))
+            .unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(screen.contains("Toast5"), "screen: {screen}");
+        assert!(screen.contains("Toast1"), "screen: {screen}");
+        assert!(!screen.contains("Toast0"), "screen: {screen}");
+        assert!(
+            screen.find("Toast5").unwrap() < screen.find("Toast4").unwrap(),
+            "newest toast should render first: {screen}"
+        );
+    }
+
+    #[test]
+    fn toast_renderer_handles_narrow_terminals_and_storage_cap() {
+        let mut app = App::new(MockBackend::default());
+        for idx in 0..20 {
+            app.push_toast(Toast {
+                title: Some(alloc::format!("T{idx}")),
+                message: "very long message that should be clipped".into(),
+                variant: ToastVariant::Info,
+                created_at: 0,
+                duration: 10,
+            });
+        }
+
+        assert_eq!(app.toasts.len(), MAX_STORED_TOASTS);
+        assert_eq!(
+            app.toasts.front().and_then(|toast| toast.title.as_deref()),
+            Some("T4")
+        );
+
+        let test_backend = TestBackend::new(2, 4);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal
+            .draw(|frame| app.render_toasts(frame, Rect::new(0, 0, 2, 4)))
+            .unwrap();
+    }
+
+    #[test]
+    fn tick_expires_toasts_and_modal_suppresses_rendering() {
+        let mut app = App::new(MockBackend::default());
+        app.push_toast(Toast {
+            title: Some("HiddenToast".into()),
+            message: "toast message".into(),
+            variant: ToastVariant::Info,
+            created_at: 0,
+            duration: 0,
+        });
+        app.set_active_modal(Box::new(HelpModal::new()));
+
+        let test_backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+        assert!(!screen.contains("HiddenToast"), "screen: {screen}");
+
+        app.clear_active_modal();
+        run(&mut app, Event::Tick);
+        assert!(app.toasts.is_empty(), "expired toast should be pruned");
+    }
+
+    #[test]
+    fn permission_request_opens_modal_and_enter_replies_once() {
+        let mut app = App::new(MockBackend::default());
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::PermissionAsked {
+                request: permission_request("perm-1"),
+            }),
+        );
+
+        assert_eq!(
+            app.active_modal().map(|modal| modal.title()),
+            Some("Permission Request")
+        );
+        assert!(matches!(
+            app.active_blocking_prompt.as_ref(),
+            Some(ActiveBlockingPrompt::Permission(id)) if id == "perm-1"
+        ));
+
+        run(&mut app, enter_key());
+
+        assert!(
+            app.active_modal().is_none(),
+            "modal should close after reply"
+        );
+        assert_eq!(app.backend().permission_replies.len(), 1);
+        assert_eq!(app.backend().permission_replies[0].request_id, "perm-1");
+        assert_eq!(app.backend().permission_replies[0].reply, "once");
+    }
+
+    #[test]
+    fn permission_escape_rejects_and_opens_next_queued_request() {
+        let mut app = App::new(MockBackend::default());
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::PermissionAsked {
+                request: permission_request("perm-1"),
+            }),
+        );
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::PermissionAsked {
+                request: permission_request("perm-2"),
+            }),
+        );
+
+        run(&mut app, escape_key());
+
+        assert_eq!(app.backend().permission_replies.len(), 1);
+        assert_eq!(app.backend().permission_replies[0].request_id, "perm-1");
+        assert_eq!(app.backend().permission_replies[0].reply, "reject");
+        assert_eq!(app.pending_permissions.len(), 1);
+        assert_eq!(
+            app.pending_permissions
+                .front()
+                .map(|request| request.id.as_str()),
+            Some("perm-2")
+        );
+        assert!(matches!(
+            app.active_blocking_prompt.as_ref(),
+            Some(ActiveBlockingPrompt::Permission(id)) if id == "perm-2"
+        ));
+    }
+
+    #[test]
+    fn external_permission_reply_removes_matching_id_without_popping_front() {
+        let mut app = App::new(MockBackend::default());
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::PermissionAsked {
+                request: permission_request("perm-1"),
+            }),
+        );
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::PermissionAsked {
+                request: permission_request("perm-2"),
+            }),
+        );
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::PermissionReplied {
+                session_id: "session-1".into(),
+                request_id: "perm-2".into(),
+                reply: "always".into(),
+            }),
+        );
+
+        assert_eq!(app.pending_permissions.len(), 1);
+        assert_eq!(
+            app.pending_permissions
+                .front()
+                .map(|request| request.id.as_str()),
+            Some("perm-1")
+        );
+        assert!(matches!(
+            app.active_blocking_prompt.as_ref(),
+            Some(ActiveBlockingPrompt::Permission(id)) if id == "perm-1"
+        ));
+    }
+
+    #[test]
+    fn question_request_submits_nested_answers_and_escape_rejects() {
+        let mut app = App::new(MockBackend::default());
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::QuestionAsked {
+                request: question_request("question-1"),
+            }),
+        );
+        run(&mut app, enter_key());
+
+        assert_eq!(app.backend().question_replies.len(), 1);
+        assert_eq!(
+            app.backend().question_replies[0].answers,
+            vec![vec!["Yes".to_string()]]
+        );
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::QuestionAsked {
+                request: question_request("question-2"),
+            }),
+        );
+        run(&mut app, escape_key());
+
+        assert_eq!(
+            app.backend().rejected_questions,
+            vec!["question-2".to_string()]
+        );
+        assert!(
+            app.active_modal().is_none(),
+            "question modal should close after reject"
+        );
     }
 }

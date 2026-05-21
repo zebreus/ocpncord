@@ -369,6 +369,34 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         Ok(BufferedStream::empty())
     }
 
+    async fn reply_permission(&mut self, reply: &PermissionReply) -> Result<()> {
+        let url = alloc::format!("{}/permission/{}/reply", self.base_url, reply.request_id);
+        let body = ocpncord_backend::PermissionReplyBody {
+            reply: reply.reply.as_str(),
+        };
+        let json = serde_json::to_string(&body).map_err(parse_err)?;
+        self.send_get_body(Method::POST, &url, Some(json.as_bytes()))
+            .await?;
+        Ok(())
+    }
+
+    async fn reply_question(&mut self, reply: &QuestionReply) -> Result<()> {
+        let url = alloc::format!("{}/question/{}/reply", self.base_url, reply.request_id);
+        let body = ocpncord_backend::QuestionReplyBody {
+            answers: reply.answers.as_slice(),
+        };
+        let json = serde_json::to_string(&body).map_err(parse_err)?;
+        self.send_get_body(Method::POST, &url, Some(json.as_bytes()))
+            .await?;
+        Ok(())
+    }
+
+    async fn reject_question(&mut self, request_id: &str) -> Result<()> {
+        let url = alloc::format!("{}/question/{request_id}/reject", self.base_url);
+        self.send_get_body(Method::POST, &url, None).await?;
+        Ok(())
+    }
+
     async fn list_agents(&mut self) -> Result<Vec<Agent>> {
         let url = alloc::format!("{}/agent", self.base_url);
         let body = self.send_get_body(Method::GET, &url, None).await?;
@@ -492,6 +520,168 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use core::net::IpAddr;
+    use core::result::Result as CoreResult;
+
+    use embedded_io_async::{ErrorType, Read};
+    use embedded_nal_async::{AddrType, Dns, TcpConnect};
+    use ocpncord_backend::{PermissionReply, QuestionReply};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+
+    struct StdTcp;
+
+    impl TcpConnect for StdTcp {
+        type Error = std::io::Error;
+        type Connection<'a> = StdTcpStream;
+
+        async fn connect<'a>(
+            &'a self,
+            remote: core::net::SocketAddr,
+        ) -> CoreResult<Self::Connection<'a>, Self::Error> {
+            let stream = tokio::net::TcpStream::connect(remote).await?;
+            Ok(StdTcpStream(stream))
+        }
+    }
+
+    struct StdDns;
+
+    impl Dns for StdDns {
+        type Error = std::io::Error;
+
+        async fn get_host_by_name(
+            &self,
+            host: &str,
+            addr_type: AddrType,
+        ) -> CoreResult<IpAddr, Self::Error> {
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                return Ok(ip);
+            }
+
+            let addrs = tokio::net::lookup_host((host, 0)).await?;
+            let addrs: Vec<std::net::SocketAddr> = addrs.collect();
+            let addr = match addr_type {
+                AddrType::IPv4 => addrs.iter().find(|addr| addr.is_ipv4()),
+                AddrType::IPv6 => addrs.iter().find(|addr| addr.is_ipv6()),
+                AddrType::Either => addrs
+                    .iter()
+                    .find(|addr| addr.is_ipv4())
+                    .or_else(|| addrs.iter().find(|addr| addr.is_ipv6())),
+            };
+            match addr {
+                Some(addr) => Ok(addr.ip()),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no address found for host",
+                )),
+            }
+        }
+
+        async fn get_host_by_address(
+            &self,
+            _addr: IpAddr,
+            _result: &mut [u8],
+        ) -> CoreResult<usize, Self::Error> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "reverse DNS not supported",
+            ))
+        }
+    }
+
+    struct StdTcpStream(tokio::net::TcpStream);
+
+    impl ErrorType for StdTcpStream {
+        type Error = std::io::Error;
+    }
+
+    impl Read for StdTcpStream {
+        async fn read(&mut self, buf: &mut [u8]) -> CoreResult<usize, Self::Error> {
+            self.0.read(buf).await
+        }
+    }
+
+    impl embedded_io_async::Write for StdTcpStream {
+        async fn write(&mut self, buf: &[u8]) -> CoreResult<usize, Self::Error> {
+            self.0.write(buf).await
+        }
+
+        async fn flush(&mut self) -> CoreResult<(), Self::Error> {
+            self.0.flush().await
+        }
+    }
+
+    fn backend(base_url: &str) -> OpenCodeBackend<StdTcp, StdDns> {
+        static TCP: StdTcp = StdTcp;
+        static DNS: StdDns = StdDns;
+        OpenCodeBackend::new(base_url, &TCP, &DNS)
+    }
+
+    fn content_length(headers: &str) -> usize {
+        headers
+            .split("\r\n")
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    async fn spawn_capture_server(
+        response_body: &'static str,
+    ) -> (String, oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut total_len = None;
+
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+
+                if total_len.is_none() {
+                    if let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let header_end = header_end + 4;
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        total_len = Some(header_end + content_length(&headers));
+                    }
+                }
+
+                if let Some(total_len) = total_len {
+                    if request.len() >= total_len {
+                        break;
+                    }
+                }
+            }
+
+            let response = alloc::format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body,
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let _ = tx.send(String::from_utf8(request).unwrap());
+        });
+
+        (alloc::format!("http://127.0.0.1:{}", addr.port()), rx)
+    }
+
     #[test]
     fn model_list_parses_compact_fields_and_ignores_heavy_payloads() {
         let raw = br#"[
@@ -573,5 +763,61 @@ mod tests {
                 .and_then(|caps| caps.tool_call),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn reply_permission_uses_request_id_route_and_json_body() {
+        let (base_url, request_rx) = spawn_capture_server("").await;
+        let mut backend = backend(&base_url);
+
+        backend
+            .reply_permission(&PermissionReply {
+                session_id: "session-1".into(),
+                request_id: "permission-1".into(),
+                reply: "once".into(),
+            })
+            .await
+            .unwrap();
+
+        let request = request_rx.await.unwrap();
+        assert!(request.contains("POST /permission/permission-1/reply HTTP/1.1"));
+        assert_eq!(
+            request.split("\r\n\r\n").nth(1).unwrap_or(""),
+            "{\"reply\":\"once\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_question_uses_request_id_route_and_nested_answers_body() {
+        let (base_url, request_rx) = spawn_capture_server("").await;
+        let mut backend = backend(&base_url);
+
+        backend
+            .reply_question(&QuestionReply {
+                session_id: "session-1".into(),
+                request_id: "question-1".into(),
+                answers: vec![vec!["A".into()], vec!["custom".into(), "extra".into()]],
+            })
+            .await
+            .unwrap();
+
+        let request = request_rx.await.unwrap();
+        assert!(request.contains("POST /question/question-1/reply HTTP/1.1"));
+        assert_eq!(
+            request.split("\r\n\r\n").nth(1).unwrap_or(""),
+            "{\"answers\":[[\"A\"],[\"custom\",\"extra\"]]}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_question_uses_request_id_route_without_body() {
+        let (base_url, request_rx) = spawn_capture_server("").await;
+        let mut backend = backend(&base_url);
+
+        backend.reject_question("question-1").await.unwrap();
+
+        let request = request_rx.await.unwrap();
+        assert!(request.contains("POST /question/question-1/reject HTTP/1.1"));
+        assert_eq!(request.split("\r\n\r\n").nth(1).unwrap_or(""), "");
     }
 }
