@@ -245,6 +245,7 @@ pub struct App<B: Backend> {
     terminal: TerminalPane,
     // Session cache for modals
     cached_sessions: Vec<ocpncord_backend::Session>,
+    model_cache: Option<Vec<ocpncord_backend::ModelSummary>>,
     // Permission & Question pending queues
     pending_permissions:
         alloc::collections::VecDeque<(ocpncord_backend::PermissionRequest, String)>,
@@ -299,6 +300,7 @@ impl<B: Backend> App<B> {
             terminal: TerminalPane::new(),
             sync_stream: None,
             cached_sessions: Vec::new(),
+            model_cache: None,
             pending_permissions: alloc::collections::VecDeque::new(),
             pending_questions: alloc::collections::VecDeque::new(),
             toasts: alloc::collections::VecDeque::new(),
@@ -1043,15 +1045,7 @@ impl<B: Backend> App<B> {
         match text {
             "/models" | "/settings" | "/config" => {
                 self.prompt_bar.clear();
-                let mut modal = ModelPickerModal::new();
-                match self.backend.get_config().await {
-                    Ok(config) => match self.backend.list_models().await {
-                        Ok(catalog) => modal.set_catalog(config, catalog),
-                        Err(_) => modal.set_config(config),
-                    },
-                    Err(e) => modal.set_error(alloc::format!("{}", e)),
-                }
-                self.active_modal = Some(Box::new(modal));
+                self.open_model_picker().await;
                 true
             }
             "/new" => {
@@ -1176,6 +1170,26 @@ impl<B: Backend> App<B> {
         true
     }
 
+    async fn open_model_picker(&mut self) {
+        let mut modal = ModelPickerModal::new();
+        match self.backend.get_config().await {
+            Ok(config) => {
+                if self.model_cache.is_none() {
+                    if let Ok(models) = self.backend.list_models().await {
+                        self.model_cache = Some(models);
+                    }
+                }
+                if let Some(models) = self.model_cache.as_ref() {
+                    modal.set_models_from_config(config, models);
+                } else {
+                    modal.set_config(config);
+                }
+            }
+            Err(e) => modal.set_error(alloc::format!("{}", e)),
+        }
+        self.active_modal = Some(Box::new(modal));
+    }
+
     async fn handle_slash_command_inner(&mut self, text: &str) {
         match text {
             "/sessions" => {
@@ -1189,15 +1203,7 @@ impl<B: Backend> App<B> {
             }
             "/models" | "/settings" | "/config" => {
                 self.prompt_bar.clear();
-                let mut modal = ModelPickerModal::new();
-                match self.backend.get_config().await {
-                    Ok(config) => match self.backend.list_models().await {
-                        Ok(catalog) => modal.set_catalog(config, catalog),
-                        Err(_) => modal.set_config(config),
-                    },
-                    Err(e) => modal.set_error(alloc::format!("{}", e)),
-                }
-                self.active_modal = Some(Box::new(modal));
+                self.open_model_picker().await;
             }
             "/new" => {
                 match self.backend.create_session("Chat", "").await {
@@ -1270,29 +1276,13 @@ impl<B: Backend> App<B> {
                 self.active_modal = Some(Box::new(modal));
             }
             Some(Action::OpenModal(ModalId::ModelPicker)) => {
-                let mut modal = ModelPickerModal::new();
-                match self.backend.get_config().await {
-                    Ok(config) => match self.backend.list_models().await {
-                        Ok(catalog) => modal.set_catalog(config, catalog),
-                        Err(_) => modal.set_config(config),
-                    },
-                    Err(e) => modal.set_error(alloc::format!("{}", e)),
-                }
-                self.active_modal = Some(Box::new(modal));
+                self.open_model_picker().await;
             }
             Some(Action::OpenModal(ModalId::Help)) => {
                 self.active_modal = Some(Box::new(HelpModal::new()));
             }
             Some(Action::OpenModal(ModalId::Settings)) => {
-                let mut modal = ModelPickerModal::new();
-                match self.backend.get_config().await {
-                    Ok(config) => match self.backend.list_models().await {
-                        Ok(catalog) => modal.set_catalog(config, catalog),
-                        Err(_) => modal.set_config(config),
-                    },
-                    Err(e) => modal.set_error(alloc::format!("{}", e)),
-                }
-                self.active_modal = Some(Box::new(modal));
+                self.open_model_picker().await;
             }
             Some(Action::OpenModal(ModalId::PermissionApproval)) => {}
             Some(Action::OpenModal(ModalId::QuestionApproval)) => {}
@@ -1394,15 +1384,7 @@ impl<B: Backend> App<B> {
                 self.active_screen = ScreenId::Chat;
             }
             Some(Action::OpenSettings) => {
-                let mut modal = ModelPickerModal::new();
-                match self.backend.get_config().await {
-                    Ok(config) => match self.backend.list_models().await {
-                        Ok(catalog) => modal.set_catalog(config, catalog),
-                        Err(_) => modal.set_config(config),
-                    },
-                    Err(e) => modal.set_error(alloc::format!("{}", e)),
-                }
-                self.active_modal = Some(Box::new(modal));
+                self.open_model_picker().await;
             }
             Some(Action::SelectModel(ref model)) => {
                 let mut modal = ModelPickerModal::new();
@@ -1417,8 +1399,8 @@ impl<B: Backend> App<B> {
                                     } else {
                                         updated
                                     };
-                                if let Ok(catalog) = self.backend.list_models().await {
-                                    modal.set_catalog(display_config, catalog);
+                                if let Some(models) = self.model_cache.as_ref() {
+                                    modal.set_models_from_config(display_config, models);
                                 } else {
                                     modal.set_config(display_config);
                                 }
@@ -3368,6 +3350,34 @@ mod tests {
             app.active_modal().is_some(),
             "Ctrl+X M should open the model picker modal"
         );
+    }
+
+    #[test]
+    fn model_picker_reuses_cached_model_list() {
+        let mut backend = MockBackend::default();
+        backend.models = Some(vec![ocpncord_backend::ModelSummary {
+            id: "claude-sonnet".into(),
+            provider_id: "anthropic".into(),
+            name: Some("Claude Sonnet".into()),
+            ..Default::default()
+        }]);
+        let mut app = App::new(backend);
+
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('m'));
+        assert_eq!(app.backend().list_models_calls, 1);
+
+        run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Escape,
+                modifiers: Modifiers::default(),
+            }),
+        );
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('m'));
+
+        assert_eq!(app.backend().list_models_calls, 1);
     }
 
     #[test]

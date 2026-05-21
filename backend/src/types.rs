@@ -378,33 +378,14 @@ pub struct ModelConfig {
     pub tool_call: Option<bool>,
 }
 
-// --- Model catalog ---
+// --- Models ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct ModelCatalog {
-    #[serde(default)]
-    pub all: Vec<CatalogProvider>,
-    #[serde(default)]
-    pub connected: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct CatalogProvider {
+pub struct ModelSummary {
     pub id: String,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub models: BTreeMap<String, CatalogModel>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct CatalogModel {
-    pub id: String,
-    #[serde(default, rename = "providerID")]
-    pub provider_id: Option<String>,
+    #[serde(rename = "providerID")]
+    pub provider_id: String,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]

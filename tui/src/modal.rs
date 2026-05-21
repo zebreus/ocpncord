@@ -4,6 +4,8 @@ use ratatui::Frame;
 use crate::event::{Event, Scancode};
 use crate::screen::Action;
 use crate::theme::Theme;
+use alloc::collections::BTreeMap;
+use core::cell::Cell;
 
 /// An overlay dialog drawn on top of a full-screen view.
 pub trait Modal {
@@ -24,7 +26,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use ocpncord_backend::{Config, ModelCatalog, Session};
+use ocpncord_backend::{Config, ModelSummary, Session};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{
     List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -245,8 +247,11 @@ pub struct ModelPickerModal {
     current_model: Option<String>,
     agent_model: Option<String>,
     models: Vec<ModelChoice>,
+    filtered_indices: Vec<usize>,
+    search: String,
     selected: usize,
     scroll: u16,
+    visible_rows: Cell<u16>,
     error: Option<String>,
 }
 
@@ -254,6 +259,8 @@ pub struct ModelPickerModal {
 struct ModelChoice {
     id: String,
     label: String,
+    provider: String,
+    family: Option<String>,
     details: String,
 }
 
@@ -263,8 +270,11 @@ impl ModelPickerModal {
             current_model: None,
             agent_model: None,
             models: Vec::new(),
+            filtered_indices: Vec::new(),
+            search: String::new(),
             selected: 0,
             scroll: 0,
+            visible_rows: Cell::new(10),
             error: None,
         }
     }
@@ -286,15 +296,16 @@ impl ModelPickerModal {
                 let full_id = format!("{provider_id}/{model_id}");
                 let model_label = model
                     .name
+                    .clone()
                     .unwrap_or_else(|| model.id.clone().unwrap_or_else(|| model_id.clone()));
                 let mut detail = provider_label.clone();
-                if let Some(family) = model.family {
+                if let Some(family) = &model.family {
                     detail.push_str(" - ");
-                    detail.push_str(&family);
+                    detail.push_str(family);
                 }
-                if let Some(status) = model.status {
+                if let Some(status) = &model.status {
                     detail.push_str(" - ");
-                    detail.push_str(&status);
+                    detail.push_str(status);
                 }
                 if model.reasoning == Some(true) {
                     detail.push_str(" - reasoning");
@@ -305,21 +316,16 @@ impl ModelPickerModal {
                 models.push(ModelChoice {
                     id: full_id,
                     label: model_label,
+                    provider: provider_id.clone(),
+                    family: model.family.clone(),
                     details: detail,
                 });
             }
         }
-        models.sort_by(|a, b| a.id.cmp(&b.id));
-        self.selected = self
-            .current_model
-            .as_ref()
-            .and_then(|current| models.iter().position(|choice| &choice.id == current))
-            .unwrap_or(0);
-        self.scroll = self.selected.saturating_sub(4) as u16;
-        self.models = models;
+        self.set_models(models);
     }
 
-    pub fn set_catalog(&mut self, config: Config, catalog: ModelCatalog) {
+    pub fn set_models_from_config(&mut self, config: Config, models: &[ModelSummary]) {
         self.current_model = config.model.clone();
         self.agent_model = config
             .agent
@@ -327,25 +333,19 @@ impl ModelPickerModal {
             .and_then(|agent| agent.model.clone())
             .or_else(|| config.agent.values().find_map(|agent| agent.model.clone()));
 
-        let mut models = Vec::new();
-        for provider in catalog.all {
-            let provider_id = provider.id;
-            let provider_label = provider.name.unwrap_or_else(|| provider_id.clone());
-            for (model_key, model) in provider.models {
-                let model_id = model.id;
-                let model_provider = model.provider_id.unwrap_or_else(|| provider_id.clone());
-                let full_id = format!("{model_provider}/{model_id}");
-                let model_label = model.name.unwrap_or(model_key);
-                let mut detail = provider_label.clone();
-                if let Some(family) = model.family {
+        let mut choices: Vec<ModelChoice> = models
+            .iter()
+            .map(|model| {
+                let mut detail = model.provider_id.clone();
+                if let Some(family) = &model.family {
                     detail.push_str(" - ");
-                    detail.push_str(&family);
+                    detail.push_str(family);
                 }
-                if let Some(status) = model.status {
+                if let Some(status) = &model.status {
                     detail.push_str(" - ");
-                    detail.push_str(&status);
+                    detail.push_str(status);
                 }
-                if let Some(capabilities) = model.capabilities {
+                if let Some(capabilities) = &model.capabilities {
                     if capabilities.reasoning == Some(true) {
                         detail.push_str(" - reasoning");
                     }
@@ -356,21 +356,178 @@ impl ModelPickerModal {
                         detail.push_str(" - attachments");
                     }
                 }
-                models.push(ModelChoice {
+                ModelChoice {
+                    id: format!("{}/{}", model.provider_id, model.id),
+                    label: model.name.clone().unwrap_or_else(|| model.id.clone()),
+                    provider: model.provider_id.clone(),
+                    family: model.family.clone(),
+                    details: detail,
+                }
+            })
+            .collect();
+
+        for (provider_id, provider) in config.provider {
+            let provider_label = provider
+                .name
+                .unwrap_or_else(|| provider.id.clone().unwrap_or_else(|| provider_id.clone()));
+            for (model_id, model) in provider.models {
+                let full_id = format!("{provider_id}/{model_id}");
+                let model_label = model
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| model.id.clone().unwrap_or_else(|| model_id.clone()));
+                let mut detail = provider_label.clone();
+                if let Some(family) = &model.family {
+                    detail.push_str(" - ");
+                    detail.push_str(family);
+                }
+                if let Some(status) = &model.status {
+                    detail.push_str(" - ");
+                    detail.push_str(status);
+                }
+                if model.reasoning == Some(true) {
+                    detail.push_str(" - reasoning");
+                }
+                if model.tool_call == Some(true) {
+                    detail.push_str(" - tools");
+                }
+                choices.push(ModelChoice {
                     id: full_id,
                     label: model_label,
+                    provider: provider_id.clone(),
+                    family: model.family.clone(),
                     details: detail,
                 });
             }
         }
-        models.sort_by(|a, b| a.id.cmp(&b.id));
+        self.set_models(choices);
+    }
+    fn set_models(&mut self, mut models: Vec<ModelChoice>) {
+        let mut unique = BTreeMap::new();
+        for model in models.drain(..) {
+            if !unique.contains_key(&model.id) {
+                unique.insert(model.id.clone(), model);
+            }
+        }
+        self.models = unique.into_values().collect();
+        self.refilter();
         self.selected = self
             .current_model
             .as_ref()
-            .and_then(|current| models.iter().position(|choice| &choice.id == current))
+            .and_then(|current| {
+                self.filtered_indices
+                    .iter()
+                    .position(|index| self.models[*index].id == *current)
+            })
             .unwrap_or(0);
-        self.scroll = self.selected.saturating_sub(4) as u16;
-        self.models = models;
+        self.ensure_selected_visible(self.visible_rows.get());
+    }
+
+    fn refilter(&mut self) {
+        let query = self.search.to_lowercase();
+        self.filtered_indices = self
+            .models
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, choice)| {
+                if query.is_empty()
+                    || choice.id.to_lowercase().contains(&query)
+                    || choice.label.to_lowercase().contains(&query)
+                    || choice.provider.to_lowercase().contains(&query)
+                    || choice
+                        .family
+                        .as_deref()
+                        .map(|family| family.to_lowercase().contains(&query))
+                        .unwrap_or(false)
+                {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if self.filtered_indices.is_empty() {
+            self.selected = 0;
+            self.scroll = 0;
+        } else {
+            self.selected = self.selected.min(self.filtered_indices.len() - 1);
+            self.ensure_selected_visible(self.visible_rows.get());
+        }
+    }
+
+    fn filtered_len(&self) -> usize {
+        self.filtered_indices.len()
+    }
+
+    fn set_search(&mut self, search: String) {
+        self.search = search;
+        self.selected = 0;
+        self.scroll = 0;
+        self.refilter();
+    }
+
+    pub fn search(&self) -> &str {
+        &self.search
+    }
+
+    pub fn visible_model_count(&self) -> usize {
+        self.filtered_len()
+    }
+
+    pub fn scroll_offset(&self) -> u16 {
+        self.scroll
+    }
+
+    pub fn search_matches(&self, model: &str) -> bool {
+        self.filtered_indices
+            .iter()
+            .any(|index| self.models[*index].id == model)
+    }
+
+    pub fn set_visible_rows_for_test(&self, rows: u16) {
+        self.visible_rows.set(rows);
+    }
+
+    fn current_marker(&self, choice: &ModelChoice) -> &'static str {
+        if Some(choice.id.as_str()) == self.current_model.as_deref() {
+            "*"
+        } else {
+            " "
+        }
+    }
+
+    fn move_selected(&mut self, delta: isize) {
+        if self.filtered_indices.is_empty() {
+            self.selected = 0;
+            self.scroll = 0;
+            return;
+        }
+        if delta < 0 {
+            self.selected = self.selected.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.selected = (self.selected + delta as usize).min(self.filtered_indices.len() - 1);
+        }
+        self.ensure_selected_visible(self.visible_rows.get());
+    }
+
+    fn page_amount(&self) -> usize {
+        self.visible_rows.get().max(1) as usize
+    }
+
+    fn search_input(&mut self, scancode: Scancode) -> bool {
+        match scancode {
+            Scancode::Char(c) => {
+                self.search.push(c);
+                self.set_search(self.search.clone());
+                true
+            }
+            Scancode::Backspace => {
+                self.search.pop();
+                self.set_search(self.search.clone());
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn set_error(&mut self, error: String) {
@@ -379,7 +536,7 @@ impl ModelPickerModal {
 
     pub fn selected_model(&self) -> Option<&str> {
         self.models
-            .get(self.selected)
+            .get(*self.filtered_indices.get(self.selected)?)
             .map(|choice| choice.id.as_str())
     }
 
@@ -424,33 +581,48 @@ impl Modal for ModelPickerModal {
             .style(theme.text_dim)
             .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
 
+        let search_label =
+            fit_with_ellipsis(format!("Search: {}", self.search), area.width as usize);
+        Text::from(search_label).style(theme.text).render(
+            Rect::new(area.x, area.y + 1, area.width, 1),
+            frame.buffer_mut(),
+        );
+
         if self.models.is_empty() {
             Text::from("No models found in server config")
                 .style(theme.text_dim)
                 .render(
-                    Rect::new(area.x, area.y + 2, area.width, 1.min(area.height)),
+                    Rect::new(area.x, area.y + 3, area.width, 1.min(area.height)),
                     frame.buffer_mut(),
                 );
             return;
         }
 
-        let list_y = area.y.saturating_add(2);
+        if self.filtered_indices.is_empty() {
+            Text::from("No models match search")
+                .style(theme.text_dim)
+                .render(
+                    Rect::new(area.x, area.y + 3, area.width, 1.min(area.height)),
+                    frame.buffer_mut(),
+                );
+            return;
+        }
+
+        let list_y = area.y.saturating_add(3);
         if list_y >= area.bottom() {
             return;
         }
         let list_area = Rect::new(area.x, list_y, area.width, area.bottom() - list_y);
         let visible_rows = list_area.height.max(1);
+        self.visible_rows.set(visible_rows);
         let rows: Vec<ListItem<'_>> = self
-            .models
+            .filtered_indices
             .iter()
             .skip(self.scroll as usize)
             .take(visible_rows as usize)
+            .filter_map(|model_index| self.models.get(*model_index))
             .map(|choice| {
-                let marker = if Some(choice.id.as_str()) == self.current_model.as_deref() {
-                    "*"
-                } else {
-                    " "
-                };
+                let marker = self.current_marker(choice);
                 let display = format!("{marker} {}  [{}]", choice.label, choice.details);
                 ListItem::new(Line::from(fit_with_ellipsis(
                     display,
@@ -469,9 +641,9 @@ impl Modal for ModelPickerModal {
             &mut state,
         );
 
-        if self.models.len() > visible_rows as usize {
+        if self.filtered_indices.len() > visible_rows as usize {
             let mut scroll_state =
-                ScrollbarState::new(self.models.len()).position(self.scroll as usize);
+                ScrollbarState::new(self.filtered_indices.len()).position(self.scroll as usize);
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .thumb_style(theme.scrollbar)
                 .render(list_area, frame.buffer_mut(), &mut scroll_state);
@@ -483,33 +655,26 @@ impl Modal for ModelPickerModal {
             Event::Key(key) => match key.scancode {
                 Scancode::Escape => Action::CloseModal,
                 Scancode::Up => {
-                    self.selected = self.selected.saturating_sub(1);
-                    self.ensure_selected_visible(1);
+                    self.move_selected(-1);
                     Action::None
                 }
                 Scancode::Down => {
-                    if !self.models.is_empty() {
-                        self.selected = (self.selected + 1).min(self.models.len() - 1);
-                    }
-                    self.ensure_selected_visible(1);
+                    self.move_selected(1);
                     Action::None
                 }
                 Scancode::PageUp => {
-                    self.selected = self.selected.saturating_sub(10);
-                    self.ensure_selected_visible(1);
+                    self.move_selected(-(self.page_amount() as isize));
                     Action::None
                 }
                 Scancode::PageDown => {
-                    if !self.models.is_empty() {
-                        self.selected = (self.selected + 10).min(self.models.len() - 1);
-                    }
-                    self.ensure_selected_visible(1);
+                    self.move_selected(self.page_amount() as isize);
                     Action::None
                 }
                 Scancode::Enter => self
                     .selected_model()
                     .map(|model| Action::SelectModel(model.to_string()))
                     .unwrap_or(Action::None),
+                scancode if self.search_input(scancode) => Action::None,
                 _ => Action::None,
             },
             _ => Action::None,
@@ -729,31 +894,22 @@ mod tests {
 
     #[test]
     fn model_picker_shows_models_from_catalog() {
-        use ocpncord_backend::{CatalogModel, CatalogProvider, Config, ModelCatalog};
-        let catalog = ModelCatalog {
-            all: vec![CatalogProvider {
-                id: "openrouter".into(),
-                name: Some("OpenRouter".into()),
-                models: BTreeMap::from([(
-                    "anthropic/claude-sonnet-4".into(),
-                    CatalogModel {
-                        id: "anthropic/claude-sonnet-4".into(),
-                        name: Some("Claude Sonnet 4".into()),
-                        ..Default::default()
-                    },
-                )]),
-            }],
-            connected: vec!["openrouter".into()],
-        };
+        use ocpncord_backend::{Config, ModelSummary};
+        let models = vec![ModelSummary {
+            id: "anthropic/claude-sonnet-4".into(),
+            provider_id: "openrouter".into(),
+            name: Some("Claude Sonnet 4".into()),
+            ..Default::default()
+        }];
         let mut modal = ModelPickerModal::new();
-        modal.set_catalog(
+        modal.set_models_from_config(
             Config {
                 model: Some("openrouter/anthropic/claude-sonnet-4".into()),
                 username: None,
                 provider: Default::default(),
                 agent: Default::default(),
             },
-            catalog,
+            &models,
         );
 
         let theme = Theme::default();
@@ -776,6 +932,167 @@ mod tests {
             "Catalog model should appear. Screen: {}",
             screen
         );
+    }
+
+    #[test]
+    fn model_picker_search_filters_by_name_provider_id_and_family() {
+        use ocpncord_backend::{Config, ModelSummary};
+        let mut modal = ModelPickerModal::new();
+        modal.set_models_from_config(
+            Config::default(),
+            &[
+                ModelSummary {
+                    id: "claude-sonnet".into(),
+                    provider_id: "anthropic".into(),
+                    name: Some("Claude Sonnet".into()),
+                    family: Some("claude".into()),
+                    ..Default::default()
+                },
+                ModelSummary {
+                    id: "gpt-4".into(),
+                    provider_id: "openai".into(),
+                    name: Some("GPT-4".into()),
+                    family: Some("gpt".into()),
+                    ..Default::default()
+                },
+            ],
+        );
+
+        modal.handle_event(Event::Key(crate::event::KeyEvent {
+            scancode: Scancode::Char('c'),
+            modifiers: Default::default(),
+        }));
+        modal.handle_event(Event::Key(crate::event::KeyEvent {
+            scancode: Scancode::Char('l'),
+            modifiers: Default::default(),
+        }));
+
+        assert_eq!(modal.search(), "cl");
+        assert_eq!(modal.visible_model_count(), 1);
+        assert!(modal.search_matches("anthropic/claude-sonnet"));
+        assert!(!modal.search_matches("openai/gpt-4"));
+    }
+
+    #[test]
+    fn model_picker_search_backspace_restores_matches() {
+        use ocpncord_backend::{Config, ModelSummary};
+        let mut modal = ModelPickerModal::new();
+        modal.set_models_from_config(
+            Config::default(),
+            &[
+                ModelSummary {
+                    id: "claude-sonnet".into(),
+                    provider_id: "anthropic".into(),
+                    name: Some("Claude Sonnet".into()),
+                    ..Default::default()
+                },
+                ModelSummary {
+                    id: "gpt-4".into(),
+                    provider_id: "openai".into(),
+                    name: Some("GPT-4".into()),
+                    ..Default::default()
+                },
+            ],
+        );
+
+        modal.handle_event(Event::Key(crate::event::KeyEvent {
+            scancode: Scancode::Char('z'),
+            modifiers: Default::default(),
+        }));
+        assert_eq!(modal.visible_model_count(), 0);
+
+        modal.handle_event(Event::Key(crate::event::KeyEvent {
+            scancode: Scancode::Backspace,
+            modifiers: Default::default(),
+        }));
+        assert_eq!(modal.search(), "");
+        assert_eq!(modal.visible_model_count(), 2);
+    }
+
+    #[test]
+    fn model_picker_includes_custom_config_models_when_api_models_are_available() {
+        use ocpncord_backend::{Config, ModelConfig, ModelSummary, ProviderConfig};
+        let mut modal = ModelPickerModal::new();
+        modal.set_models_from_config(
+            Config {
+                model: None,
+                username: None,
+                provider: BTreeMap::from([(
+                    "openrouter-shortcut".into(),
+                    ProviderConfig {
+                        name: Some("OpenRouter Shortcut".into()),
+                        models: BTreeMap::from([(
+                            "big-pickle".into(),
+                            ModelConfig {
+                                name: Some("Big Pickle".into()),
+                                family: Some("pickle".into()),
+                                ..Default::default()
+                            },
+                        )]),
+                        ..Default::default()
+                    },
+                )]),
+                agent: Default::default(),
+            },
+            &[ModelSummary {
+                id: "claude-sonnet".into(),
+                provider_id: "anthropic".into(),
+                name: Some("Claude Sonnet".into()),
+                ..Default::default()
+            }],
+        );
+
+        modal.handle_event(Event::Key(crate::event::KeyEvent {
+            scancode: Scancode::Char('p'),
+            modifiers: Default::default(),
+        }));
+        modal.handle_event(Event::Key(crate::event::KeyEvent {
+            scancode: Scancode::Char('i'),
+            modifiers: Default::default(),
+        }));
+        modal.handle_event(Event::Key(crate::event::KeyEvent {
+            scancode: Scancode::Char('c'),
+            modifiers: Default::default(),
+        }));
+        modal.handle_event(Event::Key(crate::event::KeyEvent {
+            scancode: Scancode::Char('k'),
+            modifiers: Default::default(),
+        }));
+        modal.handle_event(Event::Key(crate::event::KeyEvent {
+            scancode: Scancode::Char('l'),
+            modifiers: Default::default(),
+        }));
+        modal.handle_event(Event::Key(crate::event::KeyEvent {
+            scancode: Scancode::Char('e'),
+            modifiers: Default::default(),
+        }));
+
+        assert_eq!(modal.visible_model_count(), 1);
+        assert!(modal.search_matches("openrouter-shortcut/big-pickle"));
+    }
+
+    #[test]
+    fn model_picker_page_down_uses_visible_row_count() {
+        use ocpncord_backend::{Config, ModelSummary};
+        let models: Vec<ModelSummary> = (0..20)
+            .map(|idx| ModelSummary {
+                id: alloc::format!("model-{idx:02}"),
+                provider_id: "provider".into(),
+                name: Some(alloc::format!("Model {idx:02}")),
+                ..Default::default()
+            })
+            .collect();
+        let mut modal = ModelPickerModal::new();
+        modal.set_models_from_config(Config::default(), &models);
+        modal.set_visible_rows_for_test(5);
+
+        modal.handle_event(Event::Key(crate::event::KeyEvent {
+            scancode: Scancode::PageDown,
+            modifiers: Default::default(),
+        }));
+
+        assert_eq!(modal.selected_index(), 5);
+        assert_eq!(modal.scroll_offset(), 1);
     }
 
     #[test]

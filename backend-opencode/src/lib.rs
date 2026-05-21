@@ -17,11 +17,12 @@ use ocpncord_backend::*;
 use reqwless::client::HttpClient;
 use reqwless::headers::ContentType;
 use reqwless::request::{Method, RequestBuilder};
+use serde::Deserialize;
 
 mod stream;
 pub use stream::{BufferedStream, SseParser};
 
-const RX_BUF_SIZE: usize = 1024 * 1024;
+const RX_BUF_SIZE: usize = 512 * 1024;
 
 /// An HTTP client for the opencode server REST API.
 ///
@@ -74,6 +75,58 @@ fn api_err(status: u16, body: &[u8]) -> BackendError {
         status,
         message: msg.into(),
     }
+}
+
+#[derive(Deserialize)]
+struct ConfigProvidersResponse {
+    #[serde(default)]
+    providers: Vec<ProviderModels>,
+}
+
+#[derive(Deserialize)]
+struct ProviderModels {
+    id: String,
+    #[serde(default)]
+    models: BTreeMap<String, ProviderModelSummary>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderModelSummary {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "providerID", default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    capabilities: Option<ModelCapabilities>,
+}
+
+fn parse_config_provider_models(body: &[u8]) -> Result<Vec<ModelSummary>> {
+    let response: ConfigProvidersResponse = serde_json::from_slice(body).map_err(parse_err)?;
+    let mut models = Vec::new();
+    for provider in response.providers {
+        for (model_key, model) in provider.models {
+            models.push(ModelSummary {
+                id: model.id.unwrap_or(model_key),
+                provider_id: model.provider_id.unwrap_or_else(|| provider.id.clone()),
+                name: model.name,
+                family: model.family,
+                status: model.status,
+                capabilities: model.capabilities,
+            });
+        }
+    }
+    Ok(models)
+}
+
+fn parse_api_models(body: &[u8]) -> Result<Vec<ModelSummary>> {
+    serde_json::from_slice(body).map_err(parse_err)
 }
 
 // --- Helper: send + check status + return body (blocking within the async fn) ---
@@ -358,30 +411,16 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
-    async fn list_models(&mut self) -> Result<ModelCatalog> {
-        let url = alloc::format!("{}/api/model", self.base_url);
-        let body = self.send_get_body(Method::GET, &url, None).await?;
-        let models: Vec<CatalogModel> = serde_json::from_slice(&body).map_err(parse_err)?;
-        let mut providers: BTreeMap<String, CatalogProvider> = BTreeMap::new();
-        for model in models {
-            let Some(provider_id) = model.provider_id.clone() else {
-                continue;
-            };
-            let model_id = model.id.clone();
-            providers
-                .entry(provider_id.clone())
-                .or_insert_with(|| CatalogProvider {
-                    id: provider_id,
-                    name: None,
-                    models: BTreeMap::new(),
-                })
-                .models
-                .insert(model_id, model);
+    async fn list_models(&mut self) -> Result<Vec<ModelSummary>> {
+        let url = alloc::format!("{}/config/providers", self.base_url);
+        match self.send_get_body(Method::GET, &url, None).await {
+            Ok(body) => parse_config_provider_models(&body),
+            Err(_) => {
+                let url = alloc::format!("{}/api/model", self.base_url);
+                let body = self.send_get_body(Method::GET, &url, None).await?;
+                parse_api_models(&body)
+            }
         }
-        Ok(ModelCatalog {
-            all: providers.into_values().collect(),
-            connected: Vec::new(),
-        })
     }
 
     async fn set_auth(&mut self, provider: &str, api_key: &str) -> Result<()> {
@@ -448,5 +487,91 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         let url = alloc::format!("{}/auth/{provider}", self.base_url);
         self.send_get_body(Method::DELETE, &url, None).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn model_list_parses_compact_fields_and_ignores_heavy_payloads() {
+        let raw = br#"[
+            {
+                "id": "anthropic/claude-sonnet-4",
+                "providerID": "openrouter",
+                "name": "Claude Sonnet 4",
+                "family": "claude",
+                "status": "available",
+                "capabilities": {
+                    "tools": true,
+                    "attachment": false,
+                    "input": ["text"],
+                    "output": ["text"]
+                },
+                "options": {
+                    "temperature": {"type": "number"},
+                    "topP": {"type": "number"}
+                }
+            }
+        ]"#;
+
+        let models = super::parse_api_models(raw).unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "anthropic/claude-sonnet-4");
+        assert_eq!(models[0].provider_id, "openrouter");
+        assert_eq!(models[0].name.as_deref(), Some("Claude Sonnet 4"));
+        assert_eq!(
+            models[0]
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.tool_call),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn config_provider_models_include_opencode_zen_entries() {
+        let raw = br#"{
+            "default": "opencode/big-pickle",
+            "providers": [
+                {
+                    "id": "opencode",
+                    "name": "OpenCode Zen",
+                    "models": {
+                        "big-pickle": {
+                            "id": "big-pickle",
+                            "providerID": "opencode",
+                            "name": "Big Pickle",
+                            "family": "big-pickle",
+                            "status": "active",
+                            "capabilities": {
+                                "reasoning": true,
+                                "toolcall": true,
+                                "attachment": false,
+                                "input": {"text": true},
+                                "output": {"text": true}
+                            },
+                            "options": {},
+                            "variants": {}
+                        }
+                    }
+                }
+            ]
+        }"#;
+
+        let models = super::parse_config_provider_models(raw).unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "big-pickle");
+        assert_eq!(models[0].provider_id, "opencode");
+        assert_eq!(models[0].name.as_deref(), Some("Big Pickle"));
+        assert_eq!(models[0].family.as_deref(), Some("big-pickle"));
+        assert_eq!(
+            models[0]
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.tool_call),
+            Some(true)
+        );
     }
 }

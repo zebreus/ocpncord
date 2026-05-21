@@ -350,7 +350,7 @@ pub trait Backend {
 
     async fn get_config(&mut self) -> Result<Config>;
 
-    async fn list_models(&mut self) -> Result<ModelCatalog>;
+    async fn list_models(&mut self) -> Result<Vec<ModelSummary>>;
 
     async fn set_auth(&mut self, provider: &str, api_key: &str) -> Result<()>;
 
