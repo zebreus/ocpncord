@@ -24,7 +24,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use ocpncord_backend::{Config, Session};
+use ocpncord_backend::{Config, ModelCatalog, Session};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{
     List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -301,6 +301,60 @@ impl ModelPickerModal {
                 }
                 if model.tool_call == Some(true) {
                     detail.push_str(" - tools");
+                }
+                models.push(ModelChoice {
+                    id: full_id,
+                    label: model_label,
+                    details: detail,
+                });
+            }
+        }
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        self.selected = self
+            .current_model
+            .as_ref()
+            .and_then(|current| models.iter().position(|choice| &choice.id == current))
+            .unwrap_or(0);
+        self.scroll = self.selected.saturating_sub(4) as u16;
+        self.models = models;
+    }
+
+    pub fn set_catalog(&mut self, config: Config, catalog: ModelCatalog) {
+        self.current_model = config.model.clone();
+        self.agent_model = config
+            .agent
+            .get("build")
+            .and_then(|agent| agent.model.clone())
+            .or_else(|| config.agent.values().find_map(|agent| agent.model.clone()));
+
+        let mut models = Vec::new();
+        for provider in catalog.all {
+            let provider_id = provider.id;
+            let provider_label = provider.name.unwrap_or_else(|| provider_id.clone());
+            for (model_key, model) in provider.models {
+                let model_id = model.id;
+                let model_provider = model.provider_id.unwrap_or_else(|| provider_id.clone());
+                let full_id = format!("{model_provider}/{model_id}");
+                let model_label = model.name.unwrap_or(model_key);
+                let mut detail = provider_label.clone();
+                if let Some(family) = model.family {
+                    detail.push_str(" - ");
+                    detail.push_str(&family);
+                }
+                if let Some(status) = model.status {
+                    detail.push_str(" - ");
+                    detail.push_str(&status);
+                }
+                if let Some(capabilities) = model.capabilities {
+                    if capabilities.reasoning == Some(true) {
+                        detail.push_str(" - reasoning");
+                    }
+                    if capabilities.tool_call == Some(true) {
+                        detail.push_str(" - tools");
+                    }
+                    if capabilities.attachment == Some(true) {
+                        detail.push_str(" - attachments");
+                    }
                 }
                 models.push(ModelChoice {
                     id: full_id,
@@ -669,6 +723,57 @@ mod tests {
         assert!(
             screen.contains("GPT-4"),
             "Model name 'GPT-4' should appear. Screen: {}",
+            screen
+        );
+    }
+
+    #[test]
+    fn model_picker_shows_models_from_catalog() {
+        use ocpncord_backend::{CatalogModel, CatalogProvider, Config, ModelCatalog};
+        let catalog = ModelCatalog {
+            all: vec![CatalogProvider {
+                id: "openrouter".into(),
+                name: Some("OpenRouter".into()),
+                models: BTreeMap::from([(
+                    "anthropic/claude-sonnet-4".into(),
+                    CatalogModel {
+                        id: "anthropic/claude-sonnet-4".into(),
+                        name: Some("Claude Sonnet 4".into()),
+                        ..Default::default()
+                    },
+                )]),
+            }],
+            connected: vec!["openrouter".into()],
+        };
+        let mut modal = ModelPickerModal::new();
+        modal.set_catalog(
+            Config {
+                model: Some("openrouter/anthropic/claude-sonnet-4".into()),
+                username: None,
+                provider: Default::default(),
+                agent: Default::default(),
+            },
+            catalog,
+        );
+
+        let theme = Theme::default();
+        let backend = TestBackend::new(70, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                Modal::render(&modal, frame, &theme, Rect::new(5, 5, 60, 10));
+            })
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("Claude Sonnet 4"),
+            "Catalog model should appear. Screen: {}",
             screen
         );
     }

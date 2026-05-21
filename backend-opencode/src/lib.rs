@@ -6,6 +6,7 @@ extern crate alloc;
 
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -20,7 +21,7 @@ use reqwless::request::{Method, RequestBuilder};
 mod stream;
 pub use stream::{BufferedStream, SseParser};
 
-const RX_BUF_SIZE: usize = 65536;
+const RX_BUF_SIZE: usize = 1024 * 1024;
 
 /// An HTTP client for the opencode server REST API.
 ///
@@ -31,7 +32,7 @@ pub struct OpenCodeBackend<
     D: embedded_nal_async::Dns + 'static,
 > {
     base_url: String,
-    rx_buf: [u8; RX_BUF_SIZE],
+    rx_buf: Vec<u8>,
     transport: &'static T,
     dns: &'static D,
 }
@@ -42,7 +43,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
     pub fn new(base_url: &str, transport: &'static T, dns: &'static D) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_owned(),
-            rx_buf: [0; RX_BUF_SIZE],
+            rx_buf: vec![0; RX_BUF_SIZE],
             transport,
             dns,
         }
@@ -355,6 +356,32 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         let url = alloc::format!("{}/global/config", self.base_url);
         let body = self.send_get_body(Method::GET, &url, None).await?;
         serde_json::from_slice(&body).map_err(parse_err)
+    }
+
+    async fn list_models(&mut self) -> Result<ModelCatalog> {
+        let url = alloc::format!("{}/api/model", self.base_url);
+        let body = self.send_get_body(Method::GET, &url, None).await?;
+        let models: Vec<CatalogModel> = serde_json::from_slice(&body).map_err(parse_err)?;
+        let mut providers: BTreeMap<String, CatalogProvider> = BTreeMap::new();
+        for model in models {
+            let Some(provider_id) = model.provider_id.clone() else {
+                continue;
+            };
+            let model_id = model.id.clone();
+            providers
+                .entry(provider_id.clone())
+                .or_insert_with(|| CatalogProvider {
+                    id: provider_id,
+                    name: None,
+                    models: BTreeMap::new(),
+                })
+                .models
+                .insert(model_id, model);
+        }
+        Ok(ModelCatalog {
+            all: providers.into_values().collect(),
+            connected: Vec::new(),
+        })
     }
 
     async fn set_auth(&mut self, provider: &str, api_key: &str) -> Result<()> {

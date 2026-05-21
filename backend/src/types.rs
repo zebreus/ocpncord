@@ -378,6 +378,54 @@ pub struct ModelConfig {
     pub tool_call: Option<bool>,
 }
 
+// --- Model catalog ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalog {
+    #[serde(default)]
+    pub all: Vec<CatalogProvider>,
+    #[serde(default)]
+    pub connected: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogProvider {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub models: BTreeMap<String, CatalogModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogModel {
+    pub id: String,
+    #[serde(default, rename = "providerID")]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub family: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub capabilities: Option<ModelCapabilities>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCapabilities {
+    #[serde(default)]
+    pub reasoning: Option<bool>,
+    #[serde(default, rename = "toolcall", alias = "tools")]
+    pub tool_call: Option<bool>,
+    #[serde(default)]
+    pub attachment: Option<bool>,
+}
+
 // --- Message response (raw from server) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

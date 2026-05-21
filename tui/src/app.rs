@@ -1045,7 +1045,10 @@ impl<B: Backend> App<B> {
                 self.prompt_bar.clear();
                 let mut modal = ModelPickerModal::new();
                 match self.backend.get_config().await {
-                    Ok(config) => modal.set_config(config),
+                    Ok(config) => match self.backend.list_models().await {
+                        Ok(catalog) => modal.set_catalog(config, catalog),
+                        Err(_) => modal.set_config(config),
+                    },
                     Err(e) => modal.set_error(alloc::format!("{}", e)),
                 }
                 self.active_modal = Some(Box::new(modal));
@@ -1188,7 +1191,10 @@ impl<B: Backend> App<B> {
                 self.prompt_bar.clear();
                 let mut modal = ModelPickerModal::new();
                 match self.backend.get_config().await {
-                    Ok(config) => modal.set_config(config),
+                    Ok(config) => match self.backend.list_models().await {
+                        Ok(catalog) => modal.set_catalog(config, catalog),
+                        Err(_) => modal.set_config(config),
+                    },
                     Err(e) => modal.set_error(alloc::format!("{}", e)),
                 }
                 self.active_modal = Some(Box::new(modal));
@@ -1266,7 +1272,10 @@ impl<B: Backend> App<B> {
             Some(Action::OpenModal(ModalId::ModelPicker)) => {
                 let mut modal = ModelPickerModal::new();
                 match self.backend.get_config().await {
-                    Ok(config) => modal.set_config(config),
+                    Ok(config) => match self.backend.list_models().await {
+                        Ok(catalog) => modal.set_catalog(config, catalog),
+                        Err(_) => modal.set_config(config),
+                    },
                     Err(e) => modal.set_error(alloc::format!("{}", e)),
                 }
                 self.active_modal = Some(Box::new(modal));
@@ -1277,7 +1286,10 @@ impl<B: Backend> App<B> {
             Some(Action::OpenModal(ModalId::Settings)) => {
                 let mut modal = ModelPickerModal::new();
                 match self.backend.get_config().await {
-                    Ok(config) => modal.set_config(config),
+                    Ok(config) => match self.backend.list_models().await {
+                        Ok(catalog) => modal.set_catalog(config, catalog),
+                        Err(_) => modal.set_config(config),
+                    },
                     Err(e) => modal.set_error(alloc::format!("{}", e)),
                 }
                 self.active_modal = Some(Box::new(modal));
@@ -1384,7 +1396,10 @@ impl<B: Backend> App<B> {
             Some(Action::OpenSettings) => {
                 let mut modal = ModelPickerModal::new();
                 match self.backend.get_config().await {
-                    Ok(config) => modal.set_config(config),
+                    Ok(config) => match self.backend.list_models().await {
+                        Ok(catalog) => modal.set_catalog(config, catalog),
+                        Err(_) => modal.set_config(config),
+                    },
                     Err(e) => modal.set_error(alloc::format!("{}", e)),
                 }
                 self.active_modal = Some(Box::new(modal));
@@ -1396,10 +1411,16 @@ impl<B: Backend> App<B> {
                         config.model = Some(model.clone());
                         match self.backend.set_config(&config).await {
                             Ok(updated) => {
-                                if updated.provider.is_empty() && !config.provider.is_empty() {
-                                    modal.set_config(config);
+                                let display_config =
+                                    if updated.provider.is_empty() && !config.provider.is_empty() {
+                                        config
+                                    } else {
+                                        updated
+                                    };
+                                if let Ok(catalog) = self.backend.list_models().await {
+                                    modal.set_catalog(display_config, catalog);
                                 } else {
-                                    modal.set_config(updated);
+                                    modal.set_config(display_config);
                                 }
                             }
                             Err(e) => modal.set_error(alloc::format!("{}", e)),

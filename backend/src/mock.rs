@@ -11,6 +11,7 @@ pub struct MockBackend {
     pub message_detail: Option<MessageDetail>,
     pub health_status: Option<Health>,
     pub config_info: Option<Config>,
+    pub model_catalog: Option<ModelCatalog>,
     pub agents: Vec<Agent>,
     pub prompt_events: Vec<Result<BackendEvent>>,
     pub event_events: Vec<Result<BackendEvent>>,
@@ -35,6 +36,7 @@ impl Default for MockBackend {
                 provider: Default::default(),
                 agent: Default::default(),
             }),
+            model_catalog: None,
             agents: Vec::new(),
             prompt_events: Vec::new(),
             event_events: Vec::new(),
@@ -177,6 +179,12 @@ impl Backend for MockBackend {
     async fn get_config(&mut self) -> Result<Config> {
         self.config_info.clone().ok_or(BackendError::Connection {
             message: "no config stub".into(),
+        })
+    }
+
+    async fn list_models(&mut self) -> Result<ModelCatalog> {
+        self.model_catalog.clone().ok_or(BackendError::Connection {
+            message: "no model catalog stub".into(),
         })
     }
 
