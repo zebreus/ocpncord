@@ -720,7 +720,7 @@ checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
 
 [[package]]
 name = "ocpncord-backend"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "futures-core",
  "serde",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "ocpncord-backend-opencode"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "embedded-io-async",
  "embedded-nal-async",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "ocpncord-native"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "clap",
  "crossterm",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "ocpncord-tui"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "futures",
  "futures-core",
