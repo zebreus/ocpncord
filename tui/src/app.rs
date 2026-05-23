@@ -5,7 +5,12 @@ use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::Cell;
+use core::future::Future;
+use core::ops::{Deref, DerefMut};
+use core::pin::Pin;
+use core::task::Poll;
 
+use futures_core::Stream;
 use ocpncord_backend::{Backend, BackendEvent};
 
 use crate::chat::{render_chat, Chat, ChatTranscript};
@@ -258,9 +263,110 @@ impl Default for TerminalPane {
     }
 }
 
+#[derive(Debug, Clone)]
+enum CreateSessionPurpose {
+    Send {
+        text: String,
+        mode: InputMode,
+        agent: String,
+    },
+    NewChat,
+}
+
+#[derive(Debug, Clone)]
+enum BackendOp {
+    LoadAgents,
+    Subscribe,
+    CreateSession {
+        title: String,
+        cwd: String,
+        purpose: CreateSessionPurpose,
+    },
+    Submit {
+        submission: Submission,
+    },
+    ReloadMessages {
+        session_id: String,
+        dispatch_next: bool,
+    },
+    ListSessions,
+    LoadSession {
+        session_id: String,
+    },
+    DeleteSession {
+        session_id: String,
+    },
+    OpenModelPicker {
+        cached_models: Option<Vec<ocpncord_backend::ModelSummary>>,
+    },
+    SelectModel {
+        model: String,
+    },
+    ReplyPermission {
+        reply: ocpncord_backend::PermissionReply,
+        message: String,
+    },
+    ReplyQuestion {
+        reply: ocpncord_backend::QuestionReply,
+    },
+    RejectQuestion {
+        request_id: String,
+    },
+    AbortSession {
+        session_id: String,
+    },
+    Dispose,
+    Upgrade,
+    RenameSession {
+        session_id: String,
+        title: String,
+    },
+}
+
+enum BackendOpResult<B: Backend> {
+    Agents(ocpncord_backend::Result<Vec<ocpncord_backend::Agent>>),
+    Subscribe(ocpncord_backend::Result<B::EventStream>),
+    CreateSession {
+        purpose: CreateSessionPurpose,
+        result: ocpncord_backend::Result<ocpncord_backend::Session>,
+    },
+    Submit {
+        submission: Submission,
+        result: ocpncord_backend::Result<B::PromptStream>,
+    },
+    ReloadMessages {
+        dispatch_next: bool,
+        result: ocpncord_backend::Result<Vec<LoadedMessage>>,
+    },
+    ListSessions(ocpncord_backend::Result<Vec<ocpncord_backend::Session>>),
+    LoadSession {
+        result: ocpncord_backend::Result<(ocpncord_backend::Session, Vec<LoadedMessage>)>,
+    },
+    DeleteSession(ocpncord_backend::Result<Vec<ocpncord_backend::Session>>),
+    OpenModelPicker {
+        result: ocpncord_backend::Result<(
+            ocpncord_backend::Config,
+            Option<Vec<ocpncord_backend::ModelSummary>>,
+        )>,
+    },
+    SelectModel {
+        requested: String,
+        result: ocpncord_backend::Result<ocpncord_backend::Config>,
+    },
+    PermissionReply {
+        message: String,
+        result: ocpncord_backend::Result<()>,
+    },
+    QuestionReply(ocpncord_backend::Result<()>),
+    QuestionReject(ocpncord_backend::Result<()>),
+    Abort(ocpncord_backend::Result<()>),
+    Dispose(ocpncord_backend::Result<()>),
+    Upgrade(ocpncord_backend::Result<()>),
+    RenameSession(ocpncord_backend::Result<ocpncord_backend::Session>),
+}
+
 /// Top-level app state.
-pub struct App<B: Backend> {
-    backend: B,
+pub struct AppState {
     active_screen: ScreenId,
     theme: Theme,
     key_chord: KeyChord,
@@ -283,8 +389,7 @@ pub struct App<B: Backend> {
     queued_messages: Vec<LoadedMessage>,
     ignore_done_until_tick: u64,
     response_seen_assistant_activity: bool,
-    stream: Option<B::PromptStream>,
-    sync_stream: Option<B::EventStream>,
+    pending_ops: alloc::collections::VecDeque<BackendOp>,
     active_modal: Option<Box<dyn Modal>>,
     active_blocking_prompt: Option<ActiveBlockingPrompt>,
     agents: Vec<ocpncord_backend::Agent>,
@@ -315,10 +420,9 @@ pub struct App<B: Backend> {
     current_branch: Option<String>,
 }
 
-impl<B: Backend> App<B> {
-    pub fn new(backend: B) -> Self {
+impl AppState {
+    pub fn new() -> Self {
         Self {
-            backend,
             active_screen: ScreenId::StartPage,
             theme: Theme::default(),
             key_chord: KeyChord::new(),
@@ -340,13 +444,12 @@ impl<B: Backend> App<B> {
             queued_messages: Vec::new(),
             ignore_done_until_tick: 0,
             response_seen_assistant_activity: false,
-            stream: None,
+            pending_ops: alloc::collections::VecDeque::new(),
             active_modal: None,
             active_blocking_prompt: None,
             agents: Vec::new(),
             active_agent: 0,
             terminal: TerminalPane::new(),
-            sync_stream: None,
             cached_sessions: Vec::new(),
             model_cache: None,
             pending_permissions: alloc::collections::VecDeque::new(),
@@ -456,12 +559,13 @@ impl<B: Backend> App<B> {
         }
     }
 
-    pub fn backend(&self) -> &B {
-        &self.backend
+    fn queue_op(&mut self, op: BackendOp) {
+        self.pending_ops.push_back(op);
     }
 
-    pub fn backend_mut(&mut self) -> &mut B {
-        &mut self.backend
+    fn queue_startup(&mut self) {
+        self.queue_op(BackendOp::LoadAgents);
+        self.queue_op(BackendOp::Subscribe);
     }
 
     pub fn active_screen(&self) -> ScreenId {
@@ -486,53 +590,6 @@ impl<B: Backend> App<B> {
 
     pub fn set_cwd(&mut self, cwd: String) {
         self.current_workspace = Some(cwd);
-    }
-
-    /// Returns true if there is an active event stream (prompt or sync) to poll.
-    pub fn has_event_stream(&self) -> bool {
-        self.stream.is_some() || self.sync_stream.is_some()
-    }
-
-    /// Poll the next event from whichever stream is active.
-    /// Prompt stream takes priority (it's the active conversation).
-    /// Sync stream provides background session/message updates.
-    /// Returns None when the stream is exhausted.
-    pub async fn poll_next_event(
-        &mut self,
-    ) -> Option<Result<BackendEvent, ocpncord_backend::BackendError>> {
-        use futures::StreamExt;
-
-        if let Some(stream) = &mut self.stream {
-            match stream.next().await {
-                Some(result) => return Some(result),
-                None => {
-                    self.stream = None;
-                }
-            }
-        }
-        if let Some(stream) = &mut self.sync_stream {
-            match stream.next().await {
-                Some(result) => return Some(result),
-                None => {
-                    self.sync_stream = None;
-                }
-            }
-        }
-        None
-    }
-
-    /// Replace the current prompt stream (e.g., after sending a message).
-    pub fn set_stream(&mut self, stream: B::PromptStream) {
-        self.stream = Some(stream);
-    }
-
-    /// Open the sync event stream if not already active.
-    pub async fn initiate_sync_stream(&mut self) {
-        if self.sync_stream.is_none() {
-            if let Ok(stream) = self.backend.sync_events().await {
-                self.sync_stream = Some(stream);
-            }
-        }
     }
 
     pub fn prompt_text(&self) -> &str {
@@ -578,15 +635,15 @@ impl<B: Backend> App<B> {
         }
     }
 
-    pub async fn init(&mut self) {
-        match self.backend.list_agents().await {
-            Ok(agents) => {
-                self.agents = agents
-                    .into_iter()
-                    .filter(|a| matches!(a.mode, ocpncord_backend::AgentMode::Primary))
-                    .collect();
-            }
-            Err(_) => {}
+    fn apply_agent_result(
+        &mut self,
+        result: ocpncord_backend::Result<Vec<ocpncord_backend::Agent>>,
+    ) {
+        if let Ok(agents) = result {
+            self.agents = agents
+                .into_iter()
+                .filter(|a| matches!(a.mode, ocpncord_backend::AgentMode::Primary))
+                .collect();
         }
         if self.agents.is_empty() {
             self.agents = vec![
@@ -617,7 +674,6 @@ impl<B: Backend> App<B> {
             ];
         }
         self.active_agent = 0;
-        self.initiate_sync_stream().await;
     }
 
     pub fn is_streaming(&self) -> bool {
@@ -652,18 +708,14 @@ impl<B: Backend> App<B> {
         self.is_streaming || self.response_indicator_until_tick > self.tick
     }
 
-    async fn queue_or_dispatch_submission(
-        &mut self,
-        submission: Submission,
-        message: LoadedMessage,
-    ) {
+    fn queue_or_dispatch_submission(&mut self, submission: Submission, message: LoadedMessage) {
         if self.is_streaming || self.active_submission.is_some() {
             self.queued_submissions.push(submission);
             self.queued_messages.push(message);
             return;
         }
 
-        self.dispatch_submission(submission, message).await;
+        self.start_submission(submission, message);
     }
 
     fn take_next_queued_submission(&mut self) -> Option<(Submission, LoadedMessage)> {
@@ -688,92 +740,30 @@ impl<B: Backend> App<B> {
         ))
     }
 
-    async fn dispatch_submission(&mut self, submission: Submission, message: LoadedMessage) {
-        let mut next_submission = Some((submission, message));
-
-        while let Some((submission, message)) = next_submission.take() {
-            self.messages.push(message);
-            self.draft = Some(submission.text.clone());
-            self.active_screen = ScreenId::Chat;
-            self.is_streaming = true;
-            self.mark_response_active();
-            self.partial_parts.clear();
-            self.partial_texts.clear();
-            self.partial_part_indices.clear();
-            self.latest_text_part_index = None;
-            self.response_seen_assistant_activity = false;
-
-            let result = match submission.kind {
-                SubmissionKind::Prompt => {
-                    self.backend
-                        .prompt(
-                            &submission.session_id,
-                            &submission.execution_text,
-                            Some(&submission.agent),
-                        )
-                        .await
-                }
-                SubmissionKind::Command => {
-                    self.backend
-                        .command(
-                            &submission.session_id,
-                            &submission.execution_text,
-                            Some(&submission.agent),
-                        )
-                        .await
-                }
-            };
-
-            match result {
-                Ok(stream) => {
-                    self.stream = Some(stream);
-                    self.active_submission = Some(submission);
-                }
-                Err(e) => {
-                    self.error = Some(alloc::format!("{}", e));
-                    self.is_streaming = false;
-                    self.response_indicator_until_tick = 0;
-                    self.stream = None;
-                    self.partial_texts.clear();
-                    self.partial_part_indices.clear();
-                    self.latest_text_part_index = None;
-                    self.response_seen_assistant_activity = false;
-                    self.active_submission = None;
-                    next_submission = self.take_next_queued_submission();
-                    if next_submission.is_some() {
-                        self.ignore_done_until_tick = self.tick.saturating_add(2);
-                    }
-                }
-            }
-        }
+    fn start_submission(&mut self, submission: Submission, message: LoadedMessage) {
+        self.messages.push(message);
+        self.draft = Some(submission.text.clone());
+        self.active_screen = ScreenId::Chat;
+        self.is_streaming = true;
+        self.mark_response_active();
+        self.partial_parts.clear();
+        self.partial_texts.clear();
+        self.partial_part_indices.clear();
+        self.latest_text_part_index = None;
+        self.response_seen_assistant_activity = false;
+        self.queue_op(BackendOp::Submit { submission });
     }
 
-    async fn dispatch_next_queued_submission(&mut self) {
+    fn dispatch_next_queued_submission(&mut self) {
         let Some((submission, message)) = self.take_next_queued_submission() else {
             return;
         };
 
         self.ignore_done_until_tick = self.tick.saturating_add(2);
-        self.dispatch_submission(submission, message).await;
+        self.start_submission(submission, message);
     }
 
-    async fn ensure_active_session(&mut self) -> Option<String> {
-        if self.active_session.is_none() {
-            match self
-                .backend
-                .create_session("Chat", self.current_workspace.as_deref().unwrap_or(""))
-                .await
-            {
-                Ok(session) => {
-                    self.active_session = Some(session);
-                }
-                Err(e) => {
-                    self.error = Some(alloc::format!("{}", e));
-                    return None;
-                }
-            }
-        }
-
+    fn active_session_id(&self) -> Option<String> {
         self.active_session
             .as_ref()
             .map(|session| session.id.clone())
@@ -862,7 +852,7 @@ impl<B: Backend> App<B> {
     }
 
     /// Returns `false` when the application should quit.
-    pub async fn handle_event(&mut self, event: Event) -> bool {
+    pub fn handle_event(&mut self, event: Event) -> bool {
         match event {
             Event::Key(ref key) => {
                 self.error = None;
@@ -883,7 +873,7 @@ impl<B: Backend> App<B> {
                         }
                         Action::None => {}
                         other => {
-                            return self.apply_action(Some(other)).await;
+                            return self.apply_action(Some(other));
                         }
                     }
                     return true;
@@ -891,15 +881,15 @@ impl<B: Backend> App<B> {
 
                 if self.is_streaming {
                     if key.scancode == Scancode::Escape {
-                        return self.handle_interrupt().await;
+                        return self.handle_interrupt();
                     }
                     if key.scancode == Scancode::Char('c') && key.modifiers.ctrl {
-                        return self.handle_interrupt().await;
+                        return self.handle_interrupt();
                     }
                 }
 
                 if let Some(action) = self.key_chord.handle(key, self.tick) {
-                    return self.apply_action(Some(action)).await;
+                    return self.apply_action(Some(action));
                 }
 
                 // KeyChord consumed the event (leader mode entered).
@@ -934,7 +924,7 @@ impl<B: Backend> App<B> {
                         _ => None,
                     };
                     if action.is_some() {
-                        return self.apply_action(action).await;
+                        return self.apply_action(action);
                     }
                     return true;
                 }
@@ -950,14 +940,14 @@ impl<B: Backend> App<B> {
                         _ => None,
                     };
                     if action.is_some() {
-                        return self.apply_action(action).await;
+                        return self.apply_action(action);
                     }
                 }
 
                 if let Some(action) = self.prompt_bar.handle_key(key) {
                     match action {
                         Action::SendMessage => {
-                            return self.handle_send_message().await;
+                            return self.handle_send_message();
                         }
                         _ => {}
                     }
@@ -977,40 +967,18 @@ impl<B: Backend> App<B> {
                         {
                             let was_streaming = self.is_streaming;
                             self.is_streaming = false;
-                            self.stream = None;
                             self.active_submission = None;
                             self.partial_texts.clear();
                             self.partial_part_indices.clear();
                             self.latest_text_part_index = None;
 
-                            // REST API fallback: fetch all messages to fill in any
-                            // that SSE events might have missed.
                             if let Some(ref session) = self.active_session.clone() {
-                                let session_id = session.id.clone();
-                                if let Ok(summaries) = self.backend.list_messages(&session_id).await
-                                {
-                                    let mut api_messages: Vec<LoadedMessage> = Vec::new();
-                                    for summary in &summaries {
-                                        if let Ok(detail) =
-                                            self.backend.get_message(&session_id, &summary.id).await
-                                        {
-                                            api_messages.push(LoadedMessage {
-                                                role: detail.info.role,
-                                                parts: detail.parts,
-                                            });
-                                        }
-                                    }
-                                    if !api_messages.is_empty()
-                                        && api_messages.len() >= self.messages.len()
-                                    {
-                                        self.messages = api_messages;
-                                        self.partial_parts.clear();
-                                    }
-                                }
-                            }
-
-                            if was_streaming {
-                                self.dispatch_next_queued_submission().await;
+                                self.queue_op(BackendOp::ReloadMessages {
+                                    session_id: session.id.clone(),
+                                    dispatch_next: was_streaming,
+                                });
+                            } else if was_streaming {
+                                self.dispatch_next_queued_submission();
                             }
                         }
                     }
@@ -1019,13 +987,12 @@ impl<B: Backend> App<B> {
                         self.partial_parts.clear();
                         self.is_streaming = false;
                         self.response_indicator_until_tick = 0;
-                        self.stream = None;
                         self.active_submission = None;
                         self.partial_texts.clear();
                         self.partial_part_indices.clear();
                         self.latest_text_part_index = None;
                         self.response_seen_assistant_activity = false;
-                        self.dispatch_next_queued_submission().await;
+                        self.dispatch_next_queued_submission();
                     }
                     ocpncord_backend::BackendEvent::SessionCreated { session } => {
                         let is_new = self
@@ -1234,7 +1201,7 @@ impl<B: Backend> App<B> {
                         self.prompt_bar.append_text(text);
                     }
                     ocpncord_backend::BackendEvent::TuiCommandExecute { ref command } => {
-                        self.handle_slash_command_inner(command).await;
+                        self.handle_slash_command_inner(command);
                     }
                     ocpncord_backend::BackendEvent::TuiToastShow {
                         message,
@@ -1256,7 +1223,9 @@ impl<B: Backend> App<B> {
                         });
                     }
                     ocpncord_backend::BackendEvent::TuiSessionSelect { ref session_id } => {
-                        self.handle_select_session(session_id).await;
+                        self.queue_op(BackendOp::LoadSession {
+                            session_id: session_id.clone(),
+                        });
                     }
                     ocpncord_backend::BackendEvent::ServerConnected => {
                         self.push_toast(Toast {
@@ -1294,7 +1263,7 @@ impl<B: Backend> App<B> {
                     self.toasts.pop_front();
                 }
                 if let Some(action) = self.key_chord.tick(self.tick) {
-                    return self.apply_action(Some(action)).await;
+                    return self.apply_action(Some(action));
                 }
             }
             Event::Quit => return false,
@@ -1302,67 +1271,54 @@ impl<B: Backend> App<B> {
         true
     }
 
-    async fn handle_send_message(&mut self) -> bool {
+    fn handle_send_message(&mut self) -> bool {
         let text = self.prompt_bar.text().to_string();
         let mode = self.prompt_bar.input_mode();
 
         // Slash command routing
         if matches!(mode, InputMode::Command) {
-            return self.handle_slash_command(&text).await;
+            return self.handle_slash_command(&text);
         }
 
-        let Some(session_id) = self.ensure_active_session().await else {
-            return true;
-        };
-
-        self.prompt_bar.clear();
         let agent = self.active_agent_name().to_string();
-        let message = user_loaded_message(&text);
-        let submission = match mode {
-            InputMode::Shell => Submission::command(session_id, text.clone(), agent),
-            _ => Submission::prompt(session_id, text.clone(), agent),
-        };
-        self.queue_or_dispatch_submission(submission, message).await;
+        if let Some(session_id) = self.active_session_id() {
+            self.prompt_bar.clear();
+            let message = user_loaded_message(&text);
+            let submission = match mode {
+                InputMode::Shell => Submission::command(session_id, text.clone(), agent),
+                _ => Submission::prompt(session_id, text.clone(), agent),
+            };
+            self.queue_or_dispatch_submission(submission, message);
+        } else {
+            self.queue_op(BackendOp::CreateSession {
+                title: "Chat".into(),
+                cwd: self.current_workspace.clone().unwrap_or_default(),
+                purpose: CreateSessionPurpose::Send { text, mode, agent },
+            });
+        }
 
         true
     }
 
-    async fn handle_slash_command(&mut self, text: &str) -> bool {
+    fn handle_slash_command(&mut self, text: &str) -> bool {
         match text {
             "/models" | "/settings" | "/config" => {
                 self.prompt_bar.clear();
-                self.open_model_picker().await;
+                self.open_model_picker();
                 true
             }
             "/new" => {
-                match self
-                    .backend
-                    .create_session("Chat", self.current_workspace.as_deref().unwrap_or(""))
-                    .await
-                {
-                    Ok(session) => {
-                        self.active_session = Some(session);
-                    }
-                    Err(e) => {
-                        self.error = Some(alloc::format!("{}", e));
-                        return true;
-                    }
-                }
-                self.prompt_bar.clear();
-                self.draft = None;
-                self.messages.clear();
-                self.active_modal = None;
-                self.active_screen = ScreenId::Chat;
+                self.queue_op(BackendOp::CreateSession {
+                    title: "Chat".into(),
+                    cwd: self.current_workspace.clone().unwrap_or_default(),
+                    purpose: CreateSessionPurpose::NewChat,
+                });
                 true
             }
             "/sessions" => {
                 self.prompt_bar.clear();
-                let mut modal = SessionListModal::new();
-                match self.backend.list_sessions().await {
-                    Ok(sessions) => modal.set_sessions(sessions),
-                    Err(e) => modal.set_error(alloc::format!("{}", e)),
-                }
-                self.active_modal = Some(Box::new(modal));
+                self.active_modal = Some(Box::new(SessionListModal::new()));
+                self.queue_op(BackendOp::ListSessions);
                 true
             }
             "/help" => {
@@ -1390,42 +1346,53 @@ impl<B: Backend> App<B> {
             }
             "/abort" => {
                 if let Some(session) = &self.active_session {
-                    let _ = self.backend.abort_session(&session.id).await;
+                    self.queue_op(BackendOp::AbortSession {
+                        session_id: session.id.clone(),
+                    });
                 }
                 true
             }
             "/dispose" => {
-                let _ = self.backend.dispose().await;
+                self.queue_op(BackendOp::Dispose);
                 true
             }
             "/upgrade" => {
-                let _ = self.backend.upgrade().await;
+                self.queue_op(BackendOp::Upgrade);
                 true
             }
             "/exit" => false,
-            _ => self.handle_unknown_slash_command(text).await,
+            _ => self.handle_unknown_slash_command(text),
         }
     }
 
-    async fn handle_unknown_slash_command(&mut self, text: &str) -> bool {
-        let Some(session_id) = self.ensure_active_session().await else {
-            return true;
-        };
-
-        self.prompt_bar.clear();
+    fn handle_unknown_slash_command(&mut self, text: &str) -> bool {
         let agent = self.active_agent_name().to_string();
-        let message = user_loaded_message(text);
-        let submission = Submission::prompt(session_id, text.into(), agent);
-        self.queue_or_dispatch_submission(submission, message).await;
+        if let Some(session_id) = self.active_session_id() {
+            self.prompt_bar.clear();
+            let message = user_loaded_message(text);
+            let submission = Submission::prompt(session_id, text.into(), agent);
+            self.queue_or_dispatch_submission(submission, message);
+        } else {
+            self.queue_op(BackendOp::CreateSession {
+                title: "Chat".into(),
+                cwd: self.current_workspace.clone().unwrap_or_default(),
+                purpose: CreateSessionPurpose::Send {
+                    text: text.into(),
+                    mode: InputMode::Normal,
+                    agent,
+                },
+            });
+        }
 
         true
     }
 
-    async fn handle_interrupt(&mut self) -> bool {
+    fn handle_interrupt(&mut self) -> bool {
         if let Some(session) = &self.active_session {
-            let _ = self.backend.abort_session(&session.id).await;
+            self.queue_op(BackendOp::AbortSession {
+                session_id: session.id.clone(),
+            });
         }
-        self.stream = None;
         self.is_streaming = false;
         self.response_indicator_until_tick = 0;
         self.partial_parts.clear();
@@ -1439,56 +1406,30 @@ impl<B: Backend> App<B> {
         true
     }
 
-    async fn open_model_picker(&mut self) {
-        let mut modal = ModelPickerModal::new();
-        match self.backend.get_config().await {
-            Ok(config) => {
-                if self.model_cache.is_none() {
-                    if let Ok(models) = self.backend.list_models().await {
-                        self.model_cache = Some(models);
-                    }
-                }
-                if let Some(models) = self.model_cache.as_ref() {
-                    modal.set_models_from_config(config, models);
-                } else {
-                    modal.set_config(config);
-                }
-            }
-            Err(e) => modal.set_error(alloc::format!("{}", e)),
-        }
-        self.active_modal = Some(Box::new(modal));
+    fn open_model_picker(&mut self) {
+        self.active_modal = Some(Box::new(ModelPickerModal::new()));
+        self.queue_op(BackendOp::OpenModelPicker {
+            cached_models: self.model_cache.clone(),
+        });
     }
 
-    async fn handle_slash_command_inner(&mut self, text: &str) {
+    fn handle_slash_command_inner(&mut self, text: &str) {
         match text {
             "/sessions" => {
                 self.prompt_bar.clear();
-                let mut modal = SessionListModal::new();
-                match self.backend.list_sessions().await {
-                    Ok(sessions) => modal.set_sessions(sessions),
-                    Err(e) => modal.set_error(alloc::format!("{}", e)),
-                }
-                self.active_modal = Some(Box::new(modal));
+                self.active_modal = Some(Box::new(SessionListModal::new()));
+                self.queue_op(BackendOp::ListSessions);
             }
             "/models" | "/settings" | "/config" => {
                 self.prompt_bar.clear();
-                self.open_model_picker().await;
+                self.open_model_picker();
             }
             "/new" => {
-                match self.backend.create_session("Chat", "").await {
-                    Ok(session) => {
-                        self.active_session = Some(session);
-                    }
-                    Err(e) => {
-                        self.error = Some(alloc::format!("{}", e));
-                        return;
-                    }
-                }
-                self.prompt_bar.clear();
-                self.draft = None;
-                self.messages.clear();
-                self.active_modal = None;
-                self.active_screen = ScreenId::Chat;
+                self.queue_op(BackendOp::CreateSession {
+                    title: "Chat".into(),
+                    cwd: String::new(),
+                    purpose: CreateSessionPurpose::NewChat,
+                });
             }
             "/help" => {
                 self.prompt_bar.clear();
@@ -1498,36 +1439,7 @@ impl<B: Backend> App<B> {
         }
     }
 
-    async fn handle_select_session(&mut self, id: &str) {
-        let session_id = id.to_string();
-        match self.backend.get_session(&session_id).await {
-            Ok(session) => {
-                self.active_session = Some(session);
-                self.active_screen = ScreenId::Chat;
-                self.messages.clear();
-                match self.backend.list_messages(&session_id).await {
-                    Ok(summaries) => {
-                        let mut messages = Vec::new();
-                        for summary in summaries {
-                            if let Ok(detail) =
-                                self.backend.get_message(&session_id, &summary.id).await
-                            {
-                                messages.push(LoadedMessage {
-                                    role: detail.info.role,
-                                    parts: detail.parts,
-                                });
-                            }
-                        }
-                        self.messages = messages;
-                    }
-                    Err(e) => self.error = Some(alloc::format!("{}", e)),
-                }
-            }
-            Err(e) => self.error = Some(alloc::format!("{}", e)),
-        }
-    }
-
-    async fn apply_action(&mut self, action: Option<Action>) -> bool {
+    fn apply_action(&mut self, action: Option<Action>) -> bool {
         match action {
             Some(Action::Quit) => return false,
             Some(Action::SwitchScreen(id)) => self.active_screen = id,
@@ -1540,21 +1452,17 @@ impl<B: Backend> App<B> {
                 self.set_active_modal(Box::new(modal));
             }
             Some(Action::OpenModal(ModalId::SessionList)) => {
-                let mut modal = SessionListModal::new();
-                match self.backend.list_sessions().await {
-                    Ok(sessions) => modal.set_sessions(sessions),
-                    Err(e) => modal.set_error(alloc::format!("{}", e)),
-                }
-                self.set_active_modal(Box::new(modal));
+                self.set_active_modal(Box::new(SessionListModal::new()));
+                self.queue_op(BackendOp::ListSessions);
             }
             Some(Action::OpenModal(ModalId::ModelPicker)) => {
-                self.open_model_picker().await;
+                self.open_model_picker();
             }
             Some(Action::OpenModal(ModalId::Help)) => {
                 self.set_active_modal(Box::new(HelpModal::new()));
             }
             Some(Action::OpenModal(ModalId::Settings)) => {
-                self.open_model_picker().await;
+                self.open_model_picker();
             }
             Some(Action::OpenModal(ModalId::PermissionApproval)) => {
                 self.open_permission_modal_if_idle();
@@ -1564,44 +1472,18 @@ impl<B: Backend> App<B> {
             }
             Some(Action::OpenModal(_)) => {}
             Some(Action::LoadSession(ref id)) => {
-                let session_id = id.clone();
-                match self.backend.list_messages(&session_id).await {
-                    Ok(summaries) => {
-                        // Load full messages
-                        let mut messages = Vec::new();
-                        for summary in summaries {
-                            if let Ok(detail) =
-                                self.backend.get_message(&session_id, &summary.id).await
-                            {
-                                messages.push(LoadedMessage {
-                                    role: detail.info.role,
-                                    parts: detail.parts,
-                                });
-                            }
-                        }
-                        self.messages = messages;
-                    }
-                    Err(e) => {
-                        self.error = Some(alloc::format!("{}", e));
-                    }
-                }
-                self.active_session = self.backend.get_session(&session_id).await.ok();
-                self.clear_active_modal();
-                self.active_screen = ScreenId::Chat;
-                self.open_next_blocking_modal_if_idle();
+                self.queue_op(BackendOp::LoadSession {
+                    session_id: id.clone(),
+                });
             }
             Some(Action::DeleteSession(ref id)) => {
-                let _ = self.backend.delete_session(&id).await;
-                // Re-fetch sessions and re-open modal
-                let mut modal = SessionListModal::new();
-                match self.backend.list_sessions().await {
-                    Ok(sessions) => modal.set_sessions(sessions),
-                    Err(e) => modal.set_error(alloc::format!("{}", e)),
-                }
-                self.set_active_modal(Box::new(modal));
+                self.set_active_modal(Box::new(SessionListModal::new()));
+                self.queue_op(BackendOp::DeleteSession {
+                    session_id: id.clone(),
+                });
             }
             Some(Action::Interrupt) => {
-                return self.handle_interrupt().await;
+                return self.handle_interrupt();
             }
             Some(Action::ScrollUp) => {
                 if self.scroll_targets_terminal() {
@@ -1661,7 +1543,7 @@ impl<B: Backend> App<B> {
                 self.active_screen = ScreenId::Chat;
             }
             Some(Action::OpenSettings) => {
-                self.open_model_picker().await;
+                self.open_model_picker();
             }
             Some(Action::ReplyPermission(ref session_id, ref request_id, reply_action)) => {
                 let (reply_value, message) = match reply_action {
@@ -1674,26 +1556,13 @@ impl<B: Backend> App<B> {
                     request_id: request_id.clone(),
                     reply: reply_value.into(),
                 };
-                let result = self.backend.reply_permission(&reply).await;
                 self.remove_pending_permission_by_id(request_id);
                 self.clear_active_modal();
-                match result {
-                    Ok(()) => self.push_toast(Toast {
-                        title: Some("Permission".into()),
-                        message: message.into(),
-                        variant: ToastVariant::Success,
-                        created_at: self.tick,
-                        duration: 6,
-                    }),
-                    Err(e) => self.push_toast(Toast {
-                        title: Some("Permission".into()),
-                        message: alloc::format!("{message}: {e}"),
-                        variant: ToastVariant::Error,
-                        created_at: self.tick,
-                        duration: 8,
-                    }),
-                }
                 self.open_next_blocking_modal_if_idle();
+                self.queue_op(BackendOp::ReplyPermission {
+                    reply,
+                    message: message.into(),
+                });
             }
             Some(Action::ReplyQuestion(ref session_id, ref request_id, ref answers)) => {
                 let reply = ocpncord_backend::QuestionReply {
@@ -1701,92 +1570,282 @@ impl<B: Backend> App<B> {
                     request_id: request_id.clone(),
                     answers: answers.clone(),
                 };
-                let result = self.backend.reply_question(&reply).await;
                 self.remove_pending_question_by_id(request_id);
                 self.clear_active_modal();
-                match result {
-                    Ok(()) => self.push_toast(Toast {
-                        title: Some("Question".into()),
-                        message: "Answer submitted".into(),
-                        variant: ToastVariant::Success,
-                        created_at: self.tick,
-                        duration: 6,
-                    }),
-                    Err(e) => self.push_toast(Toast {
-                        title: Some("Question".into()),
-                        message: alloc::format!("Answer failed: {e}"),
-                        variant: ToastVariant::Error,
-                        created_at: self.tick,
-                        duration: 8,
-                    }),
-                }
                 self.open_next_blocking_modal_if_idle();
+                self.queue_op(BackendOp::ReplyQuestion { reply });
             }
             Some(Action::RejectQuestion(ref request_id)) => {
-                let result = self.backend.reject_question(request_id).await;
                 self.remove_pending_question_by_id(request_id);
                 self.clear_active_modal();
-                match result {
-                    Ok(()) => self.push_toast(Toast {
-                        title: Some("Question".into()),
-                        message: "Question rejected".into(),
-                        variant: ToastVariant::Success,
-                        created_at: self.tick,
-                        duration: 6,
-                    }),
-                    Err(e) => self.push_toast(Toast {
-                        title: Some("Question".into()),
-                        message: alloc::format!("Reject failed: {e}"),
-                        variant: ToastVariant::Error,
-                        created_at: self.tick,
-                        duration: 8,
-                    }),
-                }
                 self.open_next_blocking_modal_if_idle();
+                self.queue_op(BackendOp::RejectQuestion {
+                    request_id: request_id.clone(),
+                });
             }
             Some(Action::SelectModel(ref model)) => {
-                let mut modal = ModelPickerModal::new();
-                match self.backend.get_config().await {
-                    Ok(mut config) => {
-                        config.model = Some(model.clone());
-                        match self.backend.set_config(&config).await {
-                            Ok(updated) => {
-                                let display_config =
-                                    if updated.provider.is_empty() && !config.provider.is_empty() {
-                                        config
-                                    } else {
-                                        updated
-                                    };
-                                if let Some(models) = self.model_cache.as_ref() {
-                                    modal.set_models_from_config(display_config, models);
-                                } else {
-                                    modal.set_config(display_config);
-                                }
-                            }
-                            Err(e) => modal.set_error(alloc::format!("{}", e)),
-                        }
-                    }
-                    Err(e) => modal.set_error(alloc::format!("{}", e)),
-                }
-                self.set_active_modal(Box::new(modal));
+                self.set_active_modal(Box::new(ModelPickerModal::new()));
+                self.queue_op(BackendOp::SelectModel {
+                    model: model.clone(),
+                });
             }
             Some(Action::AbortSession(ref id)) => {
-                let _ = self.backend.abort_session(id).await;
+                self.queue_op(BackendOp::AbortSession {
+                    session_id: id.clone(),
+                });
             }
             Some(Action::RenameSession(ref id, ref title)) => {
-                match self.backend.update_session(id, title).await {
-                    Ok(session) => {
-                        self.active_session = Some(session);
-                    }
-                    Err(e) => self.error = Some(alloc::format!("{}", e)),
-                }
+                self.queue_op(BackendOp::RenameSession {
+                    session_id: id.clone(),
+                    title: title.clone(),
+                });
             }
             Some(Action::SwitchToChat(ref id)) => {
-                self.handle_select_session(id).await;
+                self.queue_op(BackendOp::LoadSession {
+                    session_id: id.clone(),
+                });
             }
             _ => {}
         }
         true
+    }
+
+    fn handle_submit_result<B: Backend>(
+        &mut self,
+        submission: Submission,
+        result: ocpncord_backend::Result<B::PromptStream>,
+    ) -> Option<B::PromptStream> {
+        match result {
+            Ok(stream) => {
+                self.active_submission = Some(submission);
+                Some(stream)
+            }
+            Err(e) => {
+                self.error = Some(alloc::format!("{}", e));
+                self.is_streaming = false;
+                self.response_indicator_until_tick = 0;
+                self.partial_texts.clear();
+                self.partial_part_indices.clear();
+                self.latest_text_part_index = None;
+                self.response_seen_assistant_activity = false;
+                self.active_submission = None;
+                self.dispatch_next_queued_submission();
+                None
+            }
+        }
+    }
+
+    fn handle_create_session_result(
+        &mut self,
+        purpose: CreateSessionPurpose,
+        result: ocpncord_backend::Result<ocpncord_backend::Session>,
+    ) {
+        match result {
+            Ok(session) => {
+                self.active_session = Some(session);
+                match purpose {
+                    CreateSessionPurpose::Send { text, mode, agent } => {
+                        self.prompt_bar.clear();
+                        let session_id = self
+                            .active_session
+                            .as_ref()
+                            .map(|session| session.id.clone())
+                            .unwrap_or_default();
+                        let message = user_loaded_message(&text);
+                        let submission = match mode {
+                            InputMode::Shell => Submission::command(session_id, text, agent),
+                            _ => Submission::prompt(session_id, text, agent),
+                        };
+                        self.queue_or_dispatch_submission(submission, message);
+                    }
+                    CreateSessionPurpose::NewChat => {
+                        self.prompt_bar.clear();
+                        self.draft = None;
+                        self.messages.clear();
+                        self.active_modal = None;
+                        self.active_screen = ScreenId::Chat;
+                    }
+                }
+            }
+            Err(e) => {
+                self.error = Some(alloc::format!("{}", e));
+            }
+        }
+    }
+
+    fn handle_reload_messages(
+        &mut self,
+        dispatch_next: bool,
+        result: ocpncord_backend::Result<Vec<LoadedMessage>>,
+    ) {
+        if let Ok(api_messages) = result {
+            if !api_messages.is_empty() && api_messages.len() >= self.messages.len() {
+                self.messages = api_messages;
+                self.partial_parts.clear();
+            }
+        }
+        if dispatch_next {
+            self.dispatch_next_queued_submission();
+        }
+    }
+
+    fn handle_list_sessions(
+        &mut self,
+        result: ocpncord_backend::Result<Vec<ocpncord_backend::Session>>,
+    ) {
+        let mut modal = SessionListModal::new();
+        match result {
+            Ok(sessions) => modal.set_sessions(sessions),
+            Err(e) => modal.set_error(alloc::format!("{}", e)),
+        }
+        self.set_active_modal(Box::new(modal));
+    }
+
+    fn handle_load_session(
+        &mut self,
+        result: ocpncord_backend::Result<(ocpncord_backend::Session, Vec<LoadedMessage>)>,
+    ) {
+        match result {
+            Ok((session, messages)) => {
+                self.active_session = Some(session);
+                self.active_screen = ScreenId::Chat;
+                self.messages = messages;
+                self.clear_active_modal();
+                self.open_next_blocking_modal_if_idle();
+            }
+            Err(e) => self.error = Some(alloc::format!("{}", e)),
+        }
+    }
+
+    fn handle_delete_session(
+        &mut self,
+        result: ocpncord_backend::Result<Vec<ocpncord_backend::Session>>,
+    ) {
+        self.handle_list_sessions(result);
+    }
+
+    fn handle_open_model_picker(
+        &mut self,
+        result: ocpncord_backend::Result<(
+            ocpncord_backend::Config,
+            Option<Vec<ocpncord_backend::ModelSummary>>,
+        )>,
+    ) {
+        let mut modal = ModelPickerModal::new();
+        match result {
+            Ok((config, models)) => {
+                if let Some(models) = models {
+                    self.model_cache = Some(models);
+                }
+                if let Some(models) = self.model_cache.as_ref() {
+                    modal.set_models_from_config(config, models);
+                } else {
+                    modal.set_config(config);
+                }
+            }
+            Err(e) => modal.set_error(alloc::format!("{}", e)),
+        }
+        self.set_active_modal(Box::new(modal));
+    }
+
+    fn handle_select_model(
+        &mut self,
+        requested: String,
+        result: ocpncord_backend::Result<ocpncord_backend::Config>,
+    ) {
+        let mut modal = ModelPickerModal::new();
+        match result {
+            Ok(updated) => {
+                let mut display_config = updated;
+                if display_config.model.is_none() {
+                    display_config.model = Some(requested);
+                }
+                if let Some(models) = self.model_cache.as_ref() {
+                    modal.set_models_from_config(display_config, models);
+                } else {
+                    modal.set_config(display_config);
+                }
+            }
+            Err(e) => modal.set_error(alloc::format!("{}", e)),
+        }
+        self.set_active_modal(Box::new(modal));
+    }
+
+    fn handle_permission_reply_result(
+        &mut self,
+        message: String,
+        result: ocpncord_backend::Result<()>,
+    ) {
+        match result {
+            Ok(()) => self.push_toast(Toast {
+                title: Some("Permission".into()),
+                message,
+                variant: ToastVariant::Success,
+                created_at: self.tick,
+                duration: 6,
+            }),
+            Err(e) => self.push_toast(Toast {
+                title: Some("Permission".into()),
+                message: alloc::format!("{message}: {e}"),
+                variant: ToastVariant::Error,
+                created_at: self.tick,
+                duration: 8,
+            }),
+        }
+    }
+
+    fn handle_question_reply_result(&mut self, result: ocpncord_backend::Result<()>) {
+        match result {
+            Ok(()) => self.push_toast(Toast {
+                title: Some("Question".into()),
+                message: "Answer submitted".into(),
+                variant: ToastVariant::Success,
+                created_at: self.tick,
+                duration: 6,
+            }),
+            Err(e) => self.push_toast(Toast {
+                title: Some("Question".into()),
+                message: alloc::format!("Answer failed: {e}"),
+                variant: ToastVariant::Error,
+                created_at: self.tick,
+                duration: 8,
+            }),
+        }
+    }
+
+    fn handle_question_reject_result(&mut self, result: ocpncord_backend::Result<()>) {
+        match result {
+            Ok(()) => self.push_toast(Toast {
+                title: Some("Question".into()),
+                message: "Question rejected".into(),
+                variant: ToastVariant::Success,
+                created_at: self.tick,
+                duration: 6,
+            }),
+            Err(e) => self.push_toast(Toast {
+                title: Some("Question".into()),
+                message: alloc::format!("Reject failed: {e}"),
+                variant: ToastVariant::Error,
+                created_at: self.tick,
+                duration: 8,
+            }),
+        }
+    }
+
+    fn handle_simple_result(&mut self, result: ocpncord_backend::Result<()>) {
+        if let Err(e) = result {
+            self.error = Some(alloc::format!("{}", e));
+        }
+    }
+
+    fn handle_rename_session(
+        &mut self,
+        result: ocpncord_backend::Result<ocpncord_backend::Session>,
+    ) {
+        match result {
+            Ok(session) => self.active_session = Some(session),
+            Err(e) => self.error = Some(alloc::format!("{}", e)),
+        }
     }
 
     fn page_scroll_amount(&self) -> u16 {
@@ -2294,6 +2353,433 @@ impl<B: Backend> App<B> {
     }
 }
 
+enum DriverEvent {
+    Platform(Event),
+    Response(Option<ocpncord_backend::Result<BackendEvent>>),
+    Background(Option<ocpncord_backend::Result<BackendEvent>>),
+    Operation,
+    PlatformClosed,
+}
+
+type BackendOpFuture<'a, B> = Pin<Box<dyn Future<Output = BackendOpResult<B>> + 'a>>;
+
+fn loaded_messages_from_details(
+    details: Vec<ocpncord_backend::MessageDetail>,
+) -> Vec<LoadedMessage> {
+    details
+        .into_iter()
+        .map(|detail| LoadedMessage {
+            role: detail.info.role,
+            parts: detail.parts,
+        })
+        .collect()
+}
+
+fn backend_op_future<'a, B: Backend>(backend: &'a mut B, op: BackendOp) -> BackendOpFuture<'a, B> {
+    Box::pin(execute_backend_op(backend, op))
+}
+
+fn backend_op_future_from_ptr<'a, B: Backend + 'a>(
+    backend: *mut B,
+    op: BackendOp,
+) -> BackendOpFuture<'a, B> {
+    Box::pin(async move {
+        // The driver creates at most one backend operation future at a time and
+        // drops it before starting another. The raw pointer avoids making the
+        // loop self-referential while preserving that single mutable owner.
+        let backend = unsafe { &mut *backend };
+        execute_backend_op(backend, op).await
+    })
+}
+
+async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> BackendOpResult<B> {
+    match op {
+        BackendOp::LoadAgents => BackendOpResult::Agents(backend.list_agents().await),
+        BackendOp::Subscribe => BackendOpResult::Subscribe(backend.subscribe().await),
+        BackendOp::CreateSession {
+            title,
+            cwd,
+            purpose,
+        } => BackendOpResult::CreateSession {
+            purpose,
+            result: backend.create_session(&title, &cwd).await,
+        },
+        BackendOp::Submit { submission } => {
+            let result = match submission.kind {
+                SubmissionKind::Prompt => {
+                    backend
+                        .prompt(
+                            &submission.session_id,
+                            &submission.execution_text,
+                            Some(&submission.agent),
+                        )
+                        .await
+                }
+                SubmissionKind::Command => {
+                    backend
+                        .command(
+                            &submission.session_id,
+                            &submission.execution_text,
+                            Some(&submission.agent),
+                        )
+                        .await
+                }
+            };
+            BackendOpResult::Submit { submission, result }
+        }
+        BackendOp::ReloadMessages {
+            session_id,
+            dispatch_next,
+        } => {
+            let result = load_messages(backend, &session_id).await;
+            BackendOpResult::ReloadMessages {
+                dispatch_next,
+                result,
+            }
+        }
+        BackendOp::ListSessions => BackendOpResult::ListSessions(backend.list_sessions().await),
+        BackendOp::LoadSession { session_id } => {
+            let result = async {
+                let session = backend.get_session(&session_id).await?;
+                let messages = load_messages(backend, &session_id).await?;
+                Ok((session, messages))
+            }
+            .await;
+            BackendOpResult::LoadSession { result }
+        }
+        BackendOp::DeleteSession { session_id } => {
+            let result = async {
+                backend.delete_session(&session_id).await?;
+                backend.list_sessions().await
+            }
+            .await;
+            BackendOpResult::DeleteSession(result)
+        }
+        BackendOp::OpenModelPicker { cached_models } => {
+            let result = async {
+                let config = backend.get_config().await?;
+                let models = match cached_models {
+                    Some(models) => Some(models),
+                    None => backend.list_models().await.ok(),
+                };
+                Ok((config, models))
+            }
+            .await;
+            BackendOpResult::OpenModelPicker { result }
+        }
+        BackendOp::SelectModel { model } => {
+            let requested = model.clone();
+            let result = async {
+                let mut config = backend.get_config().await?;
+                config.model = Some(model);
+                backend.set_config(&config).await
+            }
+            .await;
+            BackendOpResult::SelectModel { requested, result }
+        }
+        BackendOp::ReplyPermission { reply, message } => {
+            let result = backend.reply_permission(&reply).await;
+            BackendOpResult::PermissionReply { message, result }
+        }
+        BackendOp::ReplyQuestion { reply } => {
+            let result = backend.reply_question(&reply).await;
+            BackendOpResult::QuestionReply(result)
+        }
+        BackendOp::RejectQuestion { request_id } => {
+            let result = backend.reject_question(&request_id).await;
+            BackendOpResult::QuestionReject(result)
+        }
+        BackendOp::AbortSession { session_id } => {
+            BackendOpResult::Abort(backend.abort_session(&session_id).await)
+        }
+        BackendOp::Dispose => BackendOpResult::Dispose(backend.dispose().await),
+        BackendOp::Upgrade => BackendOpResult::Upgrade(backend.upgrade().await),
+        BackendOp::RenameSession { session_id, title } => {
+            BackendOpResult::RenameSession(backend.update_session(&session_id, &title).await)
+        }
+    }
+}
+
+async fn load_messages<B: Backend>(
+    backend: &mut B,
+    session_id: &str,
+) -> ocpncord_backend::Result<Vec<LoadedMessage>> {
+    let session_id = session_id.to_string();
+    let summaries = backend.list_messages(&session_id).await?;
+    let mut details = Vec::new();
+    for summary in summaries {
+        if let Ok(detail) = backend.get_message(&session_id, &summary.id).await {
+            details.push(detail);
+        }
+    }
+    Ok(loaded_messages_from_details(details))
+}
+
+/// Fully async application driver owning UI state, platform events, backend
+/// streams, and the Ratatui terminal.
+pub struct App<B, E, T>
+where
+    B: Backend,
+    E: Stream<Item = Event> + Unpin,
+    T: ratatui_core::backend::Backend,
+{
+    state: AppState,
+    backend: B,
+    events: E,
+    response_events: Option<B::PromptStream>,
+    background_events: Option<B::EventStream>,
+    ratatui_terminal: ratatui_core::terminal::Terminal<T>,
+    poll_cursor: u8,
+}
+
+impl<B, E, T> App<B, E, T>
+where
+    B: Backend,
+    E: Stream<Item = Event> + Unpin,
+    T: ratatui_core::backend::Backend,
+{
+    pub fn new(backend: B, events: E, terminal: ratatui_core::terminal::Terminal<T>) -> Self {
+        Self {
+            state: AppState::new(),
+            backend,
+            events,
+            response_events: None,
+            background_events: None,
+            ratatui_terminal: terminal,
+            poll_cursor: 0,
+        }
+    }
+
+    pub fn state(&self) -> &AppState {
+        &self.state
+    }
+
+    pub fn state_mut(&mut self) -> &mut AppState {
+        &mut self.state
+    }
+
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+
+    pub fn terminal(&self) -> &ratatui_core::terminal::Terminal<T> {
+        &self.ratatui_terminal
+    }
+
+    pub fn terminal_mut(&mut self) -> &mut ratatui_core::terminal::Terminal<T> {
+        &mut self.ratatui_terminal
+    }
+
+    pub async fn init(&mut self) {
+        self.state.queue_startup();
+        self.drain_backend_ops().await;
+    }
+
+    pub async fn handle_event(&mut self, event: Event) -> bool {
+        let running = self.state.handle_event(event);
+        self.drain_backend_ops().await;
+        running
+    }
+
+    async fn drain_backend_ops(&mut self) {
+        while let Some(op) = self.state.pending_ops.pop_front() {
+            let result = backend_op_future(&mut self.backend, op).await;
+            self.apply_backend_op_result(result);
+        }
+    }
+
+    fn apply_backend_op_result(&mut self, result: BackendOpResult<B>) {
+        Self::apply_backend_op_result_to(
+            &mut self.state,
+            &mut self.response_events,
+            &mut self.background_events,
+            result,
+        );
+    }
+
+    fn apply_backend_op_result_to(
+        state: &mut AppState,
+        response_events: &mut Option<B::PromptStream>,
+        background_events: &mut Option<B::EventStream>,
+        result: BackendOpResult<B>,
+    ) {
+        match result {
+            BackendOpResult::Agents(result) => state.apply_agent_result(result),
+            BackendOpResult::Subscribe(result) => match result {
+                Ok(stream) => *background_events = Some(stream),
+                Err(e) => state.error = Some(alloc::format!("{}", e)),
+            },
+            BackendOpResult::CreateSession { purpose, result } => {
+                state.handle_create_session_result(purpose, result)
+            }
+            BackendOpResult::Submit { submission, result } => {
+                *response_events = state.handle_submit_result::<B>(submission, result);
+            }
+            BackendOpResult::ReloadMessages {
+                dispatch_next,
+                result,
+            } => state.handle_reload_messages(dispatch_next, result),
+            BackendOpResult::ListSessions(result) => state.handle_list_sessions(result),
+            BackendOpResult::LoadSession { result } => state.handle_load_session(result),
+            BackendOpResult::DeleteSession(result) => state.handle_delete_session(result),
+            BackendOpResult::OpenModelPicker { result } => state.handle_open_model_picker(result),
+            BackendOpResult::SelectModel { requested, result } => {
+                state.handle_select_model(requested, result)
+            }
+            BackendOpResult::PermissionReply { message, result } => {
+                state.handle_permission_reply_result(message, result)
+            }
+            BackendOpResult::QuestionReply(result) => state.handle_question_reply_result(result),
+            BackendOpResult::QuestionReject(result) => state.handle_question_reject_result(result),
+            BackendOpResult::Abort(result)
+            | BackendOpResult::Dispose(result)
+            | BackendOpResult::Upgrade(result) => state.handle_simple_result(result),
+            BackendOpResult::RenameSession(result) => state.handle_rename_session(result),
+        }
+    }
+
+    pub async fn run(&mut self) {
+        let Self {
+            state,
+            backend,
+            events,
+            response_events,
+            background_events,
+            ratatui_terminal,
+            poll_cursor,
+        } = self;
+
+        let backend_ptr: *mut B = backend;
+        state.queue_startup();
+        let _ = ratatui_terminal.draw(|frame| state.render(frame));
+
+        let mut active_op: Option<BackendOpFuture<'_, B>> = None;
+        loop {
+            if active_op.is_none() {
+                if let Some(op) = state.pending_ops.pop_front() {
+                    active_op = Some(backend_op_future_from_ptr(backend_ptr, op));
+                }
+            }
+
+            let mut completed_op = None;
+            let event = futures::future::poll_fn(|cx| {
+                for offset in 0..4 {
+                    match offset {
+                        0 => {
+                            if let Some(op) = active_op.as_mut() {
+                                if let Poll::Ready(result) = op.as_mut().poll(cx) {
+                                    completed_op = Some(result);
+                                    return Poll::Ready(DriverEvent::Operation);
+                                }
+                            }
+                        }
+                        1 => {
+                            if let Some(stream) = response_events {
+                                if let Poll::Ready(event) = Pin::new(stream).poll_next(cx) {
+                                    return Poll::Ready(DriverEvent::Response(event));
+                                }
+                            }
+                        }
+                        2 => {
+                            if let Some(stream) = background_events {
+                                if let Poll::Ready(event) = Pin::new(stream).poll_next(cx) {
+                                    return Poll::Ready(DriverEvent::Background(event));
+                                }
+                            }
+                        }
+                        _ => {
+                            if let Poll::Ready(event) = Pin::new(&mut *events).poll_next(cx) {
+                                if let Some(event) = event {
+                                    return Poll::Ready(DriverEvent::Platform(event));
+                                }
+                                return Poll::Ready(DriverEvent::PlatformClosed);
+                            }
+                        }
+                    }
+                }
+                Poll::Pending
+            })
+            .await;
+            *poll_cursor = (*poll_cursor + 1) % 4;
+
+            if let Some(result) = completed_op {
+                active_op = None;
+                Self::apply_backend_op_result_to(state, response_events, background_events, result);
+            }
+
+            let running = match event {
+                DriverEvent::Platform(event) => state.handle_event(event),
+                DriverEvent::Response(Some(Ok(event))) => {
+                    let closes_response =
+                        matches!(event, BackendEvent::Done | BackendEvent::Error { .. });
+                    let running = state.handle_event(Event::Backend(event));
+                    if closes_response {
+                        *response_events = None;
+                    }
+                    running
+                }
+                DriverEvent::Background(Some(Ok(event))) => {
+                    state.handle_event(Event::Backend(event))
+                }
+                DriverEvent::Response(Some(Err(error))) => {
+                    *response_events = None;
+                    state.handle_event(Event::Backend(BackendEvent::Error {
+                        message: alloc::format!("{error}"),
+                    }))
+                }
+                DriverEvent::Background(Some(Err(error))) => {
+                    state.handle_event(Event::Backend(BackendEvent::Error {
+                        message: alloc::format!("{error}"),
+                    }))
+                }
+                DriverEvent::Response(None) => {
+                    *response_events = None;
+                    true
+                }
+                DriverEvent::Background(None) => {
+                    *background_events = None;
+                    true
+                }
+                DriverEvent::Operation => true,
+                DriverEvent::PlatformClosed => false,
+            };
+
+            let _ = ratatui_terminal.draw(|frame| state.render(frame));
+            if !running {
+                break;
+            }
+        }
+    }
+}
+
+impl<B, E, T> Deref for App<B, E, T>
+where
+    B: Backend,
+    E: Stream<Item = Event> + Unpin,
+    T: ratatui_core::backend::Backend,
+{
+    type Target = AppState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl<B, E, T> DerefMut for App<B, E, T>
+where
+    B: Backend,
+    E: Stream<Item = Event> + Unpin,
+    T: ratatui_core::backend::Backend,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
 fn terminal_start_index(line_count: usize, height: u16, scroll: u16) -> usize {
     line_count
         .saturating_sub(height as usize)
@@ -2305,8 +2791,169 @@ mod tests {
     use super::*;
     use crate::event::{KeyEvent, Modifiers, Scancode};
     use ocpncord_backend::mock::{MockBackend, MockSubmissionCall};
+    use ocpncord_backend::{BackendError, Result as BackendResult};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    struct PendingStartupBackend;
+
+    fn pending_backend_error() -> BackendError {
+        BackendError::Connection {
+            message: "not implemented in test backend".into(),
+        }
+    }
+
+    impl Backend for PendingStartupBackend {
+        type PromptStream = futures::stream::Pending<BackendResult<BackendEvent>>;
+        type EventStream = futures::stream::Pending<BackendResult<BackendEvent>>;
+
+        async fn health(&mut self) -> BackendResult<ocpncord_backend::Health> {
+            Err(pending_backend_error())
+        }
+
+        async fn list_agents(&mut self) -> BackendResult<Vec<ocpncord_backend::Agent>> {
+            futures::future::pending().await
+        }
+
+        async fn list_sessions(&mut self) -> BackendResult<Vec<ocpncord_backend::Session>> {
+            Err(pending_backend_error())
+        }
+
+        async fn get_session(
+            &mut self,
+            _id: &ocpncord_backend::SessionId,
+        ) -> BackendResult<ocpncord_backend::Session> {
+            Err(pending_backend_error())
+        }
+
+        async fn create_session(
+            &mut self,
+            _title: &str,
+            _cwd: &str,
+        ) -> BackendResult<ocpncord_backend::Session> {
+            Err(pending_backend_error())
+        }
+
+        async fn delete_session(&mut self, _id: &ocpncord_backend::SessionId) -> BackendResult<()> {
+            Err(pending_backend_error())
+        }
+
+        async fn update_session(
+            &mut self,
+            _id: &ocpncord_backend::SessionId,
+            _title: &str,
+        ) -> BackendResult<ocpncord_backend::Session> {
+            Err(pending_backend_error())
+        }
+
+        async fn children_sessions(
+            &mut self,
+            _id: &ocpncord_backend::SessionId,
+        ) -> BackendResult<Vec<ocpncord_backend::Session>> {
+            Err(pending_backend_error())
+        }
+
+        async fn abort_session(&mut self, _id: &ocpncord_backend::SessionId) -> BackendResult<()> {
+            Err(pending_backend_error())
+        }
+
+        async fn list_messages(
+            &mut self,
+            _id: &ocpncord_backend::SessionId,
+        ) -> BackendResult<Vec<ocpncord_backend::MessageSummary>> {
+            Err(pending_backend_error())
+        }
+
+        async fn get_message(
+            &mut self,
+            _session_id: &ocpncord_backend::SessionId,
+            _message_id: &ocpncord_backend::MessageId,
+        ) -> BackendResult<ocpncord_backend::MessageDetail> {
+            Err(pending_backend_error())
+        }
+
+        async fn prompt(
+            &mut self,
+            _id: &ocpncord_backend::SessionId,
+            _text: &str,
+            _agent: Option<&str>,
+        ) -> BackendResult<Self::PromptStream> {
+            Err(pending_backend_error())
+        }
+
+        async fn command(
+            &mut self,
+            _id: &ocpncord_backend::SessionId,
+            _text: &str,
+            _agent: Option<&str>,
+        ) -> BackendResult<Self::PromptStream> {
+            Err(pending_backend_error())
+        }
+
+        async fn reply_permission(
+            &mut self,
+            _reply: &ocpncord_backend::PermissionReply,
+        ) -> BackendResult<()> {
+            Err(pending_backend_error())
+        }
+
+        async fn reply_question(
+            &mut self,
+            _reply: &ocpncord_backend::QuestionReply,
+        ) -> BackendResult<()> {
+            Err(pending_backend_error())
+        }
+
+        async fn reject_question(&mut self, _request_id: &str) -> BackendResult<()> {
+            Err(pending_backend_error())
+        }
+
+        async fn find_text(
+            &mut self,
+            _pattern: &str,
+        ) -> BackendResult<Vec<ocpncord_backend::TextMatch>> {
+            Err(pending_backend_error())
+        }
+
+        async fn subscribe(&mut self) -> BackendResult<Self::EventStream> {
+            Err(pending_backend_error())
+        }
+
+        async fn get_config(&mut self) -> BackendResult<ocpncord_backend::Config> {
+            Err(pending_backend_error())
+        }
+
+        async fn list_models(&mut self) -> BackendResult<Vec<ocpncord_backend::ModelSummary>> {
+            Err(pending_backend_error())
+        }
+
+        async fn set_auth(&mut self, _provider: &str, _api_key: &str) -> BackendResult<()> {
+            Err(pending_backend_error())
+        }
+
+        async fn set_config(
+            &mut self,
+            _config: &ocpncord_backend::Config,
+        ) -> BackendResult<ocpncord_backend::Config> {
+            Err(pending_backend_error())
+        }
+
+        async fn dispose(&mut self) -> BackendResult<()> {
+            Err(pending_backend_error())
+        }
+
+        async fn upgrade(&mut self) -> BackendResult<()> {
+            Err(pending_backend_error())
+        }
+
+        async fn log(&mut self, _level: &str, _message: &str) -> BackendResult<()> {
+            Err(pending_backend_error())
+        }
+
+        async fn remove_auth(&mut self, _provider: &str) -> BackendResult<()> {
+            Err(pending_backend_error())
+        }
+    }
 
     fn ctrl(key: char) -> Event {
         Event::Key(KeyEvent {
@@ -2327,14 +2974,44 @@ mod tests {
         })
     }
 
-    fn run<B: Backend>(app: &mut App<B>, event: Event) -> bool {
+    type TestApp<B> = App<B, futures::stream::Empty<Event>, TestBackend>;
+
+    fn new_app<B: Backend>(backend: B) -> TestApp<B> {
+        App::new(
+            backend,
+            futures::stream::empty(),
+            Terminal::new(TestBackend::new(80, 24)).unwrap(),
+        )
+    }
+
+    fn new_app_with_events<B: Backend, E: futures_core::Stream<Item = Event> + Unpin>(
+        backend: B,
+        events: E,
+    ) -> App<B, E, TestBackend> {
+        App::new(
+            backend,
+            events,
+            Terminal::new(TestBackend::new(80, 24)).unwrap(),
+        )
+    }
+
+    fn run<B: Backend>(app: &mut TestApp<B>, event: Event) -> bool {
         futures::executor::block_on(app.handle_event(event))
     }
 
-    fn next_backend_event<B: Backend>(
-        app: &mut App<B>,
+    fn next_response_event<B: Backend>(
+        app: &mut TestApp<B>,
     ) -> Option<Result<BackendEvent, ocpncord_backend::BackendError>> {
-        futures::executor::block_on(app.poll_next_event())
+        futures::executor::block_on(async {
+            use futures::StreamExt;
+
+            let stream = app.response_events.as_mut()?;
+            let event = stream.next().await;
+            if event.is_none() {
+                app.response_events = None;
+            }
+            event
+        })
     }
 
     fn rendered_screen(terminal: &Terminal<TestBackend>) -> String {
@@ -2350,14 +3027,14 @@ mod tests {
     #[test]
     fn ctrl_c_quits() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         assert!(!run(&mut app, ctrl('c')));
     }
 
     #[test]
     fn ctrl_x_q_quits() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         run(&mut app, ctrl('x'));
         assert!(!run(
             &mut app,
@@ -2371,14 +3048,14 @@ mod tests {
     #[test]
     fn starts_on_start_page() {
         let backend = MockBackend::default();
-        let app = App::new(backend);
+        let app = new_app(backend);
         assert_eq!(app.active_screen(), ScreenId::StartPage);
     }
 
     #[test]
     fn non_quit_events_keep_running() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         assert!(run(&mut app, char_key('a')));
         assert!(run(&mut app, char_key('b')));
     }
@@ -2386,7 +3063,7 @@ mod tests {
     #[test]
     fn leader_times_out_after_ticks() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         run(&mut app, ctrl('x'));
         for _ in 0..40 {
             run(&mut app, Event::Tick);
@@ -2400,7 +3077,7 @@ mod tests {
     #[test]
     fn init_fallback_to_default_agents_when_backend_returns_empty() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         futures::executor::block_on(app.init());
         assert_eq!(app.active_agent_name(), "build");
     }
@@ -2420,7 +3097,7 @@ mod tests {
             prompt: None,
             steps: None,
         }];
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         futures::executor::block_on(app.init());
         assert_eq!(app.active_agent_name(), "coder");
     }
@@ -2466,7 +3143,7 @@ mod tests {
                 steps: None,
             },
         ];
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         futures::executor::block_on(app.init());
 
         // Move to index 1 (plan)
@@ -2526,7 +3203,7 @@ mod tests {
                 steps: None,
             },
         ];
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         futures::executor::block_on(app.init());
 
         // Tab at index 0 → index 1
@@ -2566,7 +3243,7 @@ mod tests {
                 steps: None,
             },
         ];
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         futures::executor::block_on(app.init());
 
         // Shift+Tab at index 0 → wraps to last index
@@ -2603,7 +3280,7 @@ mod tests {
                 steps: None,
             },
         ];
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         futures::executor::block_on(app.init());
         assert_eq!(app.active_agent_name(), "build");
 
@@ -2641,7 +3318,7 @@ mod tests {
             },
         ];
         backend.prompt_events = vec![Ok(ocpncord_backend::BackendEvent::Done)];
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         futures::executor::block_on(app.init());
         // Tab to "plan"
@@ -2679,8 +3356,85 @@ mod tests {
     #[test]
     fn explicit_quit_event_quits() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         assert!(!run(&mut app, Event::Quit));
+    }
+
+    #[test]
+    fn run_exits_on_quit_event_and_redraws() {
+        let backend = MockBackend::default();
+        let events = futures::stream::iter(vec![Event::Quit]);
+        let mut app = new_app_with_events(backend, events);
+
+        futures::executor::block_on(app.run());
+
+        let screen = rendered_screen(app.terminal());
+        assert!(screen.contains(">"), "screen: {screen}");
+    }
+
+    #[test]
+    fn run_exits_on_quit_while_startup_backend_op_is_pending() {
+        let events = futures::stream::iter(vec![Event::Quit]);
+        let mut app = App::new(
+            PendingStartupBackend,
+            events,
+            Terminal::new(TestBackend::new(80, 24)).unwrap(),
+        );
+
+        futures::executor::block_on(app.run());
+
+        let screen = rendered_screen(app.terminal());
+        assert!(screen.contains(">"), "screen: {screen}");
+    }
+
+    #[test]
+    fn run_handles_background_events_from_subscribe() {
+        let mut backend = MockBackend::default();
+        backend.event_events = vec![Ok(ocpncord_backend::BackendEvent::SessionCreated {
+            session: make_session("session-from-background", "Background"),
+        })];
+        let events = futures::stream::iter(vec![Event::Tick, Event::Quit]);
+        let mut app = new_app_with_events(backend, events);
+
+        futures::executor::block_on(app.run());
+
+        assert_eq!(
+            app.active_session().map(|session| session.id.as_str()),
+            Some("session-from-background")
+        );
+    }
+
+    #[test]
+    fn run_keeps_platform_events_responsive_while_response_stream_is_active() {
+        let mut backend = MockBackend::default();
+        backend.prompt_events = vec![Ok(ocpncord_backend::BackendEvent::Part {
+            part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                text: "assistant".into(),
+            }),
+            delta: None,
+        })];
+        let events =
+            futures::stream::iter(vec![char_key('h'), enter_key(), char_key('n'), Event::Quit]);
+        let mut app = new_app_with_events(backend, events);
+
+        futures::executor::block_on(app.run());
+
+        assert_eq!(app.prompt_text(), "n");
+        assert_eq!(app.partial_parts().len(), 1);
+    }
+
+    #[test]
+    fn run_clears_exhausted_streams_without_exiting() {
+        let backend = MockBackend::default();
+        let events =
+            futures::stream::iter(vec![char_key('h'), enter_key(), char_key('n'), Event::Quit]);
+        let mut app = new_app_with_events(backend, events);
+
+        futures::executor::block_on(app.run());
+
+        assert_eq!(app.prompt_text(), "n");
+        assert!(app.response_events.is_none());
+        assert!(app.background_events.is_none());
     }
 
     fn enter_key() -> Event {
@@ -2709,7 +3463,7 @@ mod tests {
             }),
             Ok(ocpncord_backend::BackendEvent::Done),
         ];
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
@@ -2717,13 +3471,13 @@ mod tests {
         assert!(running);
         assert!(app.is_streaming());
 
-        let event = next_backend_event(&mut app)
+        let event = next_response_event(&mut app)
             .expect("prompt stream should yield a part")
             .expect("part event should not error");
         run(&mut app, Event::Backend(event));
         assert_eq!(app.partial_parts().len(), 1);
 
-        let event = next_backend_event(&mut app)
+        let event = next_response_event(&mut app)
             .expect("prompt stream should yield Done")
             .expect("Done event should not error");
         run(&mut app, Event::Backend(event));
@@ -2741,7 +3495,7 @@ mod tests {
     #[test]
     fn streaming_keeps_prompt_editable_and_status_on_bottom_line() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
@@ -2782,7 +3536,7 @@ mod tests {
     #[test]
     fn start_page_status_line_matches_prompt_width_without_prompt_background() {
         let backend = MockBackend::default();
-        let app = App::new(backend);
+        let app = new_app(backend);
 
         let test_backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(test_backend).unwrap();
@@ -2823,7 +3577,7 @@ mod tests {
             label: &str,
         ) -> Option<ratatui::style::Color> {
             let backend = MockBackend::default();
-            let mut app = App::new(backend);
+            let mut app = new_app(backend);
             app.agents = vec![ocpncord_backend::Agent {
                 name: "agent".into(),
                 description: None,
@@ -2868,7 +3622,7 @@ mod tests {
     #[test]
     fn queued_messages_render_after_active_assistant_and_dispatch_in_order() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         for ch in "first".chars() {
             run(&mut app, char_key(ch));
@@ -2928,7 +3682,7 @@ mod tests {
     #[test]
     fn response_indicator_survives_early_done_for_late_sse_parts() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
@@ -2952,7 +3706,7 @@ mod tests {
     #[test]
     fn queued_prompt_waits_for_assistant_activity_before_dispatching() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         for ch in "first".chars() {
             run(&mut app, char_key(ch));
@@ -2982,7 +3736,7 @@ mod tests {
     #[test]
     fn bang_command_submits_via_command_backend() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, char_key('!'));
         run(&mut app, char_key('p'));
@@ -3012,7 +3766,7 @@ mod tests {
     #[test]
     fn sse_message_part_updated_accumulates_when_streaming() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         // Type and send a message to enter streaming mode
         run(&mut app, char_key('h'));
@@ -3053,7 +3807,7 @@ mod tests {
     #[test]
     fn duplicate_sse_part_events_do_not_duplicate_visible_assistant_text() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         for ch in "hello from regression test".chars() {
             run(&mut app, char_key(ch));
@@ -3169,7 +3923,7 @@ mod tests {
     #[test]
     fn sse_message_part_delta_accumulates_text_when_streaming() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         // Send message to enter streaming mode
         run(&mut app, char_key('h'));
@@ -3235,7 +3989,7 @@ mod tests {
     #[test]
     fn reasoning_delta_updates_reasoning_part_in_place() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
@@ -3297,7 +4051,7 @@ mod tests {
     #[test]
     fn sse_message_part_updated_ignored_when_not_streaming() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         // NOT streaming — just sitting on the start page
         assert!(!app.is_streaming());
@@ -3324,7 +4078,7 @@ mod tests {
         backend.prompt_events = vec![Ok(ocpncord_backend::BackendEvent::Error {
             message: "connection lost".into(),
         })];
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, char_key('h'));
         run(&mut app, enter_key());
@@ -3347,7 +4101,7 @@ mod tests {
             status: 500,
             message: "server error".into(),
         });
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, char_key('h'));
         let running = run(
@@ -3372,7 +4126,7 @@ mod tests {
     #[test]
     fn typing_enter_creates_session_and_switches_to_chat() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         assert_eq!(app.active_screen(), ScreenId::StartPage);
 
         run(&mut app, char_key('h'));
@@ -3397,7 +4151,7 @@ mod tests {
     #[test]
     fn enter_on_empty_input_does_nothing() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         let running = run(
             &mut app,
@@ -3440,7 +4194,7 @@ mod tests {
             make_session("s1", "First session"),
             make_session("s2", "Second session"),
         ];
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, ctrl('x'));
         run(
@@ -3465,7 +4219,7 @@ mod tests {
     #[test]
     fn session_list_shows_empty_state() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, ctrl('x'));
         run(
@@ -3487,7 +4241,7 @@ mod tests {
     #[test]
     fn ctrl_x_l_opens_session_list_modal() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, ctrl('x'));
         run(
@@ -3521,7 +4275,7 @@ mod tests {
             }
         }
 
-        let mut app = App::new(MockBackend::default());
+        let mut app = new_app(MockBackend::default());
         app.set_active_modal(Box::new(TestCloseModal));
         assert!(
             app.active_modal().is_some(),
@@ -3544,7 +4298,7 @@ mod tests {
     #[test]
     fn slash_sessions_opens_modal() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, char_key('/'));
         run(&mut app, char_key('s'));
@@ -3567,7 +4321,7 @@ mod tests {
     fn unknown_slash_command_submits_as_message() {
         let mut backend = MockBackend::default();
         backend.prompt_events = vec![Ok(ocpncord_backend::BackendEvent::Done)];
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, char_key('/'));
         run(&mut app, char_key('u'));
@@ -3593,7 +4347,7 @@ mod tests {
     #[test]
     fn new_command_creates_session_and_stays_on_chat() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
@@ -3625,7 +4379,7 @@ mod tests {
     #[test]
     fn slash_models_opens_modal() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, char_key('/'));
         run(&mut app, char_key('m'));
@@ -3645,7 +4399,7 @@ mod tests {
     #[test]
     fn slash_help_opens_modal() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, char_key('/'));
         run(&mut app, char_key('h'));
@@ -3663,7 +4417,7 @@ mod tests {
     #[test]
     fn slash_todos_selects_todos_panel_and_clears_prompt() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         for ch in "/todos".chars() {
             run(&mut app, char_key(ch));
@@ -3678,7 +4432,7 @@ mod tests {
     #[test]
     fn ctrl_x_o_toggles_todos_panel() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('o'));
@@ -3694,7 +4448,7 @@ mod tests {
     #[test]
     fn ctrl_x_d_selects_diagnostics_when_todos_panel_is_open() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('o'));
@@ -3709,7 +4463,7 @@ mod tests {
     #[test]
     fn ctrl_x_m_opens_model_picker_modal() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, ctrl('x'));
         run(
@@ -3735,7 +4489,7 @@ mod tests {
             name: Some("Claude Sonnet".into()),
             ..Default::default()
         }]);
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('m'));
@@ -3776,7 +4530,7 @@ mod tests {
             )]),
             agent: Default::default(),
         });
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('m'));
@@ -3800,7 +4554,7 @@ mod tests {
     #[test]
     fn ctrl_x_h_opens_help_modal() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, ctrl('x'));
         run(
@@ -3820,7 +4574,7 @@ mod tests {
     #[test]
     fn escape_closes_help_modal() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, ctrl('x'));
         run(
@@ -3848,7 +4602,7 @@ mod tests {
     #[test]
     fn modal_overlay_clears_background_symbols() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         // Open help modal on start page so logo gets drawn under the overlay
         run(&mut app, ctrl('x'));
@@ -3890,7 +4644,7 @@ mod tests {
     #[test]
     fn ctrl_x_leader_does_not_leak_to_prompt_bar() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         // Type "hello" into the prompt bar
         run(&mut app, char_key('h'));
@@ -3935,7 +4689,7 @@ mod tests {
     #[test]
     fn ctrl_x_t_toggles_terminal_screen() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         assert_eq!(app.active_screen(), ScreenId::StartPage);
 
         // Ctrl+X T on StartPage → Terminal
@@ -3960,7 +4714,7 @@ mod tests {
     #[test]
     fn terminal_screen_plain_keys_do_not_mutate_prompt() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('t'));
@@ -3974,7 +4728,7 @@ mod tests {
     #[test]
     fn terminal_screen_scrolls_from_bottom_with_arrow_and_page_keys() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         app.terminal.pty_id = Some("pty-1".into());
         app.terminal.command = "sh".into();
         for idx in 0..12 {
@@ -4032,7 +4786,7 @@ mod tests {
     #[test]
     fn terminal_screen_scroll_offset_changes_visible_output() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         app.terminal.pty_id = Some("pty-1".into());
         app.terminal.command = "sh".into();
         for idx in 0..12 {
@@ -4059,7 +4813,7 @@ mod tests {
     #[test]
     fn diagnostics_panel_renders_table_columns() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         app.side_panel_visible = true;
         app.side_panel_tab = crate::screen::Tab::Diagnostics;
         app.lsp_diagnostics.insert(
@@ -4086,7 +4840,7 @@ mod tests {
     #[test]
     fn todos_panel_renders_list_items_with_status_styles() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         app.side_panel_visible = true;
         app.side_panel_tab = crate::screen::Tab::Todos;
         app.todos = vec![
@@ -4127,7 +4881,7 @@ mod tests {
     #[test]
     fn terminal_side_panel_uses_terminal_scroll_offset() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         app.side_panel_visible = true;
         app.side_panel_tab = crate::screen::Tab::Pane;
         app.terminal.pty_id = Some("pty-1".into());
@@ -4154,7 +4908,7 @@ mod tests {
     #[test]
     fn prompt_row_stays_visible_at_narrow_widths() {
         let backend = MockBackend::default();
-        let app = App::new(backend);
+        let app = new_app(backend);
 
         let test_backend = TestBackend::new(24, 6);
         let mut terminal = Terminal::new(test_backend).unwrap();
@@ -4167,7 +4921,7 @@ mod tests {
     #[test]
     fn escape_clears_prompt_when_no_modal_is_open() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
@@ -4186,7 +4940,7 @@ mod tests {
     #[test]
     fn command_palette_enter_closes_palette_before_applying_action() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         run(&mut app, ctrl('p'));
         assert_eq!(
@@ -4207,7 +4961,7 @@ mod tests {
     #[test]
     fn terminal_screen_shows_message_when_no_pty() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         // Switch to terminal
         run(&mut app, ctrl('x'));
@@ -4233,7 +4987,7 @@ mod tests {
     #[test]
     fn side_panel_clears_background_chat_symbols() {
         let backend = MockBackend::default();
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
 
         // Toggle side panel on (while on start page, which has the logo)
         run(&mut app, ctrl('x'));
@@ -4278,7 +5032,7 @@ mod tests {
             }),
             Ok(ocpncord_backend::BackendEvent::Done),
         ];
-        let mut app = App::new(backend);
+        let mut app = new_app(backend);
         futures::executor::block_on(app.init());
 
         run(&mut app, char_key('h'));
@@ -4331,7 +5085,7 @@ mod tests {
 
     #[test]
     fn toast_renderer_shows_newest_first_and_caps_visible_count() {
-        let mut app = App::new(MockBackend::default());
+        let mut app = new_app(MockBackend::default());
         for idx in 0..6 {
             app.push_toast(Toast {
                 title: Some(alloc::format!("Toast{idx}")),
@@ -4360,7 +5114,7 @@ mod tests {
 
     #[test]
     fn toast_renderer_handles_narrow_terminals_and_storage_cap() {
-        let mut app = App::new(MockBackend::default());
+        let mut app = new_app(MockBackend::default());
         for idx in 0..20 {
             app.push_toast(Toast {
                 title: Some(alloc::format!("T{idx}")),
@@ -4386,7 +5140,7 @@ mod tests {
 
     #[test]
     fn tick_expires_toasts_and_modal_suppresses_rendering() {
-        let mut app = App::new(MockBackend::default());
+        let mut app = new_app(MockBackend::default());
         app.push_toast(Toast {
             title: Some("HiddenToast".into()),
             message: "toast message".into(),
@@ -4409,7 +5163,7 @@ mod tests {
 
     #[test]
     fn permission_request_opens_modal_and_enter_replies_once() {
-        let mut app = App::new(MockBackend::default());
+        let mut app = new_app(MockBackend::default());
 
         run(
             &mut app,
@@ -4440,7 +5194,7 @@ mod tests {
 
     #[test]
     fn permission_escape_rejects_and_opens_next_queued_request() {
-        let mut app = App::new(MockBackend::default());
+        let mut app = new_app(MockBackend::default());
 
         run(
             &mut app,
@@ -4475,7 +5229,7 @@ mod tests {
 
     #[test]
     fn external_permission_reply_removes_matching_id_without_popping_front() {
-        let mut app = App::new(MockBackend::default());
+        let mut app = new_app(MockBackend::default());
 
         run(
             &mut app,
@@ -4514,7 +5268,7 @@ mod tests {
 
     #[test]
     fn question_request_submits_nested_answers_and_escape_rejects() {
-        let mut app = App::new(MockBackend::default());
+        let mut app = new_app(MockBackend::default());
 
         run(
             &mut app,

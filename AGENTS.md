@@ -39,9 +39,9 @@ Before committing, always run `cargo fmt --all` and `cargo check`.
 ## Key facts
 
 - All serde types use `#[serde(rename_all = "camelCase")]` — JSON from the Agent API is camelCase.
-- `prompt()`/`command()` are fire-and-forget (HTTP returns immediately, response through SSE). `subscribe()`/`sync_events()` use `BufferedStream` for SSE parsing.
+- `prompt()`/`command()` are fire-and-forget (HTTP returns immediately, response through SSE). `subscribe()` uses `BufferedStream` for SSE parsing.
 - `MockBackend` (feature `mock` on `ocpncord-backend`) returns canned data for TUI tests.
-- `App<B: Backend>`. Screens: `StartPage`, `Chat`, `Terminal` (PTY). PromptBar modes: `/` command, `!` shell, `@` fileref.
+- `App<B, E, T>` owns the backend, platform event stream, backend streams, and Ratatui terminal. Screens: `StartPage`, `Chat`, `Terminal` (PTY). PromptBar modes: `/` command, `!` shell, `@` fileref.
 - Key bindings (`tui/src/key_chord.rs`): `Ctrl+C` quit, `Ctrl+X` leader (40-tick timeout → Q/L/M/H/T/D/O), `Ctrl+P` palette, `D`/`O` both toggle side panel. `Esc` closes modal / interrupts streaming. `Tab`/`Shift+Tab` cycles agents.
 - Workspace deps in root `Cargo.toml`, `resolver = "2"`. Uses `ratatui-core` 0.1 (not main `ratatui`).
 - Native binary accepts `--url` (default `http://localhost:4096`), uses `clap`.

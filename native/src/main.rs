@@ -1,10 +1,14 @@
 use core::convert::Infallible;
+use core::future::Future;
 use core::net::IpAddr;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 use std::fs::OpenOptions;
 use std::io::{stdout, Write};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures::Stream;
 use log::{LevelFilter, Log, Metadata, Record};
 
 use clap::Parser;
@@ -18,7 +22,6 @@ use crossterm::terminal::{
 use crossterm::{execute, queue};
 use embedded_io_async::{ErrorType, Read};
 use embedded_nal_async::{AddrType, Dns, TcpConnect};
-use ocpncord_backend::BackendEvent;
 use ocpncord_backend_opencode::OpenCodeBackend;
 use ocpncord_tui::Event;
 use ocpncord_tui::{App, KeyEvent, Modifiers, Scancode};
@@ -28,8 +31,8 @@ use ratatui_core::layout::{Position, Size};
 use ratatui_core::style::{Color, Modifier};
 use ratatui_core::terminal::Terminal;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use tokio::task::JoinHandle;
+use tokio::time::{interval, Duration, Interval};
 
 struct TuiLogger {
     file: Mutex<Option<std::fs::File>>,
@@ -375,6 +378,61 @@ fn translate_crossterm_event(event: crossterm::event::Event) -> Option<Event> {
     }
 }
 
+struct NativeEvents {
+    tick_interval: Interval,
+    input: Option<JoinHandle<Option<Event>>>,
+}
+
+impl NativeEvents {
+    fn new() -> Self {
+        Self {
+            tick_interval: interval(Duration::from_millis(50)),
+            input: Some(spawn_input_read()),
+        }
+    }
+}
+
+fn spawn_input_read() -> JoinHandle<Option<Event>> {
+    tokio::task::spawn_blocking(|| {
+        if !crossterm::event::poll(Duration::from_millis(50)).unwrap_or(false) {
+            return None;
+        }
+
+        crossterm::event::read()
+            .ok()
+            .and_then(translate_crossterm_event)
+    })
+}
+
+impl Stream for NativeEvents {
+    type Item = Event;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.input.is_none() {
+            self.input = Some(spawn_input_read());
+        }
+
+        if let Some(input) = &mut self.input {
+            match Pin::new(input).poll(cx) {
+                Poll::Ready(Ok(Some(event))) => {
+                    self.input = Some(spawn_input_read());
+                    return Poll::Ready(Some(event));
+                }
+                Poll::Ready(Ok(None)) | Poll::Ready(Err(_)) => {
+                    self.input = Some(spawn_input_read());
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        if Pin::new(&mut self.tick_interval).poll_tick(cx).is_ready() {
+            return Poll::Ready(Some(Event::Tick));
+        }
+
+        Poll::Pending
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "ocpncord-native",
@@ -407,78 +465,12 @@ async fn main() {
     static TCP: StdTcp = StdTcp;
     static DNS: StdDns = StdDns;
     let backend = OpenCodeBackend::new(&cli.url, &TCP, &DNS);
-    let mut app = App::new(backend);
+    let terminal = setup_terminal();
+    let events = NativeEvents::new();
+    let mut app = App::new(backend, events, terminal);
 
     app.set_cwd(cli.cwd);
-    app.init().await;
-
-    let mut terminal = setup_terminal();
-
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Option<Event>>();
-
-    // Keyboard input
-    let input_event_tx = event_tx.clone();
-    tokio::spawn(async move {
-        loop {
-            let event = tokio::task::spawn_blocking(|| {
-                crossterm::event::read()
-                    .ok()
-                    .and_then(translate_crossterm_event)
-            })
-            .await
-            .ok()
-            .flatten();
-            if input_event_tx.send(event).is_err() {
-                break;
-            }
-        }
-    });
-
-    // Main loop -----------------------------------------------------------
-
-    let mut running = true;
-    let mut tick_interval = interval(Duration::from_millis(50));
-
-    while running {
-        tokio::select! {
-            maybe_event = event_rx.recv() => {
-                if let Some(Some(ref event)) = maybe_event {
-                    log::debug!("[DEBUG] event: {event:?}");
-                    if matches!(event, Event::Backend(BackendEvent::Done)) {
-                        log::debug!("[DEBUG] Done received — is_streaming={} partial_parts={} messages={}", app.is_streaming(), app.partial_parts().len(), app.messages().len());
-                    }
-                }
-
-                if let Some(Some(event)) = maybe_event {
-                    running = app.handle_event(event).await;
-                }
-            }
-            backend_event = app.poll_next_event(), if app.has_event_stream() => {
-                if let Some(result) = backend_event {
-                    let event = match result {
-                        Ok(event) => Event::Backend(event),
-                        Err(error) => Event::Backend(BackendEvent::Error {
-                            message: format!("{error}"),
-                        }),
-                    };
-                    running = app.handle_event(event).await;
-                }
-            }
-            _ = tick_interval.tick() => {
-                running = app.handle_event(Event::Tick).await;
-            }
-        }
-
-        log::trace!(
-            "[RENDER] screen={:?} is_streaming={} partial_parts={} messages={} tick={}",
-            app.active_screen(),
-            app.is_streaming(),
-            app.partial_parts().len(),
-            app.messages().len(),
-            app.tick()
-        );
-        let _ = terminal.draw(|frame| app.render(frame));
-    }
+    app.run().await;
 
     let _ = execute!(stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();

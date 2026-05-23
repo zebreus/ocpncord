@@ -360,8 +360,6 @@ pub trait Backend {
 
     async fn set_auth(&mut self, provider: &str, api_key: &str) -> Result<()>;
 
-    async fn sync_events(&mut self) -> Result<Self::EventStream>;
-
     async fn set_config(&mut self, config: &Config) -> Result<Config>;
 
     async fn dispose(&mut self) -> Result<()>;

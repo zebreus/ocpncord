@@ -492,11 +492,6 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         Ok(())
     }
 
-    async fn sync_events(&mut self) -> Result<Self::EventStream> {
-        let url = alloc::format!("{}/global/sync-event", self.base_url);
-        Ok(incremental_sse_stream(self.transport, self.dns, url))
-    }
-
     async fn set_config(&mut self, config: &Config) -> Result<Config> {
         let url = alloc::format!("{}/global/config", self.base_url);
         let body = ocpncord_backend::ConfigBody {

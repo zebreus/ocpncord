@@ -287,12 +287,13 @@ fn parse_json<'a, T: Deserialize<'a>>(data: &'a str) -> core::result::Result<T, 
 /// {"directory": "/path", "payload": {"type": "message.part.delta", "properties": {...}}}
 /// ```
 ///
-/// **Sync event format** — emitted by `SyncEvent`s (e.g. `message.part.updated`, `session.created`):
+/// **Wrapped wire payload format** — emitted with `type: "sync"` envelopes
+/// (e.g. `message.part.updated`, `session.created`):
 /// ```json
 /// {"directory": "/path", "payload": {"type": "sync", "syncEvent": {"type": "message.part.updated.1", "data": {...}}}}
 /// ```
 ///
-/// **Flat (Event) format** — used in `sync_events` HTTP responses:
+/// **Flat (Event) format** — accepted for wire compatibility:
 /// ```json
 /// {"type": "message.part.updated", "properties": {...}}
 /// ```
@@ -317,8 +318,9 @@ fn parse_sse_block(block: &[u8]) -> Option<Result<BackendEvent>> {
     let payload = value.get("payload").unwrap_or(&value);
     let event_type = payload.get("type").and_then(|v| v.as_str())?;
 
-    // SyncEvents arrive wrapped: { type: "sync", syncEvent: { type: "event.type.version", data: {...} } }
-    // Unwrap to the inner event type and use `syncEvent.data` as properties.
+    // Some server events arrive wrapped as { type: "sync", syncEvent: { type:
+    // "event.type.version", data: {...} } }. Unwrap to the inner event type
+    // and use `syncEvent.data` as properties.
     let (event_type, props) = if event_type == "sync" {
         let sync_event = payload.get("syncEvent")?;
         let inner_type = sync_event.get("type").and_then(|v| v.as_str())?;
@@ -638,7 +640,7 @@ fn parse_sse_block(block: &[u8]) -> Option<Result<BackendEvent>> {
             }))
         }
 
-        // --- Sync event stream variants (from /global/sync-event) ---
+        // --- Versioned sync payload variants carried by the event stream ---
         "message.updated.1" => {
             let session_id = props.get("sessionID").and_then(|v| v.as_str())?;
             let message = props
@@ -674,15 +676,15 @@ fn parse_sse_block(block: &[u8]) -> Option<Result<BackendEvent>> {
             }))
         }
         "session.created.1" | "session.updated.1" | "session.deleted.1" => {
-            // Sync session events wrap data differently
-            parse_sync_session_event(event_type, props)
+            // Wrapped session payloads carry the session object in `data.info`.
+            parse_wrapped_session_event(event_type, props)
         }
 
         _ => None,
     }
 }
 
-fn parse_sync_session_event(
+fn parse_wrapped_session_event(
     event_type: &str,
     props: &serde_json::Value,
 ) -> Option<Result<BackendEvent>> {
@@ -726,7 +728,7 @@ fn parse_message_updated_value(props: &serde_json::Value) -> Option<Result<Backe
 
 /// Parse a `message.part.updated` event data JSON into a `BackendEvent::Part`.
 ///
-/// The `sessionID` may be at `properties.sessionID` (sync format) or
+/// The `sessionID` may be at `properties.sessionID` (wrapped format) or
 /// inside the `part` object at `properties.part.sessionID` (live SSE format).
 fn parse_part_updated_value(props: &serde_json::Value) -> Option<Result<BackendEvent>> {
     let part = props
@@ -1112,26 +1114,26 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    // --- SyncEvent format tests ---
-    // SyncEvents arrive wrapped: { type: "sync", syncEvent: { type: "event.type.version", data: {...} } }
+    // --- Wrapped wire payload tests ---
 
-    /// Helper to wrap event data in the SyncEvent envelope (as sent by the real server).
-    fn wrap_sync_event(event_type: &str, version: u32, data_json: &str) -> String {
+    /// Helper for server payloads wrapped as
+    /// `{ type: "sync", syncEvent: { type: "event.type.version", data: {...} } }`.
+    fn wrap_wire_event(event_type: &str, version: u32, data_json: &str) -> String {
         format!(
             "{{\"directory\":\"/tmp\",\"payload\":{{\"type\":\"sync\",\"syncEvent\":{{\"type\":\"{event_type}.{version}\",\"id\":\"evt_test\",\"seq\":0,\"aggregateID\":\"ses1\",\"data\":{data_json}}}}}}}"
         )
     }
 
     #[test]
-    fn parse_sync_message_part_updated_text() {
-        let data = wrap_sync_event(
+    fn parse_wrapped_message_part_updated_text() {
+        let data = wrap_wire_event(
             "message.part.updated",
             1,
-            "{\"sessionID\":\"ses1\",\"part\":{\"id\":\"prt1\",\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"type\":\"text\",\"text\":\"Hello from sync\"},\"time\":0}",
+            "{\"sessionID\":\"ses1\",\"part\":{\"id\":\"prt1\",\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"type\":\"text\",\"text\":\"Hello from wrapped payload\"},\"time\":0}",
         );
         let sse = format!("event: message\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
-        assert_eq!(events.len(), 1, "sync event should be parsed");
+        assert_eq!(events.len(), 1, "wrapped payload should be parsed");
         match &events[0] {
             Ok(BackendEvent::MessagePartUpdated { session_id, part }) => {
                 assert_eq!(session_id, "ses1");
@@ -1142,8 +1144,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_sync_message_updated_as_done() {
-        let data = wrap_sync_event(
+    fn parse_wrapped_message_updated_as_done() {
+        let data = wrap_wire_event(
             "message.updated",
             1,
             "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"summary\":null,\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}",
@@ -1153,14 +1155,14 @@ mod tests {
         assert_eq!(
             events.len(),
             1,
-            "sync message.updated should be parsed as Done"
+            "wrapped message.updated should be parsed as Done"
         );
         assert!(matches!(events[0], Ok(BackendEvent::Done)));
     }
 
     #[test]
-    fn parse_sync_session_created() {
-        let data = wrap_sync_event(
+    fn parse_wrapped_session_created() {
+        let data = wrap_wire_event(
             "session.created",
             1,
             "{\"sessionID\":\"ses123\",\"info\":{\"id\":\"ses123\",\"title\":\"Test\",\"projectID\":\"proj1\",\"directory\":\"/tmp\",\"slug\":\"\",\"version\":\"1\",\"time\":{\"created\":0,\"updated\":0}}}",
@@ -1177,8 +1179,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_sync_message_part_removed() {
-        let data = wrap_sync_event(
+    fn parse_wrapped_message_part_removed() {
+        let data = wrap_wire_event(
             "message.part.removed",
             1,
             "{\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"partID\":\"prt1\"}",
@@ -1201,10 +1203,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_sync_and_bus_events_interleaved() {
-        // Real server sends sync events for SyncEvents and bus events for BusEvents.
+    fn parse_wrapped_and_bus_events_interleaved() {
+        // Real server can send wrapped payload events alongside BusEvents.
         // Both should parse correctly.
-        let sync = wrap_sync_event(
+        let wrapped = wrap_wire_event(
             "message.part.updated",
             1,
             "{\"sessionID\":\"ses1\",\"part\":{\"id\":\"prt1\",\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"type\":\"text\",\"text\":\"One\"},\"time\":0}",
@@ -1213,13 +1215,13 @@ mod tests {
             "message.part.delta",
             "{\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"partID\":\"prt1\",\"field\":\"text\",\"delta\":\" world\"}",
         );
-        let done = wrap_sync_event(
+        let done = wrap_wire_event(
             "message.updated",
             1,
             "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"summary\":null,\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}",
         );
         let sse = format!(
-            "event: message\ndata: {sync}\n\nevent: message\ndata: {bus}\n\nevent: message\ndata: {done}\n\n"
+            "event: message\ndata: {wrapped}\n\nevent: message\ndata: {bus}\n\nevent: message\ndata: {done}\n\n"
         );
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 3, "all three events should parse");

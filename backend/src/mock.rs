@@ -238,11 +238,6 @@ impl Backend for MockBackend {
         Ok(())
     }
 
-    async fn sync_events(&mut self) -> Result<Self::EventStream> {
-        let events = core::mem::take(&mut self.event_events);
-        Ok(MockStream { events, pos: 0 })
-    }
-
     async fn set_config(&mut self, config: &Config) -> Result<Config> {
         if self.config_info.is_none() {
             return Err(BackendError::Connection {
