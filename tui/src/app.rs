@@ -2100,17 +2100,13 @@ impl AppState {
 
         if let Some(ref modal) = self.active_modal {
             let area = frame.area();
-            Clear.render(area, frame.buffer_mut());
-            Block::new()
-                .style(self.theme.bg)
-                .render(area, frame.buffer_mut());
             let (modal_width, modal_height) = modal.preferred_size(area);
             let modal_x = area.x + (area.width.saturating_sub(modal_width)) / 2;
             let modal_y = area.y + (area.height.saturating_sub(modal_height)) / 2;
             let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
             Clear.render(modal_area, frame.buffer_mut());
             let block = Block::bordered()
-                .style(self.theme.bg)
+                .style(Style::new())
                 .border_type(BorderType::Rounded)
                 .border_style(self.theme.border)
                 .title_style(self.theme.text_accent)
@@ -4602,7 +4598,7 @@ mod tests {
     }
 
     #[test]
-    fn modal_overlay_clears_background_symbols() {
+    fn modal_overlay_preserves_background_outside_modal() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
 
@@ -4619,15 +4615,46 @@ mod tests {
         terminal.draw(|frame| app.state.render(frame)).unwrap();
         let buf = terminal.backend().buffer();
 
-        // app.state.render() draws the start page first, then clears only the
-        // modal rectangle before drawing the modal block. Background content
-        // may remain outside the modal, but must not bleed through inside it.
-        let modal_area = Rect::new(15, 0, 50, 24);
+        let frame_area = Rect::new(0, 0, 80, 24);
+        let modal = app
+            .state
+            .active_modal()
+            .expect("help modal should still be active");
+        let (modal_width, modal_height) = modal.preferred_size(frame_area);
+        let modal_area = Rect::new(
+            frame_area.x + (frame_area.width.saturating_sub(modal_width)) / 2,
+            frame_area.y + (frame_area.height.saturating_sub(modal_height)) / 2,
+            modal_width,
+            modal_height,
+        );
+        let content_area = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .inner(modal_area);
         let mut has_logo_block_inside_modal = false;
-        for y in modal_area.top()..modal_area.bottom() {
-            for x in modal_area.left()..modal_area.right() {
-                if buf.cell((x, y)).is_some_and(|c| c.symbol() == "█") {
-                    has_logo_block_inside_modal = true;
+        let mut has_logo_block_outside_modal = false;
+        let mut has_theme_bg_inside_modal = false;
+        for y in frame_area.top()..frame_area.bottom() {
+            for x in frame_area.left()..frame_area.right() {
+                let cell = buf.cell((x, y));
+                let symbol = cell.map(|c| c.symbol());
+                if symbol == Some("█") {
+                    if x >= modal_area.left()
+                        && x < modal_area.right()
+                        && y >= modal_area.top()
+                        && y < modal_area.bottom()
+                    {
+                        has_logo_block_inside_modal = true;
+                    } else {
+                        has_logo_block_outside_modal = true;
+                    }
+                }
+                if x >= content_area.left()
+                    && x < content_area.right()
+                    && y >= content_area.top()
+                    && y < content_area.bottom()
+                    && cell.is_some_and(|c| c.style().bg == app.state.theme.bg.bg)
+                {
+                    has_theme_bg_inside_modal = true;
                 }
             }
         }
@@ -4635,10 +4662,13 @@ mod tests {
             !has_logo_block_inside_modal,
             "modal area should not contain logo block characters"
         );
-        let has_logo_block_anywhere = buf.content().iter().any(|c| c.symbol() == "█");
         assert!(
-            !has_logo_block_anywhere,
-            "modal backdrop should hide the underlying screen"
+            has_logo_block_outside_modal,
+            "background screen should remain visible outside the modal"
+        );
+        assert!(
+            !has_theme_bg_inside_modal,
+            "modal body should use the default app background, not theme.bg"
         );
 
         // Modal text should still render correctly
