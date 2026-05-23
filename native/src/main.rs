@@ -18,8 +18,8 @@ use crossterm::terminal::{
 use crossterm::{execute, queue};
 use embedded_io_async::{ErrorType, Read};
 use embedded_nal_async::{AddrType, Dns, TcpConnect};
-use ocpncord_backend::{Backend as OcpBackend, BackendEvent};
-use ocpncord_backend_opencode::{OpenCodeBackend, SseParser};
+use ocpncord_backend::BackendEvent;
+use ocpncord_backend_opencode::OpenCodeBackend;
 use ocpncord_tui::Event;
 use ocpncord_tui::{App, KeyEvent, Modifiers, Scancode};
 use ratatui_core::backend::Backend;
@@ -390,134 +390,6 @@ struct Cli {
     cwd: String,
 }
 
-// --- Persistent SSE background task ---
-
-/// Background task that maintains a persistent SSE connection to /global/event.
-/// Reconnects automatically with Last-Event-ID tracking.
-async fn sse_background_task(base_url: String, event_tx: mpsc::UnboundedSender<Option<Event>>) {
-    static TCP: StdTcp = StdTcp;
-    static DNS: StdDns = StdDns;
-
-    let mut parser = SseParser::new();
-
-    loop {
-        if let Err(e) = connect_and_read_sse(&base_url, &TCP, &DNS, &mut parser, &event_tx).await {
-            let _ = event_tx.send(Some(Event::Backend(BackendEvent::Error {
-                message: format!("SSE: {e}"),
-            })));
-        }
-
-        tokio::time::sleep(Duration::from_millis(parser.retry_ms())).await;
-    }
-}
-
-/// Connect to /global/event, send HTTP request, read SSE events in a loop.
-async fn connect_and_read_sse(
-    base_url: &str,
-    _tcp: &'static StdTcp,
-    dns: &'static StdDns,
-    parser: &mut SseParser,
-    event_tx: &mpsc::UnboundedSender<Option<Event>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let url = format!("{}/global/event", base_url.trim_end_matches('/'));
-    let (host, port, path) = parse_http_url(&url)?;
-
-    let addr = dns.get_host_by_name(&host, AddrType::Either).await?;
-    let socket_addr = std::net::SocketAddr::new(addr, port);
-    let mut stream = tokio::net::TcpStream::connect(socket_addr).await?;
-
-    let mut request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n",
-        path, host,
-    );
-    let last_id = parser.last_event_id();
-    if !last_id.is_empty() {
-        request.push_str(&format!("Last-Event-ID: {}\r\n", last_id));
-    }
-    request.push_str("\r\n");
-    stream.write_all(request.as_bytes()).await?;
-
-    let mut buf = vec![0u8; 8192];
-    let mut pos = 0;
-
-    loop {
-        let n = stream.read(&mut buf[pos..]).await?;
-        if n == 0 {
-            return Err("connection closed during headers".into());
-        }
-        pos += n;
-        if let Some(header_end) = buf[..pos].windows(4).position(|w| w == b"\r\n\r\n") {
-            let status_end = buf[..pos].iter().position(|&b| b == b'\r').unwrap_or(pos);
-            let status_line =
-                core::str::from_utf8(&buf[..status_end]).map_err(|_| "invalid utf-8")?;
-            if !status_line.contains("200") {
-                return Err(format!("non-200 response: {status_line}").into());
-            }
-
-            let body_start = header_end + 4;
-            if body_start < pos {
-                send_events(parser.feed(&buf[body_start..pos]), event_tx);
-            }
-            break;
-        }
-        if pos >= buf.len() {
-            buf.resize(buf.len() * 2, 0);
-        }
-    }
-
-    loop {
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        let events = parser.feed(&buf[..n]);
-        log::info!("[SSE] fed {} bytes, got {} events", n, events.len());
-        send_events(events, event_tx);
-    }
-}
-
-fn send_events(
-    events: Vec<
-        core::result::Result<ocpncord_backend::BackendEvent, ocpncord_backend::BackendError>,
-    >,
-    event_tx: &mpsc::UnboundedSender<Option<Event>>,
-) {
-    for event in events {
-        match event {
-            Ok(ref be) => {
-                log::debug!("[SSE] sending: {be:?}");
-                let _ = event_tx.send(Some(Event::Backend(be.clone())));
-            }
-            Err(ref e) => {
-                log::error!("[SSE] parse error: {e}");
-                let _ = event_tx.send(Some(Event::Backend(BackendEvent::Error {
-                    message: format!("SSE parse: {e}"),
-                })));
-            }
-        }
-    }
-}
-
-fn parse_http_url(
-    url: &str,
-) -> core::result::Result<(String, u16, String), Box<dyn std::error::Error>> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or(url);
-    let (host_part, path) = match rest.split_once('/') {
-        Some((h, p)) => (h, format!("/{}", p)),
-        None => (rest, String::new()),
-    };
-    let (host, port) = match host_part.split_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(80)),
-        None => (host_part.to_string(), 80u16),
-    };
-    Ok((host, port, path))
-}
-
 // --- Render target setup --------------------------------------------------
 
 fn setup_terminal() -> Terminal<CrosstermBackend> {
@@ -543,15 +415,6 @@ async fn main() {
     let mut terminal = setup_terminal();
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Option<Event>>();
-
-    // Persistent SSE background task — all backend events flow through here
-    let sse_event_tx = event_tx.clone();
-    let sse_url = cli.url.clone();
-    let prompt_url = cli.url.clone();
-
-    tokio::spawn(async move {
-        sse_background_task(sse_url, sse_event_tx).await;
-    });
 
     // Keyboard input
     let input_event_tx = event_tx.clone();
@@ -590,25 +453,20 @@ async fn main() {
                     running = app.handle_event(event).await;
                 }
             }
+            backend_event = app.poll_next_event(), if app.has_event_stream() => {
+                if let Some(result) = backend_event {
+                    let event = match result {
+                        Ok(event) => Event::Backend(event),
+                        Err(error) => Event::Backend(BackendEvent::Error {
+                            message: format!("{error}"),
+                        }),
+                    };
+                    running = app.handle_event(event).await;
+                }
+            }
             _ = tick_interval.tick() => {
                 running = app.handle_event(Event::Tick).await;
             }
-        }
-
-        for prompt in app.take_pending_prompts() {
-            let event_tx = event_tx.clone();
-            let url = prompt_url.clone();
-            tokio::spawn(async move {
-                let mut backend = OpenCodeBackend::new(&url, &TCP, &DNS);
-                if let Err(e) = backend
-                    .prompt(&prompt.session_id, &prompt.text, Some(&prompt.agent))
-                    .await
-                {
-                    let _ = event_tx.send(Some(Event::Backend(BackendEvent::Error {
-                        message: format!("{e}"),
-                    })));
-                }
-            });
         }
 
         log::trace!(

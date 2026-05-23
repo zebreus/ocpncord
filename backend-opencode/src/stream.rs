@@ -1,7 +1,10 @@
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -81,6 +84,37 @@ enum SseSource {
     },
     /// HTTP request in flight — lazily resolved on first poll.
     Pending(Pin<Box<dyn Future<Output = Vec<Result<BackendEvent>>>>>),
+    Live {
+        state: Rc<RefCell<LiveState>>,
+        driver: Pin<Box<dyn Future<Output = ()>>>,
+    },
+}
+
+struct LiveState {
+    queue: VecDeque<Result<BackendEvent>>,
+    done: bool,
+}
+
+#[derive(Clone)]
+pub struct BufferedStreamSink {
+    state: Rc<RefCell<LiveState>>,
+}
+
+impl BufferedStreamSink {
+    pub fn push(&self, event: Result<BackendEvent>) {
+        self.state.borrow_mut().queue.push_back(event);
+    }
+
+    pub fn extend<I>(&self, events: I)
+    where
+        I: IntoIterator<Item = Result<BackendEvent>>,
+    {
+        self.state.borrow_mut().queue.extend(events);
+    }
+
+    pub fn finish(&self) {
+        self.state.borrow_mut().done = true;
+    }
 }
 
 /// A stream that yields [`BackendEvent`]s.
@@ -102,6 +136,24 @@ impl BufferedStream {
     pub fn from_pending(fut: Pin<Box<dyn Future<Output = Vec<Result<BackendEvent>>>>>) -> Self {
         Self {
             source: SseSource::Pending(fut),
+        }
+    }
+
+    pub fn live<F, B>(builder: B) -> Self
+    where
+        F: Future<Output = ()> + 'static,
+        B: FnOnce(BufferedStreamSink) -> F,
+    {
+        let state = Rc::new(RefCell::new(LiveState {
+            queue: VecDeque::new(),
+            done: false,
+        }));
+        let sink = BufferedStreamSink {
+            state: state.clone(),
+        };
+        let driver = Box::pin(builder(sink));
+        Self {
+            source: SseSource::Live { state, driver },
         }
     }
 
@@ -178,6 +230,29 @@ impl Stream for BufferedStream {
                     }
                     Poll::Pending => return Poll::Pending,
                 },
+                SseSource::Live { state, driver } => {
+                    if let Some(event) = state.borrow_mut().queue.pop_front() {
+                        return Poll::Ready(Some(event));
+                    }
+
+                    if state.borrow().done {
+                        return Poll::Ready(None);
+                    }
+
+                    if driver.as_mut().poll(cx).is_ready() {
+                        state.borrow_mut().done = true;
+                    }
+
+                    if let Some(event) = state.borrow_mut().queue.pop_front() {
+                        return Poll::Ready(Some(event));
+                    }
+
+                    if state.borrow().done {
+                        return Poll::Ready(None);
+                    }
+
+                    return Poll::Pending;
+                }
             }
         }
     }

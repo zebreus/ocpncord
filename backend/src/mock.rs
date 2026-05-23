@@ -1,8 +1,16 @@
 use crate::*;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use futures_core::Stream;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockSubmissionCall {
+    pub session_id: String,
+    pub text: String,
+    pub agent: Option<String>,
+}
 
 /// A mock backend for testing TUI code without a real server.
 pub struct MockBackend {
@@ -17,8 +25,10 @@ pub struct MockBackend {
     pub prompt_events: Vec<Result<BackendEvent>>,
     pub event_events: Vec<Result<BackendEvent>>,
     pub text_matches: Vec<TextMatch>,
+    pub prompt_calls: Vec<MockSubmissionCall>,
+    pub command_calls: Vec<MockSubmissionCall>,
+    pub find_text_calls: Vec<String>,
     pub fail_create_session: Option<BackendError>,
-    pub last_prompt_agent: Option<alloc::string::String>,
     pub permission_replies: Vec<PermissionReply>,
     pub question_replies: Vec<QuestionReply>,
     pub rejected_questions: Vec<String>,
@@ -46,8 +56,10 @@ impl Default for MockBackend {
             prompt_events: Vec::new(),
             event_events: Vec::new(),
             text_matches: Vec::new(),
+            prompt_calls: Vec::new(),
+            command_calls: Vec::new(),
+            find_text_calls: Vec::new(),
             fail_create_session: None,
-            last_prompt_agent: None,
             permission_replies: Vec::new(),
             question_replies: Vec::new(),
             rejected_questions: Vec::new(),
@@ -156,21 +168,30 @@ impl Backend for MockBackend {
 
     async fn prompt(
         &mut self,
-        _id: &SessionId,
-        _text: &str,
+        id: &SessionId,
+        text: &str,
         agent: Option<&str>,
     ) -> Result<Self::PromptStream> {
-        self.last_prompt_agent = agent.map(|a| a.into());
+        self.prompt_calls.push(MockSubmissionCall {
+            session_id: id.clone(),
+            text: text.into(),
+            agent: agent.map(|value| value.into()),
+        });
         let events = core::mem::take(&mut self.prompt_events);
         Ok(MockStream { events, pos: 0 })
     }
 
     async fn command(
         &mut self,
-        _id: &SessionId,
-        _text: &str,
-        _agent: Option<&str>,
+        id: &SessionId,
+        text: &str,
+        agent: Option<&str>,
     ) -> Result<Self::PromptStream> {
+        self.command_calls.push(MockSubmissionCall {
+            session_id: id.clone(),
+            text: text.into(),
+            agent: agent.map(|value| value.into()),
+        });
         let events = core::mem::take(&mut self.prompt_events);
         Ok(MockStream { events, pos: 0 })
     }
@@ -190,7 +211,8 @@ impl Backend for MockBackend {
         Ok(())
     }
 
-    async fn find_text(&mut self, _pattern: &str) -> Result<Vec<TextMatch>> {
+    async fn find_text(&mut self, pattern: &str) -> Result<Vec<TextMatch>> {
+        self.find_text_calls.push(pattern.into());
         Ok(self.text_matches.clone())
     }
 

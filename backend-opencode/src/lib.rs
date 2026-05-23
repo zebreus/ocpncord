@@ -5,14 +5,12 @@
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
-use core::future::Future;
-use core::pin::Pin;
+use embedded_io_async::Read;
 use ocpncord_backend::*;
 use reqwless::client::HttpClient;
 use reqwless::headers::ContentType;
@@ -23,6 +21,8 @@ mod stream;
 pub use stream::{BufferedStream, SseParser};
 
 const RX_BUF_SIZE: usize = 512 * 1024;
+const SSE_READ_BUF_SIZE: usize = 4096;
+const SSE_HEADERS: [(&str, &str); 1] = [("Accept", "text/event-stream")];
 
 /// An HTTP client for the opencode server REST API.
 ///
@@ -222,26 +222,64 @@ async fn http_post_fire_and_forget<
     Ok(())
 }
 
-/// GET the given URL and return the response body (non-blocking, own buffer).
-async fn http_get<
+fn incremental_sse_stream<
     T: embedded_nal_async::TcpConnect + 'static,
     D: embedded_nal_async::Dns + 'static,
 >(
     transport: &'static T,
     dns: &'static D,
-    url: &str,
-) -> Result<Vec<u8>> {
-    let mut rx_buf = alloc::vec![0u8; RX_BUF_SIZE];
-    let mut client = HttpClient::new(transport, dns);
-    let mut handle = client.request(Method::GET, url).await.map_err(conn_err)?;
-    let response = handle.send(&mut rx_buf).await.map_err(conn_err)?;
-    if !response.status.is_successful() {
-        let status = response.status.0;
-        let b = response.body().read_to_end().await.map_err(conn_err)?;
-        return Err(api_err(status, b));
-    }
-    let body = response.body().read_to_end().await.map_err(conn_err)?;
-    Ok(body.to_vec())
+    url: String,
+) -> BufferedStream {
+    BufferedStream::live(move |sink| async move {
+        let mut header_buf = alloc::vec![0u8; RX_BUF_SIZE];
+        let mut read_buf = alloc::vec![0u8; SSE_READ_BUF_SIZE];
+        let mut parser = SseParser::new();
+        let mut client = HttpClient::new(transport, dns);
+
+        let mut handle = match client.request(Method::GET, &url).await {
+            Ok(handle) => handle.headers(&SSE_HEADERS),
+            Err(error) => {
+                sink.push(Err(conn_err(error)));
+                sink.finish();
+                return;
+            }
+        };
+
+        let response = match handle.send(&mut header_buf).await {
+            Ok(response) => response,
+            Err(error) => {
+                sink.push(Err(conn_err(error)));
+                sink.finish();
+                return;
+            }
+        };
+
+        if !response.status.is_successful() {
+            let status = response.status.0;
+            match response.body().read_to_end().await {
+                Ok(body) => sink.push(Err(api_err(status, body))),
+                Err(error) => sink.push(Err(conn_err(error))),
+            }
+            sink.finish();
+            return;
+        }
+
+        let mut body = response.body().reader();
+        loop {
+            match body.read(&mut read_buf).await {
+                Ok(0) => {
+                    sink.finish();
+                    return;
+                }
+                Ok(read) => sink.extend(parser.feed(&read_buf[..read])),
+                Err(error) => {
+                    sink.push(Err(conn_err(error)));
+                    sink.finish();
+                    return;
+                }
+            }
+        }
+    })
 }
 
 // --- Backend trait implementation ---
@@ -421,16 +459,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
     async fn subscribe(&mut self) -> Result<Self::EventStream> {
         let url = alloc::format!("{}/global/event", self.base_url);
-        let transport = self.transport;
-        let dns = self.dns;
-        let url2 = url;
-        let fut: Pin<Box<dyn Future<Output = Vec<Result<BackendEvent>>>>> = Box::pin(async move {
-            match http_get(transport, dns, &url2).await {
-                Ok(raw) => BufferedStream::parse_sse(&raw),
-                Err(e) => vec![Err(e)],
-            }
-        });
-        Ok(BufferedStream::from_pending(fut))
+        Ok(incremental_sse_stream(self.transport, self.dns, url))
     }
 
     async fn get_config(&mut self) -> Result<Config> {
@@ -465,16 +494,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
     async fn sync_events(&mut self) -> Result<Self::EventStream> {
         let url = alloc::format!("{}/global/sync-event", self.base_url);
-        let transport = self.transport;
-        let dns = self.dns;
-        let url2 = url;
-        let fut: Pin<Box<dyn Future<Output = Vec<Result<BackendEvent>>>>> = Box::pin(async move {
-            match http_get(transport, dns, &url2).await {
-                Ok(raw) => BufferedStream::parse_sse(&raw),
-                Err(e) => vec![Err(e)],
-            }
-        });
-        Ok(BufferedStream::from_pending(fut))
+        Ok(incremental_sse_stream(self.transport, self.dns, url))
     }
 
     async fn set_config(&mut self, config: &Config) -> Result<Config> {
@@ -526,9 +546,11 @@ mod tests {
 
     use embedded_io_async::{ErrorType, Read};
     use embedded_nal_async::{AddrType, Dns, TcpConnect};
+    use futures::StreamExt;
     use ocpncord_backend::{PermissionReply, QuestionReply};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
+    use tokio::time::{timeout, Duration};
 
     struct StdTcp;
 
@@ -682,6 +704,43 @@ mod tests {
         (alloc::format!("http://127.0.0.1:{}", addr.port()), rx)
     }
 
+    async fn spawn_streaming_sse_server(
+        first_chunk: &'static str,
+    ) -> (String, oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let response = alloc::format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n{}",
+                first_chunk,
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+
+            let _ = rx.await;
+            stream.shutdown().await.unwrap();
+        });
+
+        (alloc::format!("http://127.0.0.1:{}", addr.port()), tx)
+    }
+
     #[test]
     fn model_list_parses_compact_fields_and_ignores_heavy_payloads() {
         let raw = br#"[
@@ -819,5 +878,25 @@ mod tests {
         let request = request_rx.await.unwrap();
         assert!(request.contains("POST /question/question-1/reject HTTP/1.1"));
         assert_eq!(request.split("\r\n\r\n").nth(1).unwrap_or(""), "");
+    }
+
+    #[tokio::test]
+    async fn subscribe_yields_event_before_connection_closes() {
+        let (base_url, release_tx) = spawn_streaming_sse_server(
+            "data: {\"type\":\"server.connected\",\"properties\":{}}\n\n",
+        )
+        .await;
+        let mut backend = backend(&base_url);
+
+        let mut stream = backend.subscribe().await.unwrap();
+        let event = timeout(Duration::from_millis(500), stream.next())
+            .await
+            .expect("stream should yield before the SSE connection closes")
+            .expect("stream should produce an event")
+            .expect("event should parse successfully");
+
+        assert!(matches!(event, BackendEvent::ServerConnected));
+
+        let _ = release_tx.send(());
     }
 }

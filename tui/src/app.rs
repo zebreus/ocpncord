@@ -15,7 +15,7 @@ use crate::key_chord::KeyChord;
 use crate::modal::{
     HelpModal, Modal, ModelPickerModal, PermissionModal, QuestionModal, SessionListModal,
 };
-use crate::prompt_bar::PromptBar;
+use crate::prompt_bar::{InputMode, PromptBar};
 use crate::screen::{Action, ModalId, PermissionReplyAction, ScreenId, Tab};
 use crate::start_page::StartPage;
 use crate::theme::Theme;
@@ -62,10 +62,46 @@ pub struct LoadedMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingPrompt {
+pub enum SubmissionKind {
+    Prompt,
+    Command,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submission {
+    pub kind: SubmissionKind,
     pub session_id: String,
     pub text: String,
+    pub execution_text: String,
     pub agent: String,
+}
+
+impl Submission {
+    fn prompt(session_id: String, text: String, agent: String) -> Self {
+        Self {
+            kind: SubmissionKind::Prompt,
+            session_id,
+            execution_text: text.clone(),
+            text,
+            agent,
+        }
+    }
+
+    fn command(session_id: String, text: String, agent: String) -> Self {
+        let execution_text = text
+            .trim_start()
+            .strip_prefix('!')
+            .unwrap_or(text.as_str())
+            .trim_start()
+            .to_string();
+        Self {
+            kind: SubmissionKind::Command,
+            session_id,
+            execution_text,
+            text,
+            agent,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,8 +278,8 @@ pub struct App<B: Backend> {
     partial_part_indices: alloc::collections::BTreeMap<String, usize>,
     latest_text_part_index: Option<usize>,
     messages: Vec<LoadedMessage>,
-    pending_prompts: Vec<PendingPrompt>,
-    queued_prompts: Vec<PendingPrompt>,
+    active_submission: Option<Submission>,
+    queued_submissions: Vec<Submission>,
     queued_messages: Vec<LoadedMessage>,
     ignore_done_until_tick: u64,
     response_seen_assistant_activity: bool,
@@ -299,8 +335,8 @@ impl<B: Backend> App<B> {
             partial_part_indices: alloc::collections::BTreeMap::new(),
             latest_text_part_index: None,
             messages: Vec::new(),
-            pending_prompts: Vec::new(),
-            queued_prompts: Vec::new(),
+            active_submission: None,
+            queued_submissions: Vec::new(),
             queued_messages: Vec::new(),
             ignore_done_until_tick: 0,
             response_seen_assistant_activity: false,
@@ -471,12 +507,16 @@ impl<B: Backend> App<B> {
                 Some(result) => return Some(result),
                 None => {
                     self.stream = None;
-                    self.is_streaming = false;
                 }
             }
         }
         if let Some(stream) = &mut self.sync_stream {
-            return stream.next().await;
+            match stream.next().await {
+                Some(result) => return Some(result),
+                None => {
+                    self.sync_stream = None;
+                }
+            }
         }
         None
     }
@@ -577,6 +617,7 @@ impl<B: Backend> App<B> {
             ];
         }
         self.active_agent = 0;
+        self.initiate_sync_stream().await;
     }
 
     pub fn is_streaming(&self) -> bool {
@@ -591,16 +632,12 @@ impl<B: Backend> App<B> {
         &self.messages
     }
 
-    pub fn pending_prompts(&self) -> &[PendingPrompt] {
-        &self.pending_prompts
+    pub fn active_submission(&self) -> Option<&Submission> {
+        self.active_submission.as_ref()
     }
 
-    pub fn queued_prompts(&self) -> &[PendingPrompt] {
-        &self.queued_prompts
-    }
-
-    pub fn take_pending_prompts(&mut self) -> Vec<PendingPrompt> {
-        core::mem::take(&mut self.pending_prompts)
+    pub fn queued_submissions(&self) -> &[Submission] {
+        &self.queued_submissions
     }
 
     pub fn tick(&self) -> u64 {
@@ -615,33 +652,23 @@ impl<B: Backend> App<B> {
         self.is_streaming || self.response_indicator_until_tick > self.tick
     }
 
-    fn queue_or_dispatch_prompt(&mut self, prompt: PendingPrompt, message: LoadedMessage) {
-        if self.is_streaming || !self.pending_prompts.is_empty() {
-            self.queued_prompts.push(prompt);
+    async fn queue_or_dispatch_submission(
+        &mut self,
+        submission: Submission,
+        message: LoadedMessage,
+    ) {
+        if self.is_streaming || self.active_submission.is_some() {
+            self.queued_submissions.push(submission);
             self.queued_messages.push(message);
             return;
         }
 
-        self.dispatch_prompt(prompt, message);
+        self.dispatch_submission(submission, message).await;
     }
 
-    fn dispatch_prompt(&mut self, prompt: PendingPrompt, message: LoadedMessage) {
-        self.messages.push(message);
-        self.draft = Some(prompt.text.clone());
-        self.active_screen = ScreenId::Chat;
-        self.is_streaming = true;
-        self.mark_response_active();
-        self.partial_parts.clear();
-        self.partial_texts.clear();
-        self.partial_part_indices.clear();
-        self.latest_text_part_index = None;
-        self.response_seen_assistant_activity = false;
-        self.pending_prompts.push(prompt);
-    }
-
-    fn dispatch_next_queued_prompt(&mut self) {
-        if self.queued_prompts.is_empty() || self.queued_messages.is_empty() {
-            return;
+    fn take_next_queued_submission(&mut self) -> Option<(Submission, LoadedMessage)> {
+        if self.queued_submissions.is_empty() || self.queued_messages.is_empty() {
+            return None;
         }
 
         if !self.partial_parts.is_empty() {
@@ -655,10 +682,101 @@ impl<B: Backend> App<B> {
             self.latest_text_part_index = None;
         }
 
-        let prompt = self.queued_prompts.remove(0);
-        let message = self.queued_messages.remove(0);
+        Some((
+            self.queued_submissions.remove(0),
+            self.queued_messages.remove(0),
+        ))
+    }
+
+    async fn dispatch_submission(&mut self, submission: Submission, message: LoadedMessage) {
+        let mut next_submission = Some((submission, message));
+
+        while let Some((submission, message)) = next_submission.take() {
+            self.messages.push(message);
+            self.draft = Some(submission.text.clone());
+            self.active_screen = ScreenId::Chat;
+            self.is_streaming = true;
+            self.mark_response_active();
+            self.partial_parts.clear();
+            self.partial_texts.clear();
+            self.partial_part_indices.clear();
+            self.latest_text_part_index = None;
+            self.response_seen_assistant_activity = false;
+
+            let result = match submission.kind {
+                SubmissionKind::Prompt => {
+                    self.backend
+                        .prompt(
+                            &submission.session_id,
+                            &submission.execution_text,
+                            Some(&submission.agent),
+                        )
+                        .await
+                }
+                SubmissionKind::Command => {
+                    self.backend
+                        .command(
+                            &submission.session_id,
+                            &submission.execution_text,
+                            Some(&submission.agent),
+                        )
+                        .await
+                }
+            };
+
+            match result {
+                Ok(stream) => {
+                    self.stream = Some(stream);
+                    self.active_submission = Some(submission);
+                }
+                Err(e) => {
+                    self.error = Some(alloc::format!("{}", e));
+                    self.is_streaming = false;
+                    self.response_indicator_until_tick = 0;
+                    self.stream = None;
+                    self.partial_texts.clear();
+                    self.partial_part_indices.clear();
+                    self.latest_text_part_index = None;
+                    self.response_seen_assistant_activity = false;
+                    self.active_submission = None;
+                    next_submission = self.take_next_queued_submission();
+                    if next_submission.is_some() {
+                        self.ignore_done_until_tick = self.tick.saturating_add(2);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn dispatch_next_queued_submission(&mut self) {
+        let Some((submission, message)) = self.take_next_queued_submission() else {
+            return;
+        };
+
         self.ignore_done_until_tick = self.tick.saturating_add(2);
-        self.dispatch_prompt(prompt, message);
+        self.dispatch_submission(submission, message).await;
+    }
+
+    async fn ensure_active_session(&mut self) -> Option<String> {
+        if self.active_session.is_none() {
+            match self
+                .backend
+                .create_session("Chat", self.current_workspace.as_deref().unwrap_or(""))
+                .await
+            {
+                Ok(session) => {
+                    self.active_session = Some(session);
+                }
+                Err(e) => {
+                    self.error = Some(alloc::format!("{}", e));
+                    return None;
+                }
+            }
+        }
+
+        self.active_session
+            .as_ref()
+            .map(|session| session.id.clone())
     }
 
     fn open_permission_modal_if_idle(&mut self) -> bool {
@@ -860,6 +978,7 @@ impl<B: Backend> App<B> {
                             let was_streaming = self.is_streaming;
                             self.is_streaming = false;
                             self.stream = None;
+                            self.active_submission = None;
                             self.partial_texts.clear();
                             self.partial_part_indices.clear();
                             self.latest_text_part_index = None;
@@ -891,7 +1010,7 @@ impl<B: Backend> App<B> {
                             }
 
                             if was_streaming {
-                                self.dispatch_next_queued_prompt();
+                                self.dispatch_next_queued_submission().await;
                             }
                         }
                     }
@@ -901,11 +1020,12 @@ impl<B: Backend> App<B> {
                         self.is_streaming = false;
                         self.response_indicator_until_tick = 0;
                         self.stream = None;
+                        self.active_submission = None;
                         self.partial_texts.clear();
                         self.partial_part_indices.clear();
                         self.latest_text_part_index = None;
                         self.response_seen_assistant_activity = false;
-                        self.dispatch_next_queued_prompt();
+                        self.dispatch_next_queued_submission().await;
                     }
                     ocpncord_backend::BackendEvent::SessionCreated { session } => {
                         let is_new = self
@@ -1184,43 +1304,25 @@ impl<B: Backend> App<B> {
 
     async fn handle_send_message(&mut self) -> bool {
         let text = self.prompt_bar.text().to_string();
+        let mode = self.prompt_bar.input_mode();
 
         // Slash command routing
-        if text.starts_with('/') {
+        if matches!(mode, InputMode::Command) {
             return self.handle_slash_command(&text).await;
         }
 
-        if self.active_session.is_none() {
-            match self
-                .backend
-                .create_session("Chat", self.current_workspace.as_deref().unwrap_or(""))
-                .await
-            {
-                Ok(session) => {
-                    self.active_session = Some(session);
-                }
-                Err(e) => {
-                    self.error = Some(alloc::format!("{}", e));
-                    return true;
-                }
-            }
-        }
-
-        let session_id = self
-            .active_session
-            .as_ref()
-            .map(|s| s.id.clone())
-            .unwrap_or_default();
+        let Some(session_id) = self.ensure_active_session().await else {
+            return true;
+        };
 
         self.prompt_bar.clear();
         let agent = self.active_agent_name().to_string();
         let message = user_loaded_message(&text);
-        let prompt = PendingPrompt {
-            session_id,
-            text: text.clone(),
-            agent,
+        let submission = match mode {
+            InputMode::Shell => Submission::command(session_id, text.clone(), agent),
+            _ => Submission::prompt(session_id, text.clone(), agent),
         };
-        self.queue_or_dispatch_prompt(prompt, message);
+        self.queue_or_dispatch_submission(submission, message).await;
 
         true
     }
@@ -1306,33 +1408,15 @@ impl<B: Backend> App<B> {
     }
 
     async fn handle_unknown_slash_command(&mut self, text: &str) -> bool {
-        if self.active_session.is_none() {
-            match self.backend.create_session("Chat", "").await {
-                Ok(session) => {
-                    self.active_session = Some(session);
-                }
-                Err(e) => {
-                    self.error = Some(alloc::format!("{}", e));
-                    return true;
-                }
-            }
-        }
-
-        let session_id = self
-            .active_session
-            .as_ref()
-            .map(|s| s.id.clone())
-            .unwrap_or_default();
+        let Some(session_id) = self.ensure_active_session().await else {
+            return true;
+        };
 
         self.prompt_bar.clear();
         let agent = self.active_agent_name().to_string();
         let message = user_loaded_message(text);
-        let prompt = PendingPrompt {
-            session_id,
-            text: text.into(),
-            agent,
-        };
-        self.queue_or_dispatch_prompt(prompt, message);
+        let submission = Submission::prompt(session_id, text.into(), agent);
+        self.queue_or_dispatch_submission(submission, message).await;
 
         true
     }
@@ -1349,7 +1433,8 @@ impl<B: Backend> App<B> {
         self.partial_part_indices.clear();
         self.latest_text_part_index = None;
         self.response_seen_assistant_activity = false;
-        self.queued_prompts.clear();
+        self.active_submission = None;
+        self.queued_submissions.clear();
         self.queued_messages.clear();
         true
     }
@@ -2219,7 +2304,7 @@ fn terminal_start_index(line_count: usize, height: u16, scroll: u16) -> usize {
 mod tests {
     use super::*;
     use crate::event::{KeyEvent, Modifiers, Scancode};
-    use ocpncord_backend::mock::MockBackend;
+    use ocpncord_backend::mock::{MockBackend, MockSubmissionCall};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -2244,6 +2329,12 @@ mod tests {
 
     fn run<B: Backend>(app: &mut App<B>, event: Event) -> bool {
         futures::executor::block_on(app.handle_event(event))
+    }
+
+    fn next_backend_event<B: Backend>(
+        app: &mut App<B>,
+    ) -> Option<Result<BackendEvent, ocpncord_backend::BackendError>> {
+        futures::executor::block_on(app.poll_next_event())
     }
 
     fn rendered_screen(terminal: &Terminal<TestBackend>) -> String {
@@ -2565,13 +2656,23 @@ mod tests {
         // Verify session was created
         assert_eq!(app.backend().sessions.len(), 1, "session should be created");
         assert_eq!(
-            app.pending_prompts(),
-            &[PendingPrompt {
+            app.backend().prompt_calls,
+            vec![MockSubmissionCall {
                 session_id: "mock-session-id".into(),
                 text: "h".into(),
-                agent: "plan".into()
+                agent: Some("plan".into())
             }],
-            "prompt should be queued with the selected agent"
+            "prompt should be sent with the selected agent"
+        );
+        assert_eq!(
+            app.active_submission(),
+            Some(&Submission {
+                kind: SubmissionKind::Prompt,
+                session_id: "mock-session-id".into(),
+                text: "h".into(),
+                execution_text: "h".into(),
+                agent: "plan".into(),
+            })
         );
     }
 
@@ -2616,21 +2717,16 @@ mod tests {
         assert!(running);
         assert!(app.is_streaming());
 
-        run(
-            &mut app,
-            Event::Backend(ocpncord_backend::BackendEvent::Part {
-                part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
-                    text: "Hello".into(),
-                }),
-                delta: None,
-            }),
-        );
+        let event = next_backend_event(&mut app)
+            .expect("prompt stream should yield a part")
+            .expect("part event should not error");
+        run(&mut app, Event::Backend(event));
         assert_eq!(app.partial_parts().len(), 1);
 
-        run(
-            &mut app,
-            Event::Backend(ocpncord_backend::BackendEvent::Done),
-        );
+        let event = next_backend_event(&mut app)
+            .expect("prompt stream should yield Done")
+            .expect("Done event should not error");
+        run(&mut app, Event::Backend(event));
         assert!(!app.is_streaming());
         // Done no longer flushes partial_parts to messages; the REST API
         // fallback populates messages when the server has persisted them.
@@ -2661,12 +2757,12 @@ mod tests {
 
         run(&mut app, enter_key());
         assert_eq!(
-            app.pending_prompts().len(),
+            app.backend().prompt_calls.len(),
             1,
             "the active prompt remains the only dispatched prompt"
         );
         assert_eq!(
-            app.queued_prompts().len(),
+            app.queued_submissions().len(),
             1,
             "Enter should queue another prompt while streaming"
         );
@@ -2778,7 +2874,7 @@ mod tests {
             run(&mut app, char_key(ch));
         }
         run(&mut app, enter_key());
-        assert_eq!(app.take_pending_prompts()[0].text, "first");
+        assert_eq!(app.backend().prompt_calls[0].text, "first");
 
         run(
             &mut app,
@@ -2800,9 +2896,9 @@ mod tests {
         run(&mut app, enter_key());
 
         assert_eq!(
-            app.queued_prompts()
+            app.queued_submissions()
                 .iter()
-                .map(|prompt| prompt.text.as_str())
+                .map(|submission| submission.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["second", "third"]
         );
@@ -2824,10 +2920,9 @@ mod tests {
             Event::Backend(ocpncord_backend::BackendEvent::Done),
         );
 
-        let dispatched = app.take_pending_prompts();
-        assert_eq!(dispatched.len(), 1);
-        assert_eq!(dispatched[0].text, "second");
-        assert_eq!(app.queued_prompts()[0].text, "third");
+        assert_eq!(app.backend().prompt_calls.len(), 2);
+        assert_eq!(app.backend().prompt_calls[1].text, "second");
+        assert_eq!(app.queued_submissions()[0].text, "third");
     }
 
     #[test]
@@ -2863,13 +2958,13 @@ mod tests {
             run(&mut app, char_key(ch));
         }
         run(&mut app, enter_key());
-        assert_eq!(app.take_pending_prompts()[0].text, "first");
+        assert_eq!(app.backend().prompt_calls[0].text, "first");
 
         for ch in "second".chars() {
             run(&mut app, char_key(ch));
         }
         run(&mut app, enter_key());
-        assert_eq!(app.queued_prompts().len(), 1);
+        assert_eq!(app.queued_submissions().len(), 1);
 
         run(
             &mut app,
@@ -2877,11 +2972,38 @@ mod tests {
         );
 
         assert!(
-            app.take_pending_prompts().is_empty(),
+            app.backend().prompt_calls.len() == 1,
             "early Done without assistant activity must not dispatch queued prompt"
         );
-        assert_eq!(app.queued_prompts()[0].text, "second");
+        assert_eq!(app.queued_submissions()[0].text, "second");
         assert!(app.is_streaming());
+    }
+
+    #[test]
+    fn bang_command_submits_via_command_backend() {
+        let backend = MockBackend::default();
+        let mut app = App::new(backend);
+
+        run(&mut app, char_key('!'));
+        run(&mut app, char_key('p'));
+        run(&mut app, char_key('w'));
+        run(&mut app, char_key('d'));
+        let running = run(&mut app, enter_key());
+
+        assert!(running);
+        assert_eq!(app.backend().command_calls.len(), 1);
+        assert_eq!(app.backend().command_calls[0].text, "pwd");
+        assert_eq!(app.backend().prompt_calls.len(), 0);
+        assert_eq!(
+            app.active_submission(),
+            Some(&Submission {
+                kind: SubmissionKind::Command,
+                session_id: "mock-session-id".into(),
+                text: "!pwd".into(),
+                execution_text: "pwd".into(),
+                agent: "build".into(),
+            })
+        );
     }
 
     /// Test that the real SSE event path (MessagePartUpdated + Done) works.
