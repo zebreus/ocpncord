@@ -74,11 +74,13 @@ impl SessionListModal {
         self.state = SessionListState::Error(error);
     }
 
-    pub fn selected_index(&self) -> usize {
+    #[cfg(test)]
+    fn selected_index(&self) -> usize {
         self.selected
     }
 
-    pub fn scroll_offset(&self) -> u16 {
+    #[cfg(test)]
+    fn scroll_offset(&self) -> u16 {
         self.scroll
     }
 
@@ -455,6 +457,7 @@ impl ModelPickerModal {
         }
     }
 
+    #[cfg(test)]
     fn filtered_len(&self) -> usize {
         self.filtered_indices.len()
     }
@@ -466,25 +469,30 @@ impl ModelPickerModal {
         self.refilter();
     }
 
-    pub fn search(&self) -> &str {
+    #[cfg(test)]
+    fn search(&self) -> &str {
         &self.search
     }
 
-    pub fn visible_model_count(&self) -> usize {
+    #[cfg(test)]
+    fn visible_model_count(&self) -> usize {
         self.filtered_len()
     }
 
-    pub fn scroll_offset(&self) -> u16 {
+    #[cfg(test)]
+    fn scroll_offset(&self) -> u16 {
         self.scroll
     }
 
-    pub fn search_matches(&self, model: &str) -> bool {
+    #[cfg(test)]
+    fn search_matches(&self, model: &str) -> bool {
         self.filtered_indices
             .iter()
             .any(|index| self.models[*index].id == model)
     }
 
-    pub fn set_visible_rows_for_test(&self, rows: u16) {
+    #[cfg(test)]
+    fn set_visible_rows_for_test(&self, rows: u16) {
         self.visible_rows.set(rows);
     }
 
@@ -540,7 +548,8 @@ impl ModelPickerModal {
             .map(|choice| choice.id.as_str())
     }
 
-    pub fn selected_index(&self) -> usize {
+    #[cfg(test)]
+    fn selected_index(&self) -> usize {
         self.selected
     }
 

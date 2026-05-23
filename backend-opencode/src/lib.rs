@@ -170,31 +170,6 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
 // --- Non-blocking HTTP POST for streaming endpoints (allocates own buffer) ---
 
-/// POST JSON to the given URL and return the response body.
-/// Allocates its own rx buffer so it can be used in a boxed future without `&mut` access.
-async fn http_post_json<
-    T: embedded_nal_async::TcpConnect + 'static,
-    D: embedded_nal_async::Dns + 'static,
->(
-    transport: &'static T,
-    dns: &'static D,
-    url: &str,
-    json: &[u8],
-) -> Result<Vec<u8>> {
-    let mut rx_buf = alloc::vec![0u8; RX_BUF_SIZE];
-    let mut client = HttpClient::new(transport, dns);
-    let handle = client.request(Method::POST, url).await.map_err(conn_err)?;
-    let mut handle = handle.body(json).content_type(ContentType::ApplicationJson);
-    let response = handle.send(&mut rx_buf).await.map_err(conn_err)?;
-    if !response.status.is_successful() {
-        let status = response.status.0;
-        let b = response.body().read_to_end().await.map_err(conn_err)?;
-        return Err(api_err(status, b));
-    }
-    let body = response.body().read_to_end().await.map_err(conn_err)?;
-    Ok(body.to_vec())
-}
-
 /// Send a POST request and return immediately after receiving the status code.
 /// The response body is discarded — used for fire-and-forget triggers where
 /// the actual response arrives via the SSE event stream.

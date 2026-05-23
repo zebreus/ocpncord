@@ -34,10 +34,6 @@ impl PromptBar {
         &self.input
     }
 
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-
     pub fn input_mode(&self) -> InputMode {
         let trimmed = self.input.trim_start();
         match trimmed.chars().next() {

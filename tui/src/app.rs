@@ -6,7 +6,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::Cell;
 use core::future::Future;
-use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 use core::task::Poll;
 
@@ -242,13 +241,6 @@ impl TerminalPane {
         }
     }
 
-    pub fn push_line(&mut self, line: TermLine) {
-        if self.lines.len() >= 2000 {
-            self.lines.pop_front();
-        }
-        self.lines.push_back(line);
-    }
-
     pub fn set_from_pty(&mut self, pty: &ocpncord_backend::Pty) {
         self.pty_id = Some(pty.id.clone());
         self.title = pty.title.clone();
@@ -396,8 +388,6 @@ pub struct AppState {
     active_agent: usize,
     // --- New fields for full API integration ---
     terminal: TerminalPane,
-    // Session cache for modals
-    cached_sessions: Vec<ocpncord_backend::Session>,
     model_cache: Option<Vec<ocpncord_backend::ModelSummary>>,
     // Permission & Question pending queues
     pending_permissions: alloc::collections::VecDeque<ocpncord_backend::PermissionRequest>,
@@ -450,7 +440,6 @@ impl AppState {
             agents: Vec::new(),
             active_agent: 0,
             terminal: TerminalPane::new(),
-            cached_sessions: Vec::new(),
             model_cache: None,
             pending_permissions: alloc::collections::VecDeque::new(),
             pending_questions: alloc::collections::VecDeque::new(),
@@ -2375,6 +2364,7 @@ fn loaded_messages_from_details(
         .collect()
 }
 
+#[cfg(test)]
 fn backend_op_future<'a, B: Backend>(backend: &'a mut B, op: BackendOp) -> BackendOpFuture<'a, B> {
     Box::pin(execute_backend_op(backend, op))
 }
@@ -2574,24 +2564,19 @@ where
         &mut self.ratatui_terminal
     }
 
-    pub async fn init(&mut self) {
-        self.state.queue_startup();
-        self.drain_backend_ops().await;
+    pub fn set_cwd(&mut self, cwd: String) {
+        self.state.set_cwd(cwd);
     }
 
-    pub async fn handle_event(&mut self, event: Event) -> bool {
-        let running = self.state.handle_event(event);
-        self.drain_backend_ops().await;
-        running
-    }
-
-    async fn drain_backend_ops(&mut self) {
+    #[cfg(test)]
+    async fn drain_backend_ops_for_test(&mut self) {
         while let Some(op) = self.state.pending_ops.pop_front() {
             let result = backend_op_future(&mut self.backend, op).await;
             self.apply_backend_op_result(result);
         }
     }
 
+    #[cfg(test)]
     fn apply_backend_op_result(&mut self, result: BackendOpResult<B>) {
         Self::apply_backend_op_result_to(
             &mut self.state,
@@ -2753,30 +2738,6 @@ where
                 break;
             }
         }
-    }
-}
-
-impl<B, E, T> Deref for App<B, E, T>
-where
-    B: Backend,
-    E: Stream<Item = Event> + Unpin,
-    T: ratatui_core::backend::Backend,
-{
-    type Target = AppState;
-
-    fn deref(&self) -> &Self::Target {
-        &self.state
-    }
-}
-
-impl<B, E, T> DerefMut for App<B, E, T>
-where
-    B: Backend,
-    E: Stream<Item = Event> + Unpin,
-    T: ratatui_core::backend::Backend,
-{
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.state
     }
 }
 
@@ -2996,7 +2957,14 @@ mod tests {
     }
 
     fn run<B: Backend>(app: &mut TestApp<B>, event: Event) -> bool {
-        futures::executor::block_on(app.handle_event(event))
+        let running = app.state.handle_event(event);
+        futures::executor::block_on(app.drain_backend_ops_for_test());
+        running
+    }
+
+    fn init<B: Backend>(app: &mut TestApp<B>) {
+        app.state.queue_startup();
+        futures::executor::block_on(app.drain_backend_ops_for_test());
     }
 
     fn next_response_event<B: Backend>(
@@ -3024,6 +2992,13 @@ mod tests {
             .collect()
     }
 
+    fn push_terminal_line(terminal: &mut TerminalPane, line: TermLine) {
+        if terminal.lines.len() >= 2000 {
+            terminal.lines.pop_front();
+        }
+        terminal.lines.push_back(line);
+    }
+
     #[test]
     fn ctrl_c_quits() {
         let backend = MockBackend::default();
@@ -3049,7 +3024,7 @@ mod tests {
     fn starts_on_start_page() {
         let backend = MockBackend::default();
         let app = new_app(backend);
-        assert_eq!(app.active_screen(), ScreenId::StartPage);
+        assert_eq!(app.state.active_screen(), ScreenId::StartPage);
     }
 
     #[test]
@@ -3078,8 +3053,8 @@ mod tests {
     fn init_fallback_to_default_agents_when_backend_returns_empty() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
-        futures::executor::block_on(app.init());
-        assert_eq!(app.active_agent_name(), "build");
+        init(&mut app);
+        assert_eq!(app.state.active_agent_name(), "build");
     }
 
     #[test]
@@ -3098,8 +3073,8 @@ mod tests {
             steps: None,
         }];
         let mut app = new_app(backend);
-        futures::executor::block_on(app.init());
-        assert_eq!(app.active_agent_name(), "coder");
+        init(&mut app);
+        assert_eq!(app.state.active_agent_name(), "coder");
     }
 
     #[test]
@@ -3144,15 +3119,15 @@ mod tests {
             },
         ];
         let mut app = new_app(backend);
-        futures::executor::block_on(app.init());
+        init(&mut app);
 
         // Move to index 1 (plan)
         run(&mut app, tab_key());
-        assert_eq!(app.active_agent_name(), "plan");
+        assert_eq!(app.state.active_agent_name(), "plan");
 
         // Shift+Tab should go back to build
         run(&mut app, shift_tab_key());
-        assert_eq!(app.active_agent_name(), "build");
+        assert_eq!(app.state.active_agent_name(), "build");
     }
 
     fn tab_key() -> Event {
@@ -3204,14 +3179,14 @@ mod tests {
             },
         ];
         let mut app = new_app(backend);
-        futures::executor::block_on(app.init());
+        init(&mut app);
 
         // Tab at index 0 → index 1
         run(&mut app, tab_key());
-        assert_eq!(app.active_agent_name(), "plan");
+        assert_eq!(app.state.active_agent_name(), "plan");
         // Tab at index 1 → wraps to index 0
         run(&mut app, tab_key());
-        assert_eq!(app.active_agent_name(), "build");
+        assert_eq!(app.state.active_agent_name(), "build");
     }
 
     #[test]
@@ -3244,11 +3219,11 @@ mod tests {
             },
         ];
         let mut app = new_app(backend);
-        futures::executor::block_on(app.init());
+        init(&mut app);
 
         // Shift+Tab at index 0 → wraps to last index
         run(&mut app, shift_tab_key());
-        assert_eq!(app.active_agent_name(), "plan");
+        assert_eq!(app.state.active_agent_name(), "plan");
     }
 
     #[test]
@@ -3281,11 +3256,11 @@ mod tests {
             },
         ];
         let mut app = new_app(backend);
-        futures::executor::block_on(app.init());
-        assert_eq!(app.active_agent_name(), "build");
+        init(&mut app);
+        assert_eq!(app.state.active_agent_name(), "build");
 
         run(&mut app, tab_key());
-        assert_eq!(app.active_agent_name(), "plan");
+        assert_eq!(app.state.active_agent_name(), "plan");
     }
 
     #[test]
@@ -3320,10 +3295,10 @@ mod tests {
         backend.prompt_events = vec![Ok(ocpncord_backend::BackendEvent::Done)];
         let mut app = new_app(backend);
 
-        futures::executor::block_on(app.init());
+        init(&mut app);
         // Tab to "plan"
         run(&mut app, tab_key());
-        assert_eq!(app.active_agent_name(), "plan");
+        assert_eq!(app.state.active_agent_name(), "plan");
 
         // Send a message
         run(&mut app, char_key('h'));
@@ -3342,7 +3317,7 @@ mod tests {
             "prompt should be sent with the selected agent"
         );
         assert_eq!(
-            app.active_submission(),
+            app.state.active_submission(),
             Some(&Submission {
                 kind: SubmissionKind::Prompt,
                 session_id: "mock-session-id".into(),
@@ -3399,7 +3374,9 @@ mod tests {
         futures::executor::block_on(app.run());
 
         assert_eq!(
-            app.active_session().map(|session| session.id.as_str()),
+            app.state
+                .active_session()
+                .map(|session| session.id.as_str()),
             Some("session-from-background")
         );
     }
@@ -3419,8 +3396,8 @@ mod tests {
 
         futures::executor::block_on(app.run());
 
-        assert_eq!(app.prompt_text(), "n");
-        assert_eq!(app.partial_parts().len(), 1);
+        assert_eq!(app.state.prompt_text(), "n");
+        assert_eq!(app.state.partial_parts().len(), 1);
     }
 
     #[test]
@@ -3432,7 +3409,7 @@ mod tests {
 
         futures::executor::block_on(app.run());
 
-        assert_eq!(app.prompt_text(), "n");
+        assert_eq!(app.state.prompt_text(), "n");
         assert!(app.response_events.is_none());
         assert!(app.background_events.is_none());
     }
@@ -3469,24 +3446,28 @@ mod tests {
         run(&mut app, char_key('i'));
         let running = run(&mut app, enter_key());
         assert!(running);
-        assert!(app.is_streaming());
+        assert!(app.state.is_streaming());
 
         let event = next_response_event(&mut app)
             .expect("prompt stream should yield a part")
             .expect("part event should not error");
         run(&mut app, Event::Backend(event));
-        assert_eq!(app.partial_parts().len(), 1);
+        assert_eq!(app.state.partial_parts().len(), 1);
 
         let event = next_response_event(&mut app)
             .expect("prompt stream should yield Done")
             .expect("Done event should not error");
         run(&mut app, Event::Backend(event));
-        assert!(!app.is_streaming());
+        assert!(!app.state.is_streaming());
         // Done no longer flushes partial_parts to messages; the REST API
         // fallback populates messages when the server has persisted them.
-        assert_eq!(app.messages().len(), 1, "only user msg (no flush on Done)");
         assert_eq!(
-            app.partial_parts().len(),
+            app.state.messages().len(),
+            1,
+            "only user msg (no flush on Done)"
+        );
+        assert_eq!(
+            app.state.partial_parts().len(),
             1,
             "content stays in partial_parts for rendering"
         );
@@ -3500,14 +3481,14 @@ mod tests {
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
         run(&mut app, enter_key());
-        assert!(app.is_streaming());
-        assert_eq!(app.prompt_text(), "");
+        assert!(app.state.is_streaming());
+        assert_eq!(app.state.prompt_text(), "");
 
         run(&mut app, char_key('n'));
         run(&mut app, char_key('e'));
         run(&mut app, char_key('x'));
         run(&mut app, char_key('t'));
-        assert_eq!(app.prompt_text(), "next");
+        assert_eq!(app.state.prompt_text(), "next");
 
         run(&mut app, enter_key());
         assert_eq!(
@@ -3516,15 +3497,15 @@ mod tests {
             "the active prompt remains the only dispatched prompt"
         );
         assert_eq!(
-            app.queued_submissions().len(),
+            app.state.queued_submissions().len(),
             1,
             "Enter should queue another prompt while streaming"
         );
-        assert_eq!(app.prompt_text(), "");
+        assert_eq!(app.state.prompt_text(), "");
 
         let test_backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let screen = rendered_screen(&terminal);
 
         assert!(screen.contains(">"), "screen: {screen}");
@@ -3540,7 +3521,7 @@ mod tests {
 
         let test_backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let buf = terminal.backend().buffer();
 
         let status_y = 17;
@@ -3563,7 +3544,7 @@ mod tests {
             if cell.symbol() != " " {
                 assert_ne!(
                     cell.style().bg,
-                    app.theme.input.bg,
+                    app.state.theme.input.bg,
                     "status line should not use prompt input background at x={x}"
                 );
             }
@@ -3578,7 +3559,7 @@ mod tests {
         ) -> Option<ratatui::style::Color> {
             let backend = MockBackend::default();
             let mut app = new_app(backend);
-            app.agents = vec![ocpncord_backend::Agent {
+            app.state.agents = vec![ocpncord_backend::Agent {
                 name: "agent".into(),
                 description: None,
                 mode,
@@ -3594,7 +3575,7 @@ mod tests {
             let test_backend = TestBackend::new(80, 1);
             let mut terminal = Terminal::new(test_backend).unwrap();
             terminal
-                .draw(|frame| app.render_status_line(frame, Rect::new(0, 0, 80, 1)))
+                .draw(|frame| app.state.render_status_line(frame, Rect::new(0, 0, 80, 1)))
                 .unwrap();
             let buf = terminal.backend().buffer();
             let row: String = (0..80)
@@ -3604,7 +3585,7 @@ mod tests {
             let cell = buf.cell((start, 0)).unwrap();
             assert_ne!(
                 cell.style().bg,
-                app.theme.input.bg,
+                app.state.theme.input.bg,
                 "mode label should not use prompt input background"
             );
             cell.style().fg
@@ -3650,7 +3631,8 @@ mod tests {
         run(&mut app, enter_key());
 
         assert_eq!(
-            app.queued_submissions()
+            app.state
+                .queued_submissions()
                 .iter()
                 .map(|submission| submission.text.as_str())
                 .collect::<Vec<_>>(),
@@ -3659,7 +3641,7 @@ mod tests {
 
         let test_backend = TestBackend::new(80, 10);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let screen = rendered_screen(&terminal);
         let first = screen.find("first").expect(&screen);
         let assistant = screen.find("assistant one").expect(&screen);
@@ -3676,7 +3658,7 @@ mod tests {
 
         assert_eq!(app.backend().prompt_calls.len(), 2);
         assert_eq!(app.backend().prompt_calls[1].text, "second");
-        assert_eq!(app.queued_submissions()[0].text, "third");
+        assert_eq!(app.state.queued_submissions()[0].text, "third");
     }
 
     #[test]
@@ -3687,17 +3669,17 @@ mod tests {
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
         run(&mut app, enter_key());
-        assert!(app.is_streaming());
+        assert!(app.state.is_streaming());
 
         run(
             &mut app,
             Event::Backend(ocpncord_backend::BackendEvent::Done),
         );
-        assert!(app.is_streaming());
+        assert!(app.state.is_streaming());
 
         let test_backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let screen = rendered_screen(&terminal);
 
         assert!(screen.contains("Agent is Responding"), "screen: {screen}");
@@ -3718,7 +3700,7 @@ mod tests {
             run(&mut app, char_key(ch));
         }
         run(&mut app, enter_key());
-        assert_eq!(app.queued_submissions().len(), 1);
+        assert_eq!(app.state.queued_submissions().len(), 1);
 
         run(
             &mut app,
@@ -3729,8 +3711,8 @@ mod tests {
             app.backend().prompt_calls.len() == 1,
             "early Done without assistant activity must not dispatch queued prompt"
         );
-        assert_eq!(app.queued_submissions()[0].text, "second");
-        assert!(app.is_streaming());
+        assert_eq!(app.state.queued_submissions()[0].text, "second");
+        assert!(app.state.is_streaming());
     }
 
     #[test]
@@ -3749,7 +3731,7 @@ mod tests {
         assert_eq!(app.backend().command_calls[0].text, "pwd");
         assert_eq!(app.backend().prompt_calls.len(), 0);
         assert_eq!(
-            app.active_submission(),
+            app.state.active_submission(),
             Some(&Submission {
                 kind: SubmissionKind::Command,
                 session_id: "mock-session-id".into(),
@@ -3772,7 +3754,7 @@ mod tests {
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
         run(&mut app, enter_key());
-        assert!(app.is_streaming(), "should be streaming after send");
+        assert!(app.state.is_streaming(), "should be streaming after send");
 
         // Simulate SSE: MessagePartUpdated with a text part
         run(
@@ -3785,7 +3767,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            app.partial_parts().len(),
+            app.state.partial_parts().len(),
             1,
             "MessagePartUpdated should push to partial_parts"
         );
@@ -3795,10 +3777,14 @@ mod tests {
             &mut app,
             Event::Backend(ocpncord_backend::BackendEvent::Done),
         );
-        assert!(!app.is_streaming());
-        assert_eq!(app.messages().len(), 1, "only user msg (no flush on Done)");
+        assert!(!app.state.is_streaming());
         assert_eq!(
-            app.partial_parts().len(),
+            app.state.messages().len(),
+            1,
+            "only user msg (no flush on Done)"
+        );
+        assert_eq!(
+            app.state.partial_parts().len(),
             1,
             "content stays in partial_parts for rendering"
         );
@@ -3828,7 +3814,7 @@ mod tests {
             );
         }
         assert!(
-            app.partial_parts().is_empty(),
+            app.state.partial_parts().is_empty(),
             "echoed user text should not become assistant partials"
         );
 
@@ -3890,6 +3876,7 @@ mod tests {
         }
 
         let assistant_text_parts: Vec<&str> = app
+            .state
             .partial_parts()
             .iter()
             .filter_map(|part| match part {
@@ -3905,7 +3892,8 @@ mod tests {
             vec!["Hello! 👋 How can I help you today?"]
         );
         assert_eq!(
-            app.partial_parts()
+            app.state
+                .partial_parts()
                 .iter()
                 .filter(|part| matches!(part, ocpncord_backend::Part::Tool(_)))
                 .count(),
@@ -3913,7 +3901,7 @@ mod tests {
             "duplicate tool updates should be collapsed"
         );
         assert_eq!(
-            app.messages().len(),
+            app.state.messages().len(),
             1,
             "only the user message is committed"
         );
@@ -3929,7 +3917,7 @@ mod tests {
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
         run(&mut app, enter_key());
-        assert!(app.is_streaming());
+        assert!(app.state.is_streaming());
 
         // Simulate SSE: MessagePartDelta with text chunks (no initial MessagePartUpdated)
         run(
@@ -3943,7 +3931,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            app.partial_parts().len(),
+            app.state.partial_parts().len(),
             1,
             "first delta should create a text part"
         );
@@ -3959,13 +3947,13 @@ mod tests {
             }),
         );
         assert_eq!(
-            app.partial_parts().len(),
+            app.state.partial_parts().len(),
             1,
             "second delta should update existing text part, not add a new one"
         );
 
         // Verify the accumulated text
-        match &app.partial_parts()[0] {
+        match &app.state.partial_parts()[0] {
             ocpncord_backend::Part::Text(tp) => {
                 assert_eq!(tp.text, "Hello world");
             }
@@ -3977,10 +3965,14 @@ mod tests {
             &mut app,
             Event::Backend(ocpncord_backend::BackendEvent::Done),
         );
-        assert!(!app.is_streaming());
-        assert_eq!(app.messages().len(), 1, "only user msg (no flush on Done)");
+        assert!(!app.state.is_streaming());
         assert_eq!(
-            app.partial_parts().len(),
+            app.state.messages().len(),
+            1,
+            "only user msg (no flush on Done)"
+        );
+        assert_eq!(
+            app.state.partial_parts().len(),
             1,
             "content stays in partial_parts for rendering"
         );
@@ -4015,8 +4007,8 @@ mod tests {
             }),
         );
 
-        assert_eq!(app.partial_parts().len(), 1);
-        match &app.partial_parts()[0] {
+        assert_eq!(app.state.partial_parts().len(), 1);
+        match &app.state.partial_parts()[0] {
             ocpncord_backend::Part::Reasoning(reasoning) => {
                 assert_eq!(reasoning.text, "thinking");
             }
@@ -4035,11 +4027,11 @@ mod tests {
         );
 
         assert_eq!(
-            app.partial_parts().len(),
+            app.state.partial_parts().len(),
             1,
             "final reasoning update should replace the streaming placeholder"
         );
-        match &app.partial_parts()[0] {
+        match &app.state.partial_parts()[0] {
             ocpncord_backend::Part::Reasoning(reasoning) => {
                 assert_eq!(reasoning.text, "thinking done");
             }
@@ -4054,7 +4046,7 @@ mod tests {
         let mut app = new_app(backend);
 
         // NOT streaming — just sitting on the start page
-        assert!(!app.is_streaming());
+        assert!(!app.state.is_streaming());
 
         run(
             &mut app,
@@ -4066,7 +4058,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            app.partial_parts().len(),
+            app.state.partial_parts().len(),
             0,
             "parts should NOT accumulate when not streaming"
         );
@@ -4082,7 +4074,7 @@ mod tests {
 
         run(&mut app, char_key('h'));
         run(&mut app, enter_key());
-        assert!(app.is_streaming());
+        assert!(app.state.is_streaming());
 
         run(
             &mut app,
@@ -4090,8 +4082,8 @@ mod tests {
                 message: "connection lost".into(),
             }),
         );
-        assert!(!app.is_streaming());
-        assert!(app.error().unwrap_or("").contains("connection lost"));
+        assert!(!app.state.is_streaming());
+        assert!(app.state.error().unwrap_or("").contains("connection lost"));
     }
 
     #[test]
@@ -4113,12 +4105,12 @@ mod tests {
         );
         assert!(running);
         assert_eq!(
-            app.active_screen(),
+            app.state.active_screen(),
             ScreenId::StartPage,
             "should stay on StartPage on error"
         );
         assert!(
-            app.error().unwrap_or("").contains("server error"),
+            app.state.error().unwrap_or("").contains("server error"),
             "error should contain failure message"
         );
     }
@@ -4127,7 +4119,7 @@ mod tests {
     fn typing_enter_creates_session_and_switches_to_chat() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
-        assert_eq!(app.active_screen(), ScreenId::StartPage);
+        assert_eq!(app.state.active_screen(), ScreenId::StartPage);
 
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
@@ -4144,8 +4136,8 @@ mod tests {
             1,
             "a session should have been created"
         );
-        assert_eq!(app.active_screen(), ScreenId::Chat);
-        assert_eq!(app.draft(), Some("hi"));
+        assert_eq!(app.state.active_screen(), ScreenId::Chat);
+        assert_eq!(app.state.draft(), Some("hi"));
     }
 
     #[test]
@@ -4162,7 +4154,7 @@ mod tests {
         );
         assert!(running);
 
-        assert_eq!(app.active_screen(), ScreenId::StartPage);
+        assert_eq!(app.state.active_screen(), ScreenId::StartPage);
         assert_eq!(app.backend().sessions.len(), 0);
     }
 
@@ -4207,7 +4199,7 @@ mod tests {
 
         let test_backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let buf = terminal.backend().buffer();
         let has_session_1 = buf.content().iter().any(|c| c.symbol() == "F");
         assert!(
@@ -4232,7 +4224,7 @@ mod tests {
 
         let test_backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let buf = terminal.backend().buffer();
         let has_empty_msg = buf.content().iter().any(|c| c.symbol() == "N");
         assert!(has_empty_msg, "Empty state should show 'No sessions yet'");
@@ -4253,7 +4245,7 @@ mod tests {
         );
 
         assert!(
-            app.active_modal().is_some(),
+            app.state.active_modal().is_some(),
             "Ctrl+X L should open session list modal"
         );
     }
@@ -4276,9 +4268,9 @@ mod tests {
         }
 
         let mut app = new_app(MockBackend::default());
-        app.set_active_modal(Box::new(TestCloseModal));
+        app.state.set_active_modal(Box::new(TestCloseModal));
         assert!(
-            app.active_modal().is_some(),
+            app.state.active_modal().is_some(),
             "modal should be active after set"
         );
 
@@ -4290,7 +4282,7 @@ mod tests {
             }),
         );
         assert!(
-            app.active_modal().is_none(),
+            app.state.active_modal().is_none(),
             "Escape should close the modal"
         );
     }
@@ -4312,7 +4304,7 @@ mod tests {
         run(&mut app, enter_key());
 
         assert!(
-            app.active_modal().is_some(),
+            app.state.active_modal().is_some(),
             "/sessions should open the session list modal"
         );
     }
@@ -4334,12 +4326,12 @@ mod tests {
         run(&mut app, enter_key());
 
         assert_eq!(
-            app.active_screen(),
+            app.state.active_screen(),
             ScreenId::Chat,
             "unknown command should transition to chat"
         );
         assert!(
-            app.messages().len() > 0,
+            app.state.messages().len() > 0,
             "unknown command should add a message"
         );
     }
@@ -4352,7 +4344,7 @@ mod tests {
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
         run(&mut app, enter_key());
-        assert_eq!(app.active_screen(), ScreenId::Chat);
+        assert_eq!(app.state.active_screen(), ScreenId::Chat);
 
         // Complete the stream so input is accepted again
         run(
@@ -4368,7 +4360,7 @@ mod tests {
         run(&mut app, char_key('w'));
         run(&mut app, enter_key());
 
-        assert_eq!(app.active_screen(), ScreenId::Chat);
+        assert_eq!(app.state.active_screen(), ScreenId::Chat);
         assert_eq!(
             app.backend().sessions.len(),
             session_count_before + 1,
@@ -4391,7 +4383,7 @@ mod tests {
         run(&mut app, enter_key());
 
         assert!(
-            app.active_modal().is_some(),
+            app.state.active_modal().is_some(),
             "/models should open the model picker modal"
         );
     }
@@ -4409,7 +4401,7 @@ mod tests {
         run(&mut app, enter_key());
 
         assert!(
-            app.active_modal().is_some(),
+            app.state.active_modal().is_some(),
             "/help should open the help modal"
         );
     }
@@ -4424,9 +4416,16 @@ mod tests {
         }
         run(&mut app, enter_key());
 
-        assert!(app.side_panel_visible, "/todos should open the side panel");
-        assert_eq!(app.side_panel_tab, Tab::Todos);
-        assert_eq!(app.prompt_text(), "", "/todos should clear the prompt");
+        assert!(
+            app.state.side_panel_visible,
+            "/todos should open the side panel"
+        );
+        assert_eq!(app.state.side_panel_tab, Tab::Todos);
+        assert_eq!(
+            app.state.prompt_text(),
+            "",
+            "/todos should clear the prompt"
+        );
     }
 
     #[test]
@@ -4436,13 +4435,13 @@ mod tests {
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('o'));
-        assert!(app.side_panel_visible);
-        assert_eq!(app.side_panel_tab, Tab::Todos);
+        assert!(app.state.side_panel_visible);
+        assert_eq!(app.state.side_panel_tab, Tab::Todos);
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('o'));
-        assert!(!app.side_panel_visible);
-        assert_eq!(app.side_panel_tab, Tab::Todos);
+        assert!(!app.state.side_panel_visible);
+        assert_eq!(app.state.side_panel_tab, Tab::Todos);
     }
 
     #[test]
@@ -4452,12 +4451,12 @@ mod tests {
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('o'));
-        assert_eq!(app.side_panel_tab, Tab::Todos);
+        assert_eq!(app.state.side_panel_tab, Tab::Todos);
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('d'));
-        assert!(app.side_panel_visible);
-        assert_eq!(app.side_panel_tab, Tab::Diagnostics);
+        assert!(app.state.side_panel_visible);
+        assert_eq!(app.state.side_panel_tab, Tab::Diagnostics);
     }
 
     #[test]
@@ -4475,7 +4474,7 @@ mod tests {
         );
 
         assert!(
-            app.active_modal().is_some(),
+            app.state.active_modal().is_some(),
             "Ctrl+X M should open the model picker modal"
         );
     }
@@ -4566,7 +4565,7 @@ mod tests {
         );
 
         assert!(
-            app.active_modal().is_some(),
+            app.state.active_modal().is_some(),
             "Ctrl+X H should open the help modal"
         );
     }
@@ -4584,7 +4583,10 @@ mod tests {
                 modifiers: Modifiers::default(),
             }),
         );
-        assert!(app.active_modal().is_some(), "help modal should be open");
+        assert!(
+            app.state.active_modal().is_some(),
+            "help modal should be open"
+        );
 
         run(
             &mut app,
@@ -4594,7 +4596,7 @@ mod tests {
             }),
         );
         assert!(
-            app.active_modal().is_none(),
+            app.state.active_modal().is_none(),
             "Escape should close the help modal"
         );
     }
@@ -4607,14 +4609,17 @@ mod tests {
         // Open help modal on start page so logo gets drawn under the overlay
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('h'));
-        assert!(app.active_modal().is_some(), "help modal should be open");
+        assert!(
+            app.state.active_modal().is_some(),
+            "help modal should be open"
+        );
 
         let test_backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let buf = terminal.backend().buffer();
 
-        // app.render() draws the start page first, then clears only the
+        // app.state.render() draws the start page first, then clears only the
         // modal rectangle before drawing the modal block. Background content
         // may remain outside the modal, but must not bleed through inside it.
         let modal_area = Rect::new(15, 0, 50, 24);
@@ -4652,12 +4657,12 @@ mod tests {
         run(&mut app, char_key('l'));
         run(&mut app, char_key('l'));
         run(&mut app, char_key('o'));
-        assert_eq!(app.prompt_text(), "hello", "should have typed hello");
+        assert_eq!(app.state.prompt_text(), "hello", "should have typed hello");
 
         // Press Ctrl+X (leader key) — this must NOT leak 'x' to the prompt bar
         run(&mut app, ctrl('x'));
         assert_eq!(
-            app.prompt_text(),
+            app.state.prompt_text(),
             "hello",
             "ctrl+x should not leak 'x' to prompt bar"
         );
@@ -4665,7 +4670,7 @@ mod tests {
         // Complete the leader chord with 'h' for help
         run(&mut app, char_key('h'));
         assert!(
-            app.active_modal().is_some(),
+            app.state.active_modal().is_some(),
             "help modal should open after ctrl+x h"
         );
 
@@ -4680,7 +4685,7 @@ mod tests {
 
         // Prompt bar should still show "hello" — unchanged by modal lifecycle
         assert_eq!(
-            app.prompt_text(),
+            app.state.prompt_text(),
             "hello",
             "prompt bar should preserve input through modal lifecycle"
         );
@@ -4690,13 +4695,13 @@ mod tests {
     fn ctrl_x_t_toggles_terminal_screen() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
-        assert_eq!(app.active_screen(), ScreenId::StartPage);
+        assert_eq!(app.state.active_screen(), ScreenId::StartPage);
 
         // Ctrl+X T on StartPage → Terminal
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('t'));
         assert_eq!(
-            app.active_screen(),
+            app.state.active_screen(),
             ScreenId::Terminal,
             "ctrl+x t should switch to terminal"
         );
@@ -4705,7 +4710,7 @@ mod tests {
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('t'));
         assert_eq!(
-            app.active_screen(),
+            app.state.active_screen(),
             ScreenId::StartPage,
             "ctrl+x t again should return to start page"
         );
@@ -4718,33 +4723,36 @@ mod tests {
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('t'));
-        assert_eq!(app.active_screen(), ScreenId::Terminal);
+        assert_eq!(app.state.active_screen(), ScreenId::Terminal);
 
         run(&mut app, char_key('a'));
         run(&mut app, char_key('b'));
-        assert_eq!(app.prompt_text(), "");
+        assert_eq!(app.state.prompt_text(), "");
     }
 
     #[test]
     fn terminal_screen_scrolls_from_bottom_with_arrow_and_page_keys() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
-        app.terminal.pty_id = Some("pty-1".into());
-        app.terminal.command = "sh".into();
+        app.state.terminal.pty_id = Some("pty-1".into());
+        app.state.terminal.command = "sh".into();
         for idx in 0..12 {
-            app.terminal.push_line(TermLine {
-                content: alloc::format!("line-{idx}"),
-                is_error: false,
-            });
+            push_terminal_line(
+                &mut app.state.terminal,
+                TermLine {
+                    content: alloc::format!("line-{idx}"),
+                    is_error: false,
+                },
+            );
         }
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('t'));
-        assert_eq!(app.active_screen(), ScreenId::Terminal);
+        assert_eq!(app.state.active_screen(), ScreenId::Terminal);
 
         let test_backend = TestBackend::new(40, 6);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let screen: String = terminal
             .backend()
             .buffer()
@@ -4762,7 +4770,7 @@ mod tests {
                 modifiers: Modifiers::default(),
             }),
         );
-        assert_eq!(app.terminal.scroll, 1);
+        assert_eq!(app.state.terminal.scroll, 1);
 
         run(
             &mut app,
@@ -4771,7 +4779,7 @@ mod tests {
                 modifiers: Modifiers::default(),
             }),
         );
-        assert_eq!(app.terminal.scroll, 5);
+        assert_eq!(app.state.terminal.scroll, 5);
 
         run(
             &mut app,
@@ -4780,29 +4788,32 @@ mod tests {
                 modifiers: Modifiers::default(),
             }),
         );
-        assert_eq!(app.terminal.scroll, 1);
+        assert_eq!(app.state.terminal.scroll, 1);
     }
 
     #[test]
     fn terminal_screen_scroll_offset_changes_visible_output() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
-        app.terminal.pty_id = Some("pty-1".into());
-        app.terminal.command = "sh".into();
+        app.state.terminal.pty_id = Some("pty-1".into());
+        app.state.terminal.command = "sh".into();
         for idx in 0..12 {
-            app.terminal.push_line(TermLine {
-                content: alloc::format!("line-{idx}"),
-                is_error: false,
-            });
+            push_terminal_line(
+                &mut app.state.terminal,
+                TermLine {
+                    content: alloc::format!("line-{idx}"),
+                    is_error: false,
+                },
+            );
         }
-        app.terminal.scroll = 3;
+        app.state.terminal.scroll = 3;
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('t'));
 
         let test_backend = TestBackend::new(40, 6);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let screen = rendered_screen(&terminal);
 
         assert!(screen.contains("line-5"), "screen: {screen}");
@@ -4814,9 +4825,9 @@ mod tests {
     fn diagnostics_panel_renders_table_columns() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
-        app.side_panel_visible = true;
-        app.side_panel_tab = crate::screen::Tab::Diagnostics;
-        app.lsp_diagnostics.insert(
+        app.state.side_panel_visible = true;
+        app.state.side_panel_tab = crate::screen::Tab::Diagnostics;
+        app.state.lsp_diagnostics.insert(
             "src/main.rs".into(),
             vec![LspDiagnostic {
                 message: "missing semicolon".into(),
@@ -4828,7 +4839,7 @@ mod tests {
 
         let test_backend = TestBackend::new(140, 12);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let screen = rendered_screen(&terminal);
 
         assert!(screen.contains("src/main.rs"), "screen: {screen}");
@@ -4841,9 +4852,9 @@ mod tests {
     fn todos_panel_renders_list_items_with_status_styles() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
-        app.side_panel_visible = true;
-        app.side_panel_tab = crate::screen::Tab::Todos;
-        app.todos = vec![
+        app.state.side_panel_visible = true;
+        app.state.side_panel_tab = crate::screen::Tab::Todos;
+        app.state.todos = vec![
             ocpncord_backend::Todo {
                 content: "done task".into(),
                 status: "completed".into(),
@@ -4858,7 +4869,7 @@ mod tests {
 
         let test_backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let screen = rendered_screen(&terminal);
 
         assert!(screen.contains("[x] done task"), "screen: {screen}");
@@ -4868,12 +4879,12 @@ mod tests {
         let panel_x = 57;
         assert_eq!(
             buf[(panel_x, 2)].style().fg,
-            app.theme.text_dim.fg,
+            app.state.theme.text_dim.fg,
             "completed todo should use dim style"
         );
         assert_eq!(
             buf[(panel_x, 3)].style().fg,
-            app.theme.text.fg,
+            app.state.theme.text.fg,
             "active todo should use normal text style"
         );
     }
@@ -4882,21 +4893,24 @@ mod tests {
     fn terminal_side_panel_uses_terminal_scroll_offset() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
-        app.side_panel_visible = true;
-        app.side_panel_tab = crate::screen::Tab::Pane;
-        app.terminal.pty_id = Some("pty-1".into());
-        app.terminal.command = "sh".into();
+        app.state.side_panel_visible = true;
+        app.state.side_panel_tab = crate::screen::Tab::Pane;
+        app.state.terminal.pty_id = Some("pty-1".into());
+        app.state.terminal.command = "sh".into();
         for idx in 0..10 {
-            app.terminal.push_line(TermLine {
-                content: alloc::format!("line-{idx}"),
-                is_error: false,
-            });
+            push_terminal_line(
+                &mut app.state.terminal,
+                TermLine {
+                    content: alloc::format!("line-{idx}"),
+                    is_error: false,
+                },
+            );
         }
-        app.terminal.scroll = 2;
+        app.state.terminal.scroll = 2;
 
         let test_backend = TestBackend::new(80, 6);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let screen = rendered_screen(&terminal);
 
         assert!(screen.contains("line-5"), "screen: {screen}");
@@ -4912,7 +4926,7 @@ mod tests {
 
         let test_backend = TestBackend::new(24, 6);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let screen = rendered_screen(&terminal);
 
         assert!(screen.contains(">"), "screen: {screen}");
@@ -4925,7 +4939,7 @@ mod tests {
 
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
-        assert_eq!(app.prompt_text(), "hi");
+        assert_eq!(app.state.prompt_text(), "hi");
 
         run(
             &mut app,
@@ -4934,7 +4948,7 @@ mod tests {
                 modifiers: Modifiers::default(),
             }),
         );
-        assert_eq!(app.prompt_text(), "");
+        assert_eq!(app.state.prompt_text(), "");
     }
 
     #[test]
@@ -4944,7 +4958,7 @@ mod tests {
 
         run(&mut app, ctrl('p'));
         assert_eq!(
-            app.active_modal().map(|modal| modal.title()),
+            app.state.active_modal().map(|modal| modal.title()),
             Some("Command Palette")
         );
 
@@ -4955,7 +4969,10 @@ mod tests {
                 modifiers: Modifiers::default(),
             }),
         );
-        assert_eq!(app.active_modal().map(|modal| modal.title()), Some("Help"));
+        assert_eq!(
+            app.state.active_modal().map(|modal| modal.title()),
+            Some("Help")
+        );
     }
 
     #[test]
@@ -4966,12 +4983,12 @@ mod tests {
         // Switch to terminal
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('t'));
-        assert_eq!(app.active_screen(), ScreenId::Terminal);
+        assert_eq!(app.state.active_screen(), ScreenId::Terminal);
 
         // Render and verify helpful message
         let test_backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let screen = rendered_screen(&terminal);
         let has_help = screen.contains("No active terminal");
         assert!(
@@ -4992,12 +5009,12 @@ mod tests {
         // Toggle side panel on (while on start page, which has the logo)
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('d'));
-        assert!(app.side_panel_visible, "side panel should be visible");
+        assert!(app.state.side_panel_visible, "side panel should be visible");
 
         // Render and check panel area
         let test_backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let buf = terminal.backend().buffer();
 
         // The side panel occupies the right 30%. For 80-wide: x=56..79.
@@ -5033,18 +5050,18 @@ mod tests {
             Ok(ocpncord_backend::BackendEvent::Done),
         ];
         let mut app = new_app(backend);
-        futures::executor::block_on(app.init());
+        init(&mut app);
 
         run(&mut app, char_key('h'));
         run(&mut app, enter_key());
-        assert!(app.is_streaming(), "should be streaming after send");
+        assert!(app.state.is_streaming(), "should be streaming after send");
 
         let running = run(&mut app, ctrl('c'));
         assert!(
             running,
             "ctrl+c during streaming should interrupt, not quit"
         );
-        assert!(!app.is_streaming(), "streaming should be stopped");
+        assert!(!app.state.is_streaming(), "streaming should be stopped");
     }
 
     fn permission_request(id: &str) -> ocpncord_backend::PermissionRequest {
@@ -5087,7 +5104,7 @@ mod tests {
     fn toast_renderer_shows_newest_first_and_caps_visible_count() {
         let mut app = new_app(MockBackend::default());
         for idx in 0..6 {
-            app.push_toast(Toast {
+            app.state.push_toast(Toast {
                 title: Some(alloc::format!("Toast{idx}")),
                 message: alloc::format!("message-{idx}"),
                 variant: ToastVariant::Info,
@@ -5099,7 +5116,7 @@ mod tests {
         let test_backend = TestBackend::new(80, 10);
         let mut terminal = Terminal::new(test_backend).unwrap();
         terminal
-            .draw(|frame| app.render_toasts(frame, Rect::new(0, 0, 80, 10)))
+            .draw(|frame| app.state.render_toasts(frame, Rect::new(0, 0, 80, 10)))
             .unwrap();
         let screen = rendered_screen(&terminal);
 
@@ -5116,7 +5133,7 @@ mod tests {
     fn toast_renderer_handles_narrow_terminals_and_storage_cap() {
         let mut app = new_app(MockBackend::default());
         for idx in 0..20 {
-            app.push_toast(Toast {
+            app.state.push_toast(Toast {
                 title: Some(alloc::format!("T{idx}")),
                 message: "very long message that should be clipped".into(),
                 variant: ToastVariant::Info,
@@ -5125,40 +5142,46 @@ mod tests {
             });
         }
 
-        assert_eq!(app.toasts.len(), MAX_STORED_TOASTS);
+        assert_eq!(app.state.toasts.len(), MAX_STORED_TOASTS);
         assert_eq!(
-            app.toasts.front().and_then(|toast| toast.title.as_deref()),
+            app.state
+                .toasts
+                .front()
+                .and_then(|toast| toast.title.as_deref()),
             Some("T4")
         );
 
         let test_backend = TestBackend::new(2, 4);
         let mut terminal = Terminal::new(test_backend).unwrap();
         terminal
-            .draw(|frame| app.render_toasts(frame, Rect::new(0, 0, 2, 4)))
+            .draw(|frame| app.state.render_toasts(frame, Rect::new(0, 0, 2, 4)))
             .unwrap();
     }
 
     #[test]
     fn tick_expires_toasts_and_modal_suppresses_rendering() {
         let mut app = new_app(MockBackend::default());
-        app.push_toast(Toast {
+        app.state.push_toast(Toast {
             title: Some("HiddenToast".into()),
             message: "toast message".into(),
             variant: ToastVariant::Info,
             created_at: 0,
             duration: 0,
         });
-        app.set_active_modal(Box::new(HelpModal::new()));
+        app.state.set_active_modal(Box::new(HelpModal::new()));
 
         let test_backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(test_backend).unwrap();
-        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
         let screen = rendered_screen(&terminal);
         assert!(!screen.contains("HiddenToast"), "screen: {screen}");
 
-        app.clear_active_modal();
+        app.state.clear_active_modal();
         run(&mut app, Event::Tick);
-        assert!(app.toasts.is_empty(), "expired toast should be pruned");
+        assert!(
+            app.state.toasts.is_empty(),
+            "expired toast should be pruned"
+        );
     }
 
     #[test]
@@ -5173,18 +5196,18 @@ mod tests {
         );
 
         assert_eq!(
-            app.active_modal().map(|modal| modal.title()),
+            app.state.active_modal().map(|modal| modal.title()),
             Some("Permission Request")
         );
         assert!(matches!(
-            app.active_blocking_prompt.as_ref(),
+            app.state.active_blocking_prompt.as_ref(),
             Some(ActiveBlockingPrompt::Permission(id)) if id == "perm-1"
         ));
 
         run(&mut app, enter_key());
 
         assert!(
-            app.active_modal().is_none(),
+            app.state.active_modal().is_none(),
             "modal should close after reply"
         );
         assert_eq!(app.backend().permission_replies.len(), 1);
@@ -5214,15 +5237,16 @@ mod tests {
         assert_eq!(app.backend().permission_replies.len(), 1);
         assert_eq!(app.backend().permission_replies[0].request_id, "perm-1");
         assert_eq!(app.backend().permission_replies[0].reply, "reject");
-        assert_eq!(app.pending_permissions.len(), 1);
+        assert_eq!(app.state.pending_permissions.len(), 1);
         assert_eq!(
-            app.pending_permissions
+            app.state
+                .pending_permissions
                 .front()
                 .map(|request| request.id.as_str()),
             Some("perm-2")
         );
         assert!(matches!(
-            app.active_blocking_prompt.as_ref(),
+            app.state.active_blocking_prompt.as_ref(),
             Some(ActiveBlockingPrompt::Permission(id)) if id == "perm-2"
         ));
     }
@@ -5253,15 +5277,16 @@ mod tests {
             }),
         );
 
-        assert_eq!(app.pending_permissions.len(), 1);
+        assert_eq!(app.state.pending_permissions.len(), 1);
         assert_eq!(
-            app.pending_permissions
+            app.state
+                .pending_permissions
                 .front()
                 .map(|request| request.id.as_str()),
             Some("perm-1")
         );
         assert!(matches!(
-            app.active_blocking_prompt.as_ref(),
+            app.state.active_blocking_prompt.as_ref(),
             Some(ActiveBlockingPrompt::Permission(id)) if id == "perm-1"
         ));
     }
@@ -5297,7 +5322,7 @@ mod tests {
             vec!["question-2".to_string()]
         );
         assert!(
-            app.active_modal().is_none(),
+            app.state.active_modal().is_none(),
             "question modal should close after reject"
         );
     }
