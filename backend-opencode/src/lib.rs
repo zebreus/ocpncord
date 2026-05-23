@@ -20,8 +20,8 @@ use serde::Deserialize;
 mod stream;
 pub use stream::{BufferedStream, SseParser};
 
-const RX_BUF_SIZE: usize = 512 * 1024;
-const SSE_READ_BUF_SIZE: usize = 4096;
+const RX_BUF_SIZE: usize = 32 * 1024;
+const SSE_READ_BUF_SIZE: usize = 4 * 1024;
 const SSE_HEADERS: [(&str, &str); 1] = [("Accept", "text/event-stream")];
 
 /// An HTTP client for the opencode server REST API.
@@ -75,6 +75,10 @@ fn api_err(status: u16, body: &[u8]) -> BackendError {
         status,
         message: msg.into(),
     }
+}
+
+fn should_fallback_to_api_models(error: &BackendError) -> bool {
+    matches!(error, BackendError::Api { status: 404, .. })
 }
 
 #[derive(Deserialize)]
@@ -447,11 +451,12 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         let url = alloc::format!("{}/config/providers", self.base_url);
         match self.send_get_body(Method::GET, &url, None).await {
             Ok(body) => parse_config_provider_models(&body),
-            Err(_) => {
+            Err(error) if should_fallback_to_api_models(&error) => {
                 let url = alloc::format!("{}/api/model", self.base_url);
                 let body = self.send_get_body(Method::GET, &url, None).await?;
                 parse_api_models(&body)
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -674,6 +679,69 @@ mod tests {
         (alloc::format!("http://127.0.0.1:{}", addr.port()), rx)
     }
 
+    fn http_response(status_line: &str, body: &str) -> String {
+        alloc::format!(
+            "{status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        )
+    }
+
+    async fn spawn_response_sequence_server(
+        responses: Vec<String>,
+    ) -> (String, oneshot::Receiver<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let mut requests = Vec::new();
+
+            for response in responses {
+                let accept = timeout(Duration::from_millis(500), listener.accept()).await;
+                let Ok(Ok((mut stream, _))) = accept else {
+                    break;
+                };
+
+                let mut request = Vec::new();
+                let mut total_len = None;
+
+                loop {
+                    let mut chunk = [0u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+
+                    if total_len.is_none() {
+                        if let Some(header_end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            let header_end = header_end + 4;
+                            let headers = String::from_utf8_lossy(&request[..header_end]);
+                            total_len = Some(header_end + content_length(&headers));
+                        }
+                    }
+
+                    if let Some(total_len) = total_len {
+                        if request.len() >= total_len {
+                            break;
+                        }
+                    }
+                }
+
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+                requests.push(String::from_utf8(request).unwrap());
+            }
+
+            let _ = tx.send(requests);
+        });
+
+        (alloc::format!("http://127.0.0.1:{}", addr.port()), rx)
+    }
+
     async fn spawn_streaming_sse_server(
         first_chunk: &'static str,
     ) -> (String, oneshot::Sender<()>) {
@@ -792,6 +860,95 @@ mod tests {
                 .and_then(|caps| caps.tool_call),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn list_models_prefers_config_providers_endpoint() {
+        let config_providers_body = r#"{
+            "providers": [
+                {
+                    "id": "opencode",
+                    "models": {
+                        "big-pickle": {
+                            "id": "big-pickle",
+                            "providerID": "opencode",
+                            "name": "Big Pickle",
+                            "family": "big-pickle",
+                            "status": "active"
+                        }
+                    }
+                }
+            ]
+        }"#;
+        let (base_url, requests_rx) = spawn_response_sequence_server(vec![http_response(
+            "HTTP/1.1 200 OK",
+            config_providers_body,
+        )])
+        .await;
+        let mut backend = backend(&base_url);
+
+        let models = backend.list_models().await.unwrap();
+        let requests = requests_rx.await.unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("GET /config/providers HTTP/1.1"));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "big-pickle");
+        assert_eq!(models[0].provider_id, "opencode");
+    }
+
+    #[tokio::test]
+    async fn list_models_falls_back_to_api_model_on_404() {
+        let api_models_body = r#"[
+            {
+                "id": "anthropic/claude-sonnet-4",
+                "providerID": "openrouter",
+                "name": "Claude Sonnet 4",
+                "family": "claude",
+                "status": "available"
+            }
+        ]"#;
+        let (base_url, requests_rx) = spawn_response_sequence_server(vec![
+            http_response("HTTP/1.1 404 Not Found", "missing"),
+            http_response("HTTP/1.1 200 OK", api_models_body),
+        ])
+        .await;
+        let mut backend = backend(&base_url);
+
+        let models = backend.list_models().await.unwrap();
+        let requests = requests_rx.await.unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("GET /config/providers HTTP/1.1"));
+        assert!(requests[1].contains("GET /api/model HTTP/1.1"));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "anthropic/claude-sonnet-4");
+        assert_eq!(models[0].provider_id, "openrouter");
+    }
+
+    #[tokio::test]
+    async fn list_models_does_not_fallback_on_oversized_config_providers_response() {
+        let oversized_body = "x".repeat(RX_BUF_SIZE + 1);
+        let fallback_body = r#"[
+            {
+                "id": "should-not-be-requested",
+                "providerID": "fallback",
+                "name": "Fallback"
+            }
+        ]"#;
+        let (base_url, requests_rx) = spawn_response_sequence_server(vec![
+            http_response("HTTP/1.1 200 OK", &oversized_body),
+            http_response("HTTP/1.1 200 OK", fallback_body),
+        ])
+        .await;
+        let mut backend = backend(&base_url);
+
+        let error = backend.list_models().await.unwrap_err();
+        let requests = requests_rx.await.unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("GET /config/providers HTTP/1.1"));
+        assert!(matches!(error, BackendError::Connection { .. }));
     }
 
     #[tokio::test]
