@@ -630,12 +630,7 @@ fn parse_backend_event_value(value: &serde_json::Value) -> Option<Result<EventEn
                 message_id: message_id.to_owned(),
             }))
         }
-        "message.part.updated.1" => {
-            let part = props
-                .get("part")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())?;
-            Some(Ok(BackendEvent::Part { part, delta: None }))
-        }
+        "message.part.updated.1" => parse_part_updated_value(props),
         "message.part.removed.1" => {
             let session_id = props.get("sessionID").and_then(|v| v.as_str())?;
             let message_id = props.get("messageID").and_then(|v| v.as_str())?;
@@ -791,14 +786,17 @@ fn parse_message_updated_value(props: &serde_json::Value) -> Option<Result<Backe
     }))
 }
 
-/// Parse a `message.part.updated` event data JSON into a `BackendEvent::Part`.
+/// Parse a `message.part.updated` event data JSON into a
+/// `BackendEvent::MessagePartUpdated`.
 ///
 /// The `sessionID` may be at `properties.sessionID` (wrapped format) or
 /// inside the `part` object at `properties.part.sessionID` (live SSE format).
 fn parse_part_updated_value(props: &serde_json::Value) -> Option<Result<BackendEvent>> {
-    let part = props
+    let part: ocpncord_backend::Part = props
         .get("part")
         .and_then(|v| serde_json::from_value(v.clone()).ok())?;
+    let message_id = part.message_id()?;
+    let part_id = part.id()?;
     let session_id = props
         .get("sessionID")
         .and_then(|v| v.as_str())
@@ -810,6 +808,8 @@ fn parse_part_updated_value(props: &serde_json::Value) -> Option<Result<BackendE
         })?;
     Some(Ok(BackendEvent::MessagePartUpdated {
         session_id: session_id.to_owned(),
+        message_id: message_id.to_owned(),
+        part_id: part_id.to_owned(),
         part,
     }))
 }
@@ -840,7 +840,14 @@ mod tests {
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
         match event_at(&events, 0) {
-            BackendEvent::MessagePartUpdated { part, .. } => {
+            BackendEvent::MessagePartUpdated {
+                message_id,
+                part_id,
+                part,
+                ..
+            } => {
+                assert_eq!(message_id, "msg1");
+                assert_eq!(part_id, "prt1");
                 assert!(matches!(part, ocpncord_backend::Part::Text(_)));
             }
             _ => panic!("expected text part"),
@@ -854,7 +861,14 @@ mod tests {
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
         match event_at(&events, 0) {
-            BackendEvent::MessagePartUpdated { part, .. } => {
+            BackendEvent::MessagePartUpdated {
+                message_id,
+                part_id,
+                part,
+                ..
+            } => {
+                assert_eq!(message_id, "msg1");
+                assert_eq!(part_id, "prt1");
                 assert!(matches!(part, ocpncord_backend::Part::Tool(_)));
             }
             _ => panic!("expected tool part"),
@@ -863,26 +877,71 @@ mod tests {
 
     #[test]
     fn parse_message_updated_for_assistant_message() {
-        let data = wrap_sse_data("message.updated", "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"modelID\":\"model-1\",\"providerID\":\"provider-1\",\"mode\":\"build\",\"agent\":\"builder\",\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}");
+        let data = wrap_sse_data("message.updated", "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0},\"parentID\":\"msg0\",\"modelID\":\"model-1\",\"providerID\":\"provider-1\",\"mode\":\"build\",\"agent\":\"builder\",\"path\":{\"cwd\":\"/tmp\",\"root\":\"/repo\"},\"summary\":true,\"cost\":0,\"tokens\":{\"total\":4,\"input\":1,\"output\":2,\"reasoning\":1,\"cache\":{\"read\":0,\"write\":0}},\"structured\":{\"answer\":42},\"variant\":\"thinking\",\"finish\":\"stop\"}}");
         let sse = format!("event: message.updated\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        assert!(matches!(
-            event_at(&events, 0),
-            BackendEvent::MessageUpdated { .. }
-        ));
+        match event_at(&events, 0) {
+            BackendEvent::MessageUpdated {
+                message: ocpncord_backend::Message::Assistant(message),
+                ..
+            } => {
+                assert_eq!(message.parent_id.as_deref(), Some("msg0"));
+                assert_eq!(
+                    message.path.as_ref().map(|path| path.cwd.as_str()),
+                    Some("/tmp")
+                );
+                assert_eq!(message.summary, Some(true));
+                assert_eq!(
+                    message.tokens.as_ref().and_then(|tokens| tokens.total),
+                    Some(4.0)
+                );
+                assert_eq!(message.variant.as_deref(), Some("thinking"));
+                assert_eq!(message.finish.as_deref(), Some("stop"));
+                assert_eq!(
+                    message
+                        .structured
+                        .as_ref()
+                        .and_then(|value| value.get("answer"))
+                        .and_then(|value| value.as_i64()),
+                    Some(42)
+                );
+            }
+            other => panic!("expected assistant message.updated, got {other:?}"),
+        }
     }
 
     #[test]
     fn parse_user_message_updated_produces_transcript_event() {
-        let data = wrap_sse_data("message.updated", "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"user\",\"time\":{\"created\":0},\"agent\":\"build\",\"model\":{\"providerID\":\"anthropic\",\"modelID\":\"claude-sonnet\"}}}");
+        let data = wrap_sse_data("message.updated", "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"user\",\"time\":{\"created\":0},\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"},\"retryCount\":2},\"summary\":{\"title\":\"T\",\"body\":\"B\",\"diffs\":[]},\"agent\":\"build\",\"model\":{\"providerID\":\"anthropic\",\"modelID\":\"claude-sonnet\",\"variant\":\"fast\"},\"system\":\"system prompt\",\"tools\":{\"grep\":true}}}");
         let sse = format!("event: message.updated\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        assert!(matches!(
-            event_at(&events, 0),
-            BackendEvent::MessageUpdated { .. }
-        ));
+        match event_at(&events, 0) {
+            BackendEvent::MessageUpdated {
+                message: ocpncord_backend::Message::User(message),
+                ..
+            } => {
+                assert_eq!(message.model.variant.as_deref(), Some("fast"));
+                assert_eq!(message.system.as_deref(), Some("system prompt"));
+                assert_eq!(
+                    message.tools.as_ref().and_then(|tools| tools.get("grep")),
+                    Some(&true)
+                );
+                assert_eq!(
+                    message
+                        .summary
+                        .as_ref()
+                        .and_then(|summary| summary.title.as_deref()),
+                    Some("T")
+                );
+                assert!(matches!(
+                    message.format,
+                    Some(ocpncord_backend::OutputFormat::JsonSchema(_))
+                ));
+            }
+            other => panic!("expected user message.updated, got {other:?}"),
+        }
     }
 
     #[test]
@@ -903,13 +962,26 @@ mod tests {
 
     #[test]
     fn parse_session_created() {
-        let data = wrap_sse_data("session.created", "{\"sessionID\":\"ses123\",\"info\":{\"id\":\"ses123\",\"title\":\"Test\",\"projectID\":\"proj1\",\"directory\":\"/tmp\",\"slug\":\"\",\"version\":\"1\",\"time\":{\"created\":0,\"updated\":0}}}");
+        let data = wrap_sse_data("session.created", "{\"sessionID\":\"ses123\",\"info\":{\"id\":\"ses123\",\"title\":\"Test\",\"projectID\":\"proj1\",\"directory\":\"/tmp\",\"path\":\"/repo\",\"slug\":\"\",\"summary\":{\"additions\":1,\"deletions\":2,\"files\":3},\"cost\":4.5,\"tokens\":{\"input\":1,\"output\":2,\"reasoning\":3,\"cache\":{\"read\":4,\"write\":5}},\"agent\":\"builder\",\"model\":{\"id\":\"model-1\",\"providerID\":\"provider-1\",\"variant\":\"thinking\"},\"version\":\"1\",\"time\":{\"created\":0,\"updated\":0,\"compacting\":9,\"archived\":10}}}");
         let sse = format!("event: session.created\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
         match event_at(&events, 0) {
             BackendEvent::SessionCreated { session } => {
                 assert_eq!(session.id, "ses123");
+                assert_eq!(session.path.as_deref(), Some("/repo"));
+                assert_eq!(session.cost, Some(4.5));
+                assert_eq!(
+                    session.tokens.as_ref().map(|tokens| tokens.cache.write),
+                    Some(5.0)
+                );
+                assert_eq!(session.agent.as_deref(), Some("builder"));
+                assert_eq!(
+                    session.model.as_ref().map(|model| model.id.as_str()),
+                    Some("model-1")
+                );
+                assert_eq!(session.time.compacting, Some(9));
+                assert_eq!(session.time.archived, Some(10));
             }
             _ => panic!("expected session.created"),
         }
@@ -1180,7 +1252,7 @@ mod tests {
     fn parse_multiple_events() {
         let d1 = wrap_sse_data("message.part.updated", "{\"sessionID\":\"ses1\",\"part\":{\"id\":\"prt1\",\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"type\":\"text\",\"text\":\"One\"},\"time\":0}");
         let d2 = wrap_sse_data("message.part.updated", "{\"sessionID\":\"ses1\",\"part\":{\"id\":\"prt2\",\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"type\":\"text\",\"text\":\"Two\"},\"time\":0}");
-        let d3 = wrap_sse_data("message.updated", "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"modelID\":\"model-1\",\"providerID\":\"provider-1\",\"mode\":\"build\",\"agent\":\"builder\",\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}");
+        let d3 = wrap_sse_data("message.updated", "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0},\"parentID\":\"msg0\",\"modelID\":\"model-1\",\"providerID\":\"provider-1\",\"mode\":\"build\",\"agent\":\"builder\",\"path\":{\"cwd\":\"/tmp\",\"root\":\"/repo\"},\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}},\"finish\":\"stop\"}}");
         let sse = format!(
             "event: message.part.updated\ndata: {d1}\n\nevent: message.part.updated\ndata: {d2}\n\nevent: message.updated\ndata: {d3}\n\n"
         );
@@ -1219,7 +1291,9 @@ mod tests {
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1, "wrapped payload should be parsed");
         match event_at(&events, 0) {
-            BackendEvent::MessagePartUpdated { session_id, part } => {
+            BackendEvent::MessagePartUpdated {
+                session_id, part, ..
+            } => {
                 assert_eq!(session_id, "ses1");
                 assert!(matches!(part, ocpncord_backend::Part::Text(_)));
             }
@@ -1232,7 +1306,7 @@ mod tests {
         let data = wrap_wire_event(
             "message.updated",
             1,
-            "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"modelID\":\"model-1\",\"providerID\":\"provider-1\",\"mode\":\"build\",\"agent\":\"builder\",\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}",
+            "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0},\"parentID\":\"msg0\",\"modelID\":\"model-1\",\"providerID\":\"provider-1\",\"mode\":\"build\",\"agent\":\"builder\",\"path\":{\"cwd\":\"/tmp\",\"root\":\"/repo\"},\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}},\"finish\":\"stop\"}}",
         );
         let sse = format!("event: message\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
@@ -1309,7 +1383,7 @@ mod tests {
         let done = wrap_wire_event(
             "message.updated",
             1,
-            "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"modelID\":\"model-1\",\"providerID\":\"provider-1\",\"mode\":\"build\",\"agent\":\"builder\",\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}",
+            "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0},\"parentID\":\"msg0\",\"modelID\":\"model-1\",\"providerID\":\"provider-1\",\"mode\":\"build\",\"agent\":\"builder\",\"path\":{\"cwd\":\"/tmp\",\"root\":\"/repo\"},\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}},\"finish\":\"stop\"}}",
         );
         let sse = format!(
             "event: message\ndata: {wrapped}\n\nevent: message\ndata: {bus}\n\nevent: message\ndata: {done}\n\n"

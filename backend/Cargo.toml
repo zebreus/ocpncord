@@ -13,6 +13,7 @@ categories = ["api-bindings", "asynchronous", "no-std"]
 [dependencies]
 futures-core.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 [features]
 mock = []

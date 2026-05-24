@@ -200,27 +200,14 @@ fn parse_api_models(body: &[u8]) -> Result<Vec<ModelSummary>> {
 }
 
 fn parse_submission_receipt(body: &[u8]) -> Result<SubmissionReceipt> {
-    serde_json::from_slice(body).map_err(parse_err)
+    let receipt: CreatedSubmissionReceipt = serde_json::from_slice(body).map_err(parse_err)?;
+    Ok(SubmissionReceipt::Created(receipt))
 }
 
 fn accepted_submission_receipt(session_id: &SessionId, agent: Option<&str>) -> SubmissionReceipt {
-    SubmissionReceipt {
-        info: AssistantMessage {
-            id: "pending".into(),
-            session_id: session_id.clone(),
-            role: MessageRole::Assistant,
-            time: MessageTime {
-                created: 0,
-                completed: None,
-            },
-            parent_id: None,
-            model_id: "pending".into(),
-            provider_id: "pending".into(),
-            mode: "primary".into(),
-            agent: agent.unwrap_or("build").into(),
-            cost: 0.0,
-        },
-        parts: Vec::new(),
+    SubmissionReceipt::Accepted {
+        session_id: session_id.clone(),
+        agent: agent.map(|value| value.into()),
     }
 }
 
@@ -1183,10 +1170,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(receipt.info.id, "pending");
-        assert_eq!(receipt.info.session_id, "ses_1");
-        assert_eq!(receipt.info.agent, "builder");
-        assert!(receipt.parts.is_empty());
+        match receipt {
+            SubmissionReceipt::Accepted { session_id, agent } => {
+                assert_eq!(session_id, "ses_1");
+                assert_eq!(agent.as_deref(), Some("builder"));
+            }
+            other => panic!("expected accepted receipt, got {other:?}"),
+        }
 
         let request = request_rx.await.unwrap();
         assert!(request.contains("POST /session/ses_1/prompt_async HTTP/1.1"));
@@ -1207,10 +1197,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(receipt.info.id, "msg_2");
-        assert_eq!(receipt.info.session_id, "ses_2");
-        assert_eq!(receipt.info.agent, "runner");
-        assert!(receipt.parts.is_empty());
+        match receipt {
+            SubmissionReceipt::Created(receipt) => {
+                assert_eq!(receipt.info.id, "msg_2");
+                assert_eq!(receipt.info.session_id, "ses_2");
+                assert_eq!(receipt.info.agent, "runner");
+                assert!(receipt.parts.is_empty());
+            }
+            other => panic!("expected created receipt, got {other:?}"),
+        }
 
         let request = request_rx.await.unwrap();
         assert!(request.contains("POST /session/ses_2/command HTTP/1.1"));

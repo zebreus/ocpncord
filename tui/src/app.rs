@@ -1,4 +1,3 @@
-use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -14,7 +13,10 @@ use core::task::Poll;
 use futures_core::Stream;
 use ocpncord_backend::{Backend, BackendEvent, EventEnvelope, EventScope};
 
-use crate::chat::{render_chat, ChatTranscript};
+use crate::chat::{
+    loaded_messages_from_details, render_chat, user_loaded_message, ChatState, ChatTranscript,
+    LoadedMessage,
+};
 use crate::command_palette::CommandPaletteModal;
 use crate::event::{Event, Scancode};
 use crate::key_chord::KeyChord;
@@ -126,15 +128,6 @@ enum ActiveBlockingPrompt {
     Question(String),
 }
 
-/// A message held in memory, built from streaming Parts.
-#[derive(Debug, Clone)]
-pub struct LoadedMessage {
-    pub id: Option<String>,
-    pub session_id: Option<String>,
-    pub role: ocpncord_backend::MessageRole,
-    pub parts: Vec<ocpncord_backend::Part>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmissionKind {
     Prompt,
@@ -178,12 +171,6 @@ impl Submission {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamTextKind {
-    Text,
-    Reasoning,
-}
-
 /// A single LSP diagnostic entry.
 #[derive(Debug, Clone)]
 pub struct LspDiagnostic {
@@ -208,96 +195,6 @@ pub struct TerminalPane {
 pub struct TermLine {
     pub content: String,
     pub is_error: bool,
-}
-
-fn parts_equivalent(left: &ocpncord_backend::Part, right: &ocpncord_backend::Part) -> bool {
-    match (left, right) {
-        (ocpncord_backend::Part::Text(left), ocpncord_backend::Part::Text(right)) => {
-            left.text == right.text
-        }
-        (ocpncord_backend::Part::Reasoning(left), ocpncord_backend::Part::Reasoning(right)) => {
-            left.text == right.text
-        }
-        (ocpncord_backend::Part::Tool(left), ocpncord_backend::Part::Tool(right)) => {
-            left.tool == right.tool && tool_states_equivalent(&left.state, &right.state)
-        }
-        (ocpncord_backend::Part::StepStart(_), ocpncord_backend::Part::StepStart(_)) => true,
-        (ocpncord_backend::Part::StepFinish(left), ocpncord_backend::Part::StepFinish(right)) => {
-            left.reason == right.reason
-        }
-        _ => false,
-    }
-}
-
-fn tool_states_equivalent(
-    left: &ocpncord_backend::ToolState,
-    right: &ocpncord_backend::ToolState,
-) -> bool {
-    match (left, right) {
-        (
-            ocpncord_backend::ToolState::Pending {
-                input: left_input,
-                raw: left_raw,
-            },
-            ocpncord_backend::ToolState::Pending {
-                input: right_input,
-                raw: right_raw,
-            },
-        ) => left_input == right_input && left_raw == right_raw,
-        (
-            ocpncord_backend::ToolState::Running { .. },
-            ocpncord_backend::ToolState::Running { .. },
-        ) => true,
-        (
-            ocpncord_backend::ToolState::Completed {
-                output: left_output,
-                title: left_title,
-                ..
-            },
-            ocpncord_backend::ToolState::Completed {
-                output: right_output,
-                title: right_title,
-                ..
-            },
-        ) => left_output == right_output && left_title == right_title,
-        (
-            ocpncord_backend::ToolState::Error {
-                error: left_error, ..
-            },
-            ocpncord_backend::ToolState::Error {
-                error: right_error, ..
-            },
-        ) => left_error == right_error,
-        _ => false,
-    }
-}
-
-fn user_loaded_message(text: &str) -> LoadedMessage {
-    LoadedMessage {
-        id: None,
-        session_id: None,
-        role: ocpncord_backend::MessageRole::User,
-        parts: vec![ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
-            text: text.into(),
-        })],
-    }
-}
-
-fn stream_text_kind(part: &ocpncord_backend::Part) -> Option<StreamTextKind> {
-    match part {
-        ocpncord_backend::Part::Text(_) => Some(StreamTextKind::Text),
-        ocpncord_backend::Part::Reasoning(_) => Some(StreamTextKind::Reasoning),
-        _ => None,
-    }
-}
-
-fn set_stream_text(part: &mut ocpncord_backend::Part, text: String, kind: StreamTextKind) {
-    *part = match kind {
-        StreamTextKind::Text => ocpncord_backend::Part::Text(ocpncord_backend::TextPart { text }),
-        StreamTextKind::Reasoning => {
-            ocpncord_backend::Part::Reasoning(ocpncord_backend::ReasoningPart { text })
-        }
-    };
 }
 
 impl TerminalPane {
@@ -494,15 +391,9 @@ pub struct AppState {
     error: Option<String>,
     is_streaming: bool,
     response_indicator_until_tick: u64,
-    partial_parts: Vec<ocpncord_backend::Part>,
-    /// Accumulated delta text per part_id for real-time streaming.
-    partial_texts: alloc::collections::BTreeMap<String, String>,
-    partial_part_indices: alloc::collections::BTreeMap<String, usize>,
-    latest_text_part_index: Option<usize>,
-    messages: Vec<LoadedMessage>,
+    chat: ChatState,
     active_submission: Option<Submission>,
     queued_submissions: Vec<Submission>,
-    queued_messages: Vec<LoadedMessage>,
     sync_known_sequences: BTreeMap<String, u64>,
     live_reconnect_at_tick: Option<u64>,
     pending_ops: alloc::collections::VecDeque<BackendOp>,
@@ -548,14 +439,9 @@ impl AppState {
             error: None,
             is_streaming: false,
             response_indicator_until_tick: 0,
-            partial_parts: Vec::new(),
-            partial_texts: alloc::collections::BTreeMap::new(),
-            partial_part_indices: alloc::collections::BTreeMap::new(),
-            latest_text_part_index: None,
-            messages: Vec::new(),
+            chat: ChatState::new(),
             active_submission: None,
             queued_submissions: Vec::new(),
-            queued_messages: Vec::new(),
             sync_known_sequences: BTreeMap::new(),
             live_reconnect_at_tick: None,
             pending_ops: alloc::collections::VecDeque::new(),
@@ -898,11 +784,12 @@ impl AppState {
     }
 
     pub fn partial_parts(&self) -> &[ocpncord_backend::Part] {
-        &self.partial_parts
+        self.chat.partial_parts()
     }
 
-    pub fn messages(&self) -> &[LoadedMessage] {
-        &self.messages
+    #[cfg(test)]
+    pub(crate) fn messages(&self) -> &[LoadedMessage] {
+        self.chat.messages()
     }
 
     pub fn active_submission(&self) -> Option<&Submission> {
@@ -928,7 +815,7 @@ impl AppState {
     fn queue_or_dispatch_submission(&mut self, submission: Submission, message: LoadedMessage) {
         if self.is_streaming || self.active_submission.is_some() {
             self.queued_submissions.push(submission);
-            self.queued_messages.push(message);
+            self.chat.queue_message(message);
             return;
         }
 
@@ -936,39 +823,28 @@ impl AppState {
     }
 
     fn take_next_queued_submission(&mut self) -> Option<(Submission, LoadedMessage)> {
-        if self.queued_submissions.is_empty() || self.queued_messages.is_empty() {
+        if self.queued_submissions.is_empty() {
             return None;
         }
 
-        if !self.partial_parts.is_empty() {
-            let parts = core::mem::take(&mut self.partial_parts);
-            self.messages.push(LoadedMessage {
-                id: None,
-                session_id: self.active_session_id(),
-                role: ocpncord_backend::MessageRole::Assistant,
-                parts,
-            });
-            self.partial_texts.clear();
-            self.partial_part_indices.clear();
-            self.latest_text_part_index = None;
+        let Some(message) = self.chat.pop_queued_message() else {
+            return None;
+        };
+
+        if self.chat.has_partial_response() {
+            self.chat.flush_partial_response(self.active_session_id());
         }
 
-        Some((
-            self.queued_submissions.remove(0),
-            self.queued_messages.remove(0),
-        ))
+        Some((self.queued_submissions.remove(0), message))
     }
 
     fn start_submission(&mut self, submission: Submission, message: LoadedMessage) {
-        self.messages.push(message);
+        self.chat.push_message(message);
         self.draft = Some(submission.text.clone());
         self.active_mode = AppMode::Chat;
         self.is_streaming = true;
         self.mark_response_active();
-        self.partial_parts.clear();
-        self.partial_texts.clear();
-        self.partial_part_indices.clear();
-        self.latest_text_part_index = None;
+        self.chat.clear_partial_stream();
         self.queue_op(BackendOp::Submit { submission });
     }
 
@@ -986,80 +862,13 @@ impl AppState {
             .map(|session| session.id.clone())
     }
 
-    fn message_identity(
-        message: &ocpncord_backend::Message,
-    ) -> (&str, &str, ocpncord_backend::MessageRole) {
-        match message {
-            ocpncord_backend::Message::User(message) => {
-                (&message.id, &message.session_id, message.role.clone())
-            }
-            ocpncord_backend::Message::Assistant(message) => {
-                (&message.id, &message.session_id, message.role.clone())
-            }
-        }
-    }
-
     fn active_session_matches(&self, session_id: &str) -> bool {
         self.active_session.as_ref().map(|s| s.id.as_str()) == Some(session_id)
     }
-
-    fn find_message_index(&self, message_id: &str) -> Option<usize> {
-        self.messages
-            .iter()
-            .position(|message| message.id.as_deref() == Some(message_id))
-    }
-
-    fn attach_id_to_optimistic_user_message(&mut self, message_id: &str, session_id: &str) -> bool {
-        let Some(index) = self.messages.iter().position(|message| {
-            message.id.is_none() && matches!(message.role, ocpncord_backend::MessageRole::User)
-        }) else {
-            return false;
-        };
-
-        self.messages[index].id = Some(message_id.to_owned());
-        self.messages[index].session_id = Some(session_id.to_owned());
-        true
-    }
-
-    fn upsert_assistant_message_from_partial(&mut self, message_id: &str, session_id: &str) {
-        let parts = core::mem::take(&mut self.partial_parts);
-        if let Some(index) = self.find_message_index(message_id) {
-            self.messages[index].session_id = Some(session_id.to_owned());
-            self.messages[index].role = ocpncord_backend::MessageRole::Assistant;
-            if !parts.is_empty() {
-                self.messages[index].parts = parts;
-            }
-            return;
-        }
-
-        self.messages.push(LoadedMessage {
-            id: Some(message_id.to_owned()),
-            session_id: Some(session_id.to_owned()),
-            role: ocpncord_backend::MessageRole::Assistant,
-            parts,
-        });
-    }
-
-    fn finish_streaming_response(&mut self, message_id: Option<&str>, session_id: Option<&str>) {
+    fn finish_streaming_response(&mut self) {
         let was_streaming = self.is_streaming;
-        if let (Some(message_id), Some(session_id)) = (message_id, session_id) {
-            self.upsert_assistant_message_from_partial(message_id, session_id);
-        } else if !self.partial_parts.is_empty() {
-            let parts = core::mem::take(&mut self.partial_parts);
-            self.messages.push(LoadedMessage {
-                id: None,
-                session_id: self.active_session_id(),
-                role: ocpncord_backend::MessageRole::Assistant,
-                parts,
-            });
-        }
-
         self.is_streaming = false;
         self.active_submission = None;
-        self.partial_parts.clear();
-        self.partial_texts.clear();
-        self.partial_part_indices.clear();
-        self.latest_text_part_index = None;
 
         if was_streaming {
             self.dispatch_next_queued_submission();
@@ -1071,22 +880,8 @@ impl AppState {
             return;
         }
 
-        let (message_id, message_session_id, role) = Self::message_identity(&message);
-        let message_id = message_id.to_owned();
-        let message_session_id = message_session_id.to_owned();
-
-        match role {
-            ocpncord_backend::MessageRole::User => {
-                if let Some(index) = self.find_message_index(&message_id) {
-                    self.messages[index].session_id = Some(message_session_id.clone());
-                    self.messages[index].role = ocpncord_backend::MessageRole::User;
-                } else {
-                    self.attach_id_to_optimistic_user_message(&message_id, &message_session_id);
-                }
-            }
-            ocpncord_backend::MessageRole::Assistant => {
-                self.finish_streaming_response(Some(&message_id), Some(&message_session_id));
-            }
+        if self.chat.apply_message_updated(message) {
+            self.finish_streaming_response();
         }
     }
 
@@ -1094,8 +889,7 @@ impl AppState {
         if !self.active_session_matches(&session_id) {
             return;
         }
-        self.messages
-            .retain(|message| message.id.as_deref() != Some(message_id.as_str()));
+        self.chat.remove_message(&message_id);
     }
 
     fn open_permission_modal_if_idle(&mut self) -> bool {
@@ -1286,19 +1080,12 @@ impl AppState {
             {
                 #[allow(unreachable_patterns)]
                 match event {
-                    ocpncord_backend::BackendEvent::Part { part, delta: _ } => {
-                        self.mark_response_active();
-                        self.merge_stream_part(part);
-                    }
                     ocpncord_backend::BackendEvent::Error { message } => {
                         self.error = Some(message);
-                        self.partial_parts.clear();
+                        self.chat.clear_partial_stream();
                         self.is_streaming = false;
                         self.response_indicator_until_tick = 0;
                         self.active_submission = None;
-                        self.partial_texts.clear();
-                        self.partial_part_indices.clear();
-                        self.latest_text_part_index = None;
                         self.dispatch_next_queued_submission();
                     }
                     ocpncord_backend::BackendEvent::SessionCreated { session } => {
@@ -1310,7 +1097,7 @@ impl AppState {
                         self.active_session = Some(session);
                         self.active_mode = AppMode::Chat;
                         if is_new {
-                            self.messages.clear();
+                            self.chat.clear_messages();
                         }
                         self.error = None;
                     }
@@ -1323,7 +1110,7 @@ impl AppState {
                     }
                     ocpncord_backend::BackendEvent::SessionDeleted { .. } => {
                         self.active_session = None;
-                        self.messages.clear();
+                        self.chat.clear_messages();
                         self.active_mode = AppMode::StartPage;
                     }
                     ocpncord_backend::BackendEvent::SessionIdle { .. } => {}
@@ -1345,12 +1132,13 @@ impl AppState {
                     ocpncord_backend::BackendEvent::MessagePartUpdated {
                         session_id,
                         ref part,
+                        ..
                     } => {
                         if self.active_session.as_ref().map(|s| s.id.as_str())
                             == Some(session_id.as_str())
                         {
                             self.mark_response_active();
-                            self.merge_stream_part(part.clone());
+                            self.chat.merge_stream_part(part.clone());
                         }
                     }
                     ocpncord_backend::BackendEvent::MessagePartDelta {
@@ -1364,7 +1152,7 @@ impl AppState {
                             == Some(session_id.as_str()) =>
                     {
                         self.mark_response_active();
-                        self.merge_stream_delta(part_id, delta);
+                        self.chat.merge_stream_delta(part_id, delta);
                     }
                     ocpncord_backend::BackendEvent::MessagePartDelta { .. } => {}
                     ocpncord_backend::BackendEvent::MessagePartRemoved {
@@ -1373,7 +1161,7 @@ impl AppState {
                         ..
                     } => {
                         if self.active_session_matches(&session_id) {
-                            self.remove_stream_part(&part_id);
+                            self.chat.remove_stream_part(&part_id);
                         }
                     }
                     ocpncord_backend::BackendEvent::PermissionAsked { request } => {
@@ -1768,13 +1556,10 @@ impl AppState {
         }
         self.is_streaming = false;
         self.response_indicator_until_tick = 0;
-        self.partial_parts.clear();
-        self.partial_texts.clear();
-        self.partial_part_indices.clear();
-        self.latest_text_part_index = None;
+        self.chat.clear_partial_stream();
         self.active_submission = None;
         self.queued_submissions.clear();
-        self.queued_messages.clear();
+        self.chat.clear_queued_messages();
         true
     }
 
@@ -1964,9 +1749,7 @@ impl AppState {
                 self.error = Some(alloc::format!("{}", e));
                 self.is_streaming = false;
                 self.response_indicator_until_tick = 0;
-                self.partial_texts.clear();
-                self.partial_part_indices.clear();
-                self.latest_text_part_index = None;
+                self.chat.clear_partial_stream();
                 self.active_submission = None;
                 self.dispatch_next_queued_submission();
             }
@@ -1999,7 +1782,7 @@ impl AppState {
                     CreateSessionPurpose::NewChat => {
                         self.prompt_bar.clear();
                         self.draft = None;
-                        self.messages.clear();
+                        self.chat.clear_messages();
                         self.active_modal = None;
                         self.active_mode = AppMode::Chat;
                     }
@@ -2031,7 +1814,7 @@ impl AppState {
             Ok((session, messages)) => {
                 self.active_session = Some(session);
                 self.active_mode = AppMode::Chat;
-                self.messages = messages;
+                self.chat.replace_messages(messages);
                 self.clear_active_modal();
                 self.open_next_blocking_modal_if_idle();
             }
@@ -2248,128 +2031,6 @@ impl AppState {
         }
     }
 
-    fn merge_stream_part(&mut self, part: ocpncord_backend::Part) -> Option<usize> {
-        if self.is_echoed_user_text(&part) {
-            return None;
-        }
-
-        if let Some(index) = self
-            .partial_parts
-            .iter()
-            .rposition(|existing| parts_equivalent(existing, &part))
-        {
-            if stream_text_kind(&part).is_some() {
-                self.latest_text_part_index = Some(index);
-            }
-            return Some(index);
-        }
-
-        if let Some(kind) = stream_text_kind(&part) {
-            let incoming_text = match &part {
-                ocpncord_backend::Part::Text(text) => text.text.clone(),
-                ocpncord_backend::Part::Reasoning(reasoning) => reasoning.text.clone(),
-                _ => String::new(),
-            };
-
-            if let Some(index) = self
-                .partial_parts
-                .iter()
-                .rposition(|existing| stream_text_kind(existing) == Some(kind))
-            {
-                if incoming_text.is_empty() {
-                    self.latest_text_part_index = Some(index);
-                    return Some(index);
-                }
-                set_stream_text(&mut self.partial_parts[index], incoming_text, kind);
-                self.latest_text_part_index = Some(index);
-                return Some(index);
-            }
-        }
-
-        self.partial_parts.push(part);
-        let index = self.partial_parts.len() - 1;
-        if stream_text_kind(&self.partial_parts[index]).is_some() {
-            self.latest_text_part_index = Some(index);
-        }
-        Some(index)
-    }
-
-    fn merge_stream_delta(&mut self, part_id: String, delta: String) {
-        let text = {
-            let acc = self.partial_texts.entry(part_id.clone()).or_default();
-            acc.push_str(&delta);
-            acc.clone()
-        };
-
-        let index = self
-            .partial_part_indices
-            .get(&part_id)
-            .copied()
-            .filter(|index| *index < self.partial_parts.len())
-            .or(self.latest_text_part_index)
-            .filter(|index| *index < self.partial_parts.len());
-
-        let (index, kind) = match index {
-            Some(index) => {
-                let kind =
-                    stream_text_kind(&self.partial_parts[index]).unwrap_or(StreamTextKind::Text);
-                (index, kind)
-            }
-            None => {
-                self.partial_parts
-                    .push(ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
-                        text: String::new(),
-                    }));
-                (self.partial_parts.len() - 1, StreamTextKind::Text)
-            }
-        };
-
-        set_stream_text(&mut self.partial_parts[index], text, kind);
-        self.partial_part_indices.insert(part_id, index);
-        self.latest_text_part_index = Some(index);
-    }
-
-    fn remove_stream_part(&mut self, part_id: &str) {
-        self.partial_texts.remove(part_id);
-        let Some(index) = self.partial_part_indices.remove(part_id) else {
-            return;
-        };
-        if index >= self.partial_parts.len() {
-            return;
-        }
-
-        self.partial_parts.remove(index);
-        for value in self.partial_part_indices.values_mut() {
-            if *value > index {
-                *value -= 1;
-            }
-        }
-        self.latest_text_part_index = self.latest_text_part_index.and_then(|latest| {
-            if latest == index {
-                None
-            } else if latest > index {
-                Some(latest - 1)
-            } else {
-                Some(latest)
-            }
-        });
-    }
-
-    fn is_echoed_user_text(&self, part: &ocpncord_backend::Part) -> bool {
-        let ocpncord_backend::Part::Text(incoming) = part else {
-            return false;
-        };
-
-        self.messages.last().is_some_and(|message| {
-            matches!(message.role, ocpncord_backend::MessageRole::User)
-                && message.parts.len() == 1
-                && matches!(
-                    &message.parts[0],
-                    ocpncord_backend::Part::Text(existing) if existing.text == incoming.text
-                )
-        })
-    }
-
     fn render_start_page_logo(&self, frame: &mut ratatui::Frame, area: Rect) {
         let logo_height = START_PAGE_LOGO.lines().count() as u16;
         let tip_height = 1u16;
@@ -2459,9 +2120,9 @@ impl AppState {
                     &self.theme,
                     rows[0],
                     ChatTranscript {
-                        messages: &self.messages,
-                        active_parts: &self.partial_parts,
-                        queued_messages: &self.queued_messages,
+                        messages: self.chat.messages(),
+                        active_parts: self.chat.partial_parts(),
+                        queued_messages: self.chat.queued_messages(),
                         is_streaming: self.is_streaming,
                     },
                     self.chat_scroll,
@@ -2748,20 +2409,6 @@ enum DriverEvent {
 }
 
 type BackendOpFuture<'a, B> = Pin<Box<dyn Future<Output = BackendOpResult<B>> + 'a>>;
-
-fn loaded_messages_from_details(
-    details: Vec<ocpncord_backend::MessageDetail>,
-) -> Vec<LoadedMessage> {
-    details
-        .into_iter()
-        .map(|detail| LoadedMessage {
-            id: Some(detail.info.id),
-            session_id: Some(detail.info.session_id),
-            role: detail.info.role,
-            parts: detail.parts,
-        })
-        .collect()
-}
 
 #[cfg(test)]
 fn backend_op_future<'a, B: Backend>(backend: &'a mut B, op: BackendOp) -> BackendOpFuture<'a, B> {
@@ -3348,13 +2995,34 @@ mod tests {
                     created: 0,
                     completed: Some(1),
                 },
+                error: None,
                 parent_id: None,
                 model_id: "mock/model".into(),
                 provider_id: "mock".into(),
                 mode: "default".into(),
                 agent: "build".into(),
+                path: None,
+                summary: None,
                 cost: 0.0,
+                tokens: None,
+                structured: None,
+                variant: None,
+                finish: None,
             }),
+        }
+    }
+
+    fn message_part_updated(
+        session_id: &str,
+        message_id: &str,
+        part_id: &str,
+        part: ocpncord_backend::Part,
+    ) -> BackendEvent {
+        BackendEvent::MessagePartUpdated {
+            session_id: session_id.into(),
+            message_id: message_id.into(),
+            part_id: part_id.into(),
+            part,
         }
     }
 
@@ -3786,12 +3454,15 @@ mod tests {
     fn run_keeps_platform_events_responsive_while_live_stream_is_active() {
         let mut backend = MockBackend::default();
         backend.live_event_stream_pending_polls = 2;
-        backend.live_events = vec![live_event(ocpncord_backend::BackendEvent::Part {
-            part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+        backend.live_events = vec![live_event(message_part_updated(
+            "mock-session-id",
+            "msg-assistant-1",
+            "prt-assistant-1",
+            ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                identity: Default::default(),
                 text: "assistant".into(),
             }),
-            delta: None,
-        })];
+        ))];
         let events =
             futures::stream::iter(vec![char_key('h'), enter_key(), char_key('n'), Event::Quit]);
         let mut app = new_app_with_events(backend, events);
@@ -3833,12 +3504,15 @@ mod tests {
     fn send_message_starts_stream_and_accumulates_parts() {
         let mut backend = MockBackend::default();
         backend.live_events = vec![
-            live_event(ocpncord_backend::BackendEvent::Part {
-                part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+            live_event(message_part_updated(
+                "mock-session-id",
+                "msg-assistant-1",
+                "prt-assistant-1",
+                ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                    identity: Default::default(),
                     text: "Hello".into(),
                 }),
-                delta: None,
-            }),
+            )),
             live_event(assistant_message_updated(
                 "mock-session-id",
                 "msg-assistant-1",
@@ -3886,12 +3560,15 @@ mod tests {
         let batch = ocpncord_backend::SyncHistoryBatch {
             envelopes: vec![
                 sync_envelope(
-                    ocpncord_backend::BackendEvent::MessagePartUpdated {
-                        session_id: "mock-session-id".into(),
-                        part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                    message_part_updated(
+                        "mock-session-id",
+                        "msg-assistant-1",
+                        "prt-assistant-1",
+                        ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                            identity: Default::default(),
                             text: "from catch-up".into(),
                         }),
-                    },
+                    ),
                     "mock-session-id",
                     1,
                 ),
@@ -3919,11 +3596,12 @@ mod tests {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
         app.state.active_session = Some(make_session("mock-session-id", "Mock"));
-        app.state.messages.push(LoadedMessage {
+        app.state.chat.push_message(LoadedMessage {
             id: Some("msg-1".into()),
             session_id: Some("mock-session-id".into()),
             role: ocpncord_backend::MessageRole::Assistant,
             parts: vec![ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                identity: Default::default(),
                 text: "remove me".into(),
             })],
         });
@@ -4130,12 +3808,15 @@ mod tests {
 
         run(
             &mut app,
-            Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
-                session_id: "mock-session-id".into(),
-                part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+            Event::Backend(message_part_updated(
+                "mock-session-id",
+                "msg-assistant-1",
+                "prt-assistant-1",
+                ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                    identity: Default::default(),
                     text: "assistant one".into(),
                 }),
-            }),
+            )),
         );
 
         for ch in "second".chars() {
@@ -4277,12 +3958,15 @@ mod tests {
         // Simulate SSE: MessagePartUpdated with a text part
         run(
             &mut app,
-            Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
-                session_id: "mock-session-id".into(),
-                part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+            Event::Backend(message_part_updated(
+                "mock-session-id",
+                "msg-assistant-1",
+                "prt-assistant-1",
+                ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                    identity: Default::default(),
                     text: "Hello from assistant".into(),
                 }),
-            }),
+            )),
         );
         assert_eq!(
             app.state.partial_parts().len(),
@@ -4323,15 +4007,18 @@ mod tests {
 
         let session_id = "mock-session-id".to_string();
         let user_echo = ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+            identity: Default::default(),
             text: "hello from regression test".into(),
         });
         for _ in 0..2 {
             run(
                 &mut app,
-                Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
-                    session_id: session_id.clone(),
-                    part: user_echo.clone(),
-                }),
+                Event::Backend(message_part_updated(
+                    session_id.as_str(),
+                    "msg-user-echo",
+                    "prt-user-echo",
+                    user_echo.clone(),
+                )),
             );
         }
         assert!(
@@ -4340,16 +4027,19 @@ mod tests {
         );
 
         let step_start = ocpncord_backend::Part::StepStart(ocpncord_backend::StepStartPart {
+            identity: Default::default(),
             snapshot: None,
             session_id: Some(session_id.clone()),
         });
         for _ in 0..2 {
             run(
                 &mut app,
-                Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
-                    session_id: session_id.clone(),
-                    part: step_start.clone(),
-                }),
+                Event::Backend(message_part_updated(
+                    session_id.as_str(),
+                    "msg-step-start",
+                    "prt-step-start",
+                    step_start.clone(),
+                )),
             );
         }
 
@@ -4367,19 +4057,23 @@ mod tests {
         }
 
         let final_text = ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+            identity: Default::default(),
             text: "Hello! 👋 How can I help you today?".into(),
         });
         for _ in 0..2 {
             run(
                 &mut app,
-                Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
-                    session_id: session_id.clone(),
-                    part: final_text.clone(),
-                }),
+                Event::Backend(message_part_updated(
+                    session_id.as_str(),
+                    "msg1",
+                    "prt1",
+                    final_text.clone(),
+                )),
             );
         }
 
         let tool = ocpncord_backend::Part::Tool(ocpncord_backend::ToolPart {
+            identity: Default::default(),
             tool: "bash".into(),
             state: ocpncord_backend::ToolState::Pending {
                 input: Default::default(),
@@ -4389,10 +4083,12 @@ mod tests {
         for _ in 0..2 {
             run(
                 &mut app,
-                Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
-                    session_id: session_id.clone(),
-                    part: tool.clone(),
-                }),
+                Event::Backend(message_part_updated(
+                    session_id.as_str(),
+                    "msg-tool-1",
+                    "prt-tool-1",
+                    tool.clone(),
+                )),
             );
         }
 
@@ -4513,12 +4209,15 @@ mod tests {
 
         run(
             &mut app,
-            Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
-                session_id: "mock-session-id".into(),
-                part: ocpncord_backend::Part::Reasoning(ocpncord_backend::ReasoningPart {
+            Event::Backend(message_part_updated(
+                "mock-session-id",
+                "msg1",
+                "prt_reasoning",
+                ocpncord_backend::Part::Reasoning(ocpncord_backend::ReasoningPart {
+                    identity: Default::default(),
                     text: String::new(),
                 }),
-            }),
+            )),
         );
         run(
             &mut app,
@@ -4540,14 +4239,17 @@ mod tests {
         }
 
         let final_reasoning = ocpncord_backend::Part::Reasoning(ocpncord_backend::ReasoningPart {
+            identity: Default::default(),
             text: "thinking done".into(),
         });
         run(
             &mut app,
-            Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
-                session_id: "mock-session-id".into(),
-                part: final_reasoning,
-            }),
+            Event::Backend(message_part_updated(
+                "mock-session-id",
+                "msg1",
+                "prt_reasoning",
+                final_reasoning,
+            )),
         );
 
         assert_eq!(
@@ -4574,12 +4276,15 @@ mod tests {
 
         run(
             &mut app,
-            Event::Backend(ocpncord_backend::BackendEvent::MessagePartUpdated {
-                session_id: "ses1".into(),
-                part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+            Event::Backend(message_part_updated(
+                "ses1",
+                "msg-stale",
+                "prt-stale",
+                ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                    identity: Default::default(),
                     text: "Stale event".into(),
                 }),
-            }),
+            )),
         );
         assert_eq!(
             app.state.partial_parts().len(),
@@ -4689,16 +4394,23 @@ mod tests {
             title: title.into(),
             project_id: "p1".into(),
             directory: "/".into(),
+            path: None,
             parent_id: None,
             time: ocpncord_backend::SessionTime {
                 created: 0,
                 updated: 0,
+                compacting: None,
+                archived: None,
             },
             slug: String::new(),
             version: String::new(),
             workspace_id: None,
             summary: None,
+            cost: None,
+            tokens: None,
             share: None,
+            agent: None,
+            model: None,
             permission: None,
             revert: None,
         }
@@ -5708,12 +5420,15 @@ mod tests {
     fn ctrl_c_during_streaming_interrupts_not_quits() {
         let mut backend = MockBackend::default();
         backend.live_events = vec![
-            live_event(ocpncord_backend::BackendEvent::Part {
-                part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+            live_event(message_part_updated(
+                "mock-session-id",
+                "msg-assistant-1",
+                "prt-assistant-1",
+                ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                    identity: Default::default(),
                     text: "streaming".into(),
                 }),
-                delta: None,
-            }),
+            )),
             live_event(assistant_message_updated(
                 "mock-session-id",
                 "msg-assistant-1",

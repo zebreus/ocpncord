@@ -77,8 +77,21 @@ impl Default for MockBackend {
     }
 }
 
-fn default_submission_receipt(session_id: &SessionId) -> SubmissionReceipt {
-    SubmissionReceipt {
+fn default_prompt_submission_receipt(
+    session_id: &SessionId,
+    agent: Option<&str>,
+) -> SubmissionReceipt {
+    SubmissionReceipt::Accepted {
+        session_id: session_id.clone(),
+        agent: agent.map(|value| value.into()),
+    }
+}
+
+fn default_command_submission_receipt(
+    session_id: &SessionId,
+    agent: Option<&str>,
+) -> SubmissionReceipt {
+    SubmissionReceipt::Created(CreatedSubmissionReceipt {
         info: AssistantMessage {
             id: "mock-message-id".into(),
             session_id: session_id.clone(),
@@ -87,15 +100,22 @@ fn default_submission_receipt(session_id: &SessionId) -> SubmissionReceipt {
                 created: 0,
                 completed: None,
             },
+            error: None,
             parent_id: None,
             model_id: "mock/model".into(),
             provider_id: "mock".into(),
             mode: "default".into(),
-            agent: "mock-agent".into(),
+            agent: agent.unwrap_or("mock-agent").into(),
+            path: None,
+            summary: None,
             cost: 0.0,
+            tokens: None,
+            structured: None,
+            variant: None,
+            finish: None,
         },
         parts: Vec::new(),
-    }
+    })
 }
 
 impl Backend for MockBackend {
@@ -131,16 +151,23 @@ impl Backend for MockBackend {
             title: title.into(),
             project_id: "mock-project".into(),
             directory: session_directory.into(),
+            path: None,
             parent_id: None,
             time: SessionTime {
                 created: 0,
                 updated: 0,
+                compacting: None,
+                archived: None,
             },
             slug: String::new(),
             version: String::new(),
             workspace_id: None,
             summary: None,
+            cost: None,
+            tokens: None,
             share: None,
+            agent: None,
+            model: None,
             permission: None,
             revert: None,
         };
@@ -158,16 +185,23 @@ impl Backend for MockBackend {
             title: title.into(),
             project_id: "mock-project".into(),
             directory: "/mock".into(),
+            path: None,
             parent_id: None,
             time: SessionTime {
                 created: 0,
                 updated: 0,
+                compacting: None,
+                archived: None,
             },
             slug: String::new(),
             version: String::new(),
             workspace_id: None,
             summary: None,
+            cost: None,
+            tokens: None,
             share: None,
+            agent: None,
+            model: None,
             permission: None,
             revert: None,
         })
@@ -210,7 +244,7 @@ impl Backend for MockBackend {
         Ok(self
             .prompt_receipt
             .clone()
-            .unwrap_or_else(|| default_submission_receipt(id)))
+            .unwrap_or_else(|| default_prompt_submission_receipt(id, agent)))
     }
 
     async fn submit_command(
@@ -227,7 +261,7 @@ impl Backend for MockBackend {
         Ok(self
             .command_receipt
             .clone()
-            .unwrap_or_else(|| default_submission_receipt(id)))
+            .unwrap_or_else(|| default_command_submission_receipt(id, agent)))
     }
 
     async fn reply_permission(&mut self, reply: &PermissionReply) -> Result<()> {

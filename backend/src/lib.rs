@@ -19,10 +19,6 @@ pub mod mock;
 
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
-    Part {
-        part: Part,
-        delta: Option<String>,
-    },
     Error {
         message: String,
     },
@@ -59,6 +55,8 @@ pub enum BackendEvent {
     },
     MessagePartUpdated {
         session_id: SessionId,
+        message_id: MessageId,
+        part_id: String,
         part: Part,
     },
     MessagePartDelta {
@@ -206,7 +204,6 @@ impl fmt::Display for BackendError {
 impl fmt::Display for BackendEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Part { part, .. } => write!(f, "part: {part:?}"),
             Self::Error { message } => write!(f, "error: {message}"),
             Self::SessionCreated { session } => write!(f, "session.created: {}", session.id),
             Self::SessionDeleted { session_id } => write!(f, "session.deleted: {session_id}"),
@@ -222,8 +219,16 @@ impl fmt::Display for BackendEvent {
                 session_id,
                 message_id,
             } => write!(f, "message.removed: {session_id}/{message_id}"),
-            Self::MessagePartUpdated { session_id, .. } => {
-                write!(f, "message.part.updated: {session_id}")
+            Self::MessagePartUpdated {
+                session_id,
+                message_id,
+                part_id,
+                ..
+            } => {
+                write!(
+                    f,
+                    "message.part.updated: {session_id}/{message_id}/{part_id}"
+                )
             }
             Self::MessagePartDelta {
                 session_id,

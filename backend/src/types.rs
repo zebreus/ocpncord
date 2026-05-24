@@ -2,6 +2,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 // --- Identifiers ---
 
@@ -24,6 +25,38 @@ pub struct Health {
 pub struct SessionTime {
     pub created: u64,
     pub updated: u64,
+    #[serde(default)]
+    pub compacting: Option<u64>,
+    #[serde(default)]
+    pub archived: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageCache {
+    pub read: f64,
+    pub write: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    #[serde(default)]
+    pub total: Option<f64>,
+    pub input: f64,
+    pub output: f64,
+    pub reasoning: f64,
+    pub cache: TokenUsageCache,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModel {
+    pub id: String,
+    #[serde(rename = "providerID")]
+    pub provider_id: String,
+    #[serde(default)]
+    pub variant: Option<String>,
 }
 
 // --- Sessions ---
@@ -36,6 +69,8 @@ pub struct Session {
     #[serde(rename = "projectID")]
     pub project_id: String,
     pub directory: String,
+    #[serde(default)]
+    pub path: Option<String>,
     #[serde(rename = "parentID")]
     pub parent_id: Option<SessionId>,
     pub time: SessionTime,
@@ -46,7 +81,15 @@ pub struct Session {
     #[serde(default)]
     pub summary: Option<SessionSummary>,
     #[serde(default)]
+    pub cost: Option<f64>,
+    #[serde(default)]
+    pub tokens: Option<TokenUsage>,
+    #[serde(default)]
     pub share: Option<SessionShare>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<SessionModel>,
     #[serde(default)]
     pub permission: Option<PermissionRuleset>,
     #[serde(default)]
@@ -91,6 +134,33 @@ pub struct MessageTime {
     pub completed: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputFormatJsonSchema {
+    pub schema: JsonValue,
+    #[serde(default)]
+    pub retry_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OutputFormat {
+    Text,
+    #[serde(rename = "json_schema")]
+    JsonSchema(OutputFormatJsonSchema),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserMessageSummary {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub diffs: Vec<SnapshotFileDiff>,
+}
+
 // --- Messages ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,21 +191,36 @@ pub enum MessageRole {
 
 // --- Parts ---
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "messageID", default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<MessageId>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextPart {
+    #[serde(flatten)]
+    pub identity: PartIdentity,
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReasoningPart {
+    #[serde(flatten)]
+    pub identity: PartIdentity,
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolPart {
+    #[serde(flatten)]
+    pub identity: PartIdentity,
     pub tool: String,
     pub state: ToolState,
 }
@@ -190,6 +275,8 @@ pub struct ToolTimeCompleted {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StepStartPart {
+    #[serde(flatten)]
+    pub identity: PartIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<String>,
     #[serde(rename = "sessionID", default, skip_serializing_if = "Option::is_none")]
@@ -199,6 +286,8 @@ pub struct StepStartPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StepFinishPart {
+    #[serde(flatten)]
+    pub identity: PartIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,6 +299,8 @@ pub struct StepFinishPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilePart {
+    #[serde(flatten)]
+    pub identity: PartIdentity,
     pub mime: String,
     pub url: String,
     #[serde(default)]
@@ -219,12 +310,16 @@ pub struct FilePart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotPart {
+    #[serde(flatten)]
+    pub identity: PartIdentity,
     pub snapshot: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchPart {
+    #[serde(flatten)]
+    pub identity: PartIdentity,
     pub hash: String,
     pub files: Vec<String>,
 }
@@ -232,12 +327,16 @@ pub struct PatchPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentPart {
+    #[serde(flatten)]
+    pub identity: PartIdentity,
     pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubtaskPart {
+    #[serde(flatten)]
+    pub identity: PartIdentity,
     pub prompt: String,
     pub description: String,
     pub agent: String,
@@ -246,12 +345,16 @@ pub struct SubtaskPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetryPart {
+    #[serde(flatten)]
+    pub identity: PartIdentity,
     pub attempt: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionPart {
+    #[serde(flatten)]
+    pub identity: PartIdentity,
     pub auto: bool,
     #[serde(default)]
     pub overflow: Option<bool>,
@@ -274,6 +377,33 @@ pub enum Part {
     Subtask(SubtaskPart),
     Retry(RetryPart),
     Compaction(CompactionPart),
+}
+
+impl Part {
+    pub fn identity(&self) -> &PartIdentity {
+        match self {
+            Self::Text(part) => &part.identity,
+            Self::Reasoning(part) => &part.identity,
+            Self::Tool(part) => &part.identity,
+            Self::StepStart(part) => &part.identity,
+            Self::StepFinish(part) => &part.identity,
+            Self::File(part) => &part.identity,
+            Self::Snapshot(part) => &part.identity,
+            Self::Patch(part) => &part.identity,
+            Self::Agent(part) => &part.identity,
+            Self::Subtask(part) => &part.identity,
+            Self::Retry(part) => &part.identity,
+            Self::Compaction(part) => &part.identity,
+        }
+    }
+
+    pub fn id(&self) -> Option<&str> {
+        self.identity().id.as_deref()
+    }
+
+    pub fn message_id(&self) -> Option<&str> {
+        self.identity().message_id.as_deref()
+    }
 }
 
 // --- Agents ---
@@ -433,8 +563,16 @@ pub struct UserMessage {
     pub session_id: SessionId,
     pub role: MessageRole,
     pub time: MessageTime,
+    #[serde(default)]
+    pub format: Option<OutputFormat>,
+    #[serde(default)]
+    pub summary: Option<UserMessageSummary>,
     pub agent: String,
     pub model: UserMessageModel,
+    #[serde(default)]
+    pub system: Option<String>,
+    #[serde(default)]
+    pub tools: Option<BTreeMap<String, bool>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,6 +594,8 @@ pub struct AssistantMessage {
     pub session_id: SessionId,
     pub role: MessageRole,
     pub time: MessageTime,
+    #[serde(default)]
+    pub error: Option<ServerError>,
     #[serde(rename = "parentID", default)]
     pub parent_id: Option<MessageId>,
     #[serde(rename = "modelID")]
@@ -464,14 +604,42 @@ pub struct AssistantMessage {
     pub provider_id: String,
     pub mode: String,
     pub agent: String,
+    #[serde(default)]
+    pub path: Option<MessagePath>,
+    #[serde(default)]
+    pub summary: Option<bool>,
     pub cost: f64,
+    #[serde(default)]
+    pub tokens: Option<TokenUsage>,
+    #[serde(default)]
+    pub structured: Option<JsonValue>,
+    #[serde(default)]
+    pub variant: Option<String>,
+    #[serde(default, alias = "finishReason")]
+    pub finish: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SubmissionReceipt {
+pub struct MessagePath {
+    pub cwd: String,
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedSubmissionReceipt {
     pub info: AssistantMessage,
     pub parts: Vec<Part>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SubmissionReceipt {
+    Accepted {
+        session_id: SessionId,
+        agent: Option<String>,
+    },
+    Created(CreatedSubmissionReceipt),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -778,7 +946,7 @@ pub type PermissionRuleset = Vec<PermissionRule>;
 #[serde(rename_all = "camelCase")]
 pub struct ServerError {
     pub name: String,
-    pub data: alloc::collections::BTreeMap<String, alloc::string::String>,
+    pub data: alloc::collections::BTreeMap<String, JsonValue>,
 }
 
 // --- GlobalEvent envelope ---
