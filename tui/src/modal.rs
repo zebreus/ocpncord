@@ -12,6 +12,12 @@ pub trait Modal {
     fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect);
     fn handle_event(&mut self, event: Event) -> Action;
     fn title(&self) -> &str;
+    fn as_model_picker(&self) -> Option<&ModelPickerModal> {
+        None
+    }
+    fn as_model_picker_mut(&mut self) -> Option<&mut ModelPickerModal> {
+        None
+    }
     fn preferred_size(&self, area: Rect) -> (u16, u16) {
         (
             ((area.width as u32 * 3) / 5).clamp(40, area.width as u32) as u16,
@@ -282,12 +288,7 @@ impl ModelPickerModal {
     }
 
     pub fn set_config(&mut self, config: Config) {
-        self.current_model = config.model.clone();
-        self.agent_model = config
-            .agent
-            .get("build")
-            .and_then(|agent| agent.model.clone())
-            .or_else(|| config.agent.values().find_map(|agent| agent.model.clone()));
+        self.update_current_from_config(&config);
 
         let mut models = Vec::new();
         for (provider_id, provider) in config.provider {
@@ -328,12 +329,7 @@ impl ModelPickerModal {
     }
 
     pub fn set_models_from_config(&mut self, config: Config, models: &[ModelSummary]) {
-        self.current_model = config.model.clone();
-        self.agent_model = config
-            .agent
-            .get("build")
-            .and_then(|agent| agent.model.clone())
-            .or_else(|| config.agent.values().find_map(|agent| agent.model.clone()));
+        self.update_current_from_config(&config);
 
         let mut choices: Vec<ModelChoice> = models
             .iter()
@@ -404,6 +400,17 @@ impl ModelPickerModal {
         }
         self.set_models(choices);
     }
+
+    pub fn update_current_from_config(&mut self, config: &Config) {
+        self.current_model = config.model.clone();
+        self.agent_model = config
+            .agent
+            .get("build")
+            .and_then(|agent| agent.model.clone())
+            .or_else(|| config.agent.values().find_map(|agent| agent.model.clone()));
+        self.error = None;
+    }
+
     fn set_models(&mut self, mut models: Vec<ModelChoice>) {
         let mut unique = BTreeMap::new();
         for model in models.drain(..) {
@@ -692,6 +699,14 @@ impl Modal for ModelPickerModal {
 
     fn title(&self) -> &str {
         "Model Picker"
+    }
+
+    fn as_model_picker(&self) -> Option<&ModelPickerModal> {
+        Some(self)
+    }
+
+    fn as_model_picker_mut(&mut self) -> Option<&mut ModelPickerModal> {
+        Some(self)
     }
 }
 

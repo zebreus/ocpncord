@@ -203,6 +203,27 @@ fn parse_submission_receipt(body: &[u8]) -> Result<SubmissionReceipt> {
     serde_json::from_slice(body).map_err(parse_err)
 }
 
+fn accepted_submission_receipt(session_id: &SessionId, agent: Option<&str>) -> SubmissionReceipt {
+    SubmissionReceipt {
+        info: AssistantMessage {
+            id: "pending".into(),
+            session_id: session_id.clone(),
+            role: MessageRole::Assistant,
+            time: MessageTime {
+                created: 0,
+                completed: None,
+            },
+            parent_id: None,
+            model_id: "pending".into(),
+            provider_id: "pending".into(),
+            mode: "primary".into(),
+            agent: agent.unwrap_or("build").into(),
+            cost: 0.0,
+        },
+        parts: Vec::new(),
+    }
+}
+
 fn parse_sync_history(body: &[u8], scope: &EventScope) -> Result<SyncHistoryBatch> {
     let records: Vec<serde_json::Value> = serde_json::from_slice(body).map_err(parse_err)?;
     let mut batch = SyncHistoryBatch::default();
@@ -423,7 +444,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         text: &str,
         agent: Option<&str>,
     ) -> Result<SubmissionReceipt> {
-        let url = alloc::format!("{}/session/{id}/message", self.base_url);
+        let url = alloc::format!("{}/session/{id}/prompt_async", self.base_url);
         let prompt_body = ocpncord_backend::PromptBody {
             parts: &[ocpncord_backend::TextPartBody {
                 type_: "text",
@@ -432,10 +453,9 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             agent,
         };
         let json = serde_json::to_string(&prompt_body).map_err(parse_err)?;
-        let body = self
-            .send_get_body(Method::POST, &url, Some(json.as_bytes()))
+        self.send_get_body(Method::POST, &url, Some(json.as_bytes()))
             .await?;
-        parse_submission_receipt(&body)
+        Ok(accepted_submission_receipt(id, agent))
     }
 
     async fn submit_command(
@@ -1154,9 +1174,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_prompt_returns_created_message_receipt() {
-        let response_body = r#"{"info":{"id":"msg_1","sessionID":"ses_1","role":"assistant","time":{"created":1},"parentID":"msg_0","modelID":"model-1","providerID":"provider-1","mode":"build","agent":"builder","cost":0.0},"parts":[]}"#;
-        let (base_url, request_rx) = spawn_capture_server(response_body).await;
+    async fn submit_prompt_uses_async_route_and_returns_accepted_receipt() {
+        let (base_url, request_rx) = spawn_capture_server("").await;
         let mut backend = backend(&base_url);
 
         let receipt = backend
@@ -1164,13 +1183,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(receipt.info.id, "msg_1");
+        assert_eq!(receipt.info.id, "pending");
         assert_eq!(receipt.info.session_id, "ses_1");
         assert_eq!(receipt.info.agent, "builder");
         assert!(receipt.parts.is_empty());
 
         let request = request_rx.await.unwrap();
-        assert!(request.contains("POST /session/ses_1/message HTTP/1.1"));
+        assert!(request.contains("POST /session/ses_1/prompt_async HTTP/1.1"));
         assert_eq!(
             request.split("\r\n\r\n").nth(1).unwrap_or(""),
             "{\"parts\":[{\"type\":\"text\",\"text\":\"hello world\"}],\"agent\":\"builder\"}"

@@ -1931,7 +1931,6 @@ impl AppState {
                 });
             }
             Some(Action::SelectModel(ref model)) => {
-                self.set_active_modal(Box::new(ModelPickerModal::new()));
                 self.queue_op(BackendOp::SelectModel {
                     model: model.clone(),
                 });
@@ -2076,22 +2075,46 @@ impl AppState {
         requested: String,
         result: ocpncord_backend::Result<ocpncord_backend::Config>,
     ) {
-        let mut modal = ModelPickerModal::new();
         match result {
             Ok(updated) => {
                 let mut display_config = updated;
                 if display_config.model.is_none() {
                     display_config.model = Some(requested);
                 }
+
+                if let Some(modal) = self
+                    .active_modal
+                    .as_deref_mut()
+                    .and_then(|modal| modal.as_model_picker_mut())
+                {
+                    modal.update_current_from_config(&display_config);
+                    return;
+                }
+
+                let mut modal = ModelPickerModal::new();
                 if let Some(models) = self.model_cache.as_ref() {
                     modal.set_models_from_config(display_config, models);
                 } else {
                     modal.set_config(display_config);
                 }
+                self.set_active_modal(Box::new(modal));
             }
-            Err(e) => modal.set_error(alloc::format!("{}", e)),
+            Err(e) => {
+                let error = alloc::format!("{}", e);
+                if let Some(modal) = self
+                    .active_modal
+                    .as_deref_mut()
+                    .and_then(|modal| modal.as_model_picker_mut())
+                {
+                    modal.set_error(error);
+                    return;
+                }
+
+                let mut modal = ModelPickerModal::new();
+                modal.set_error(error);
+                self.set_active_modal(Box::new(modal));
+            }
         }
-        self.set_active_modal(Box::new(modal));
     }
 
     fn handle_permission_reply_result(
@@ -2819,7 +2842,11 @@ async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> Backe
                 let config = backend.get_config().await?;
                 let models = match cached_models {
                     Some(models) => Some(models),
-                    None => backend.list_models().await.ok(),
+                    None => match backend.list_models().await {
+                        Ok(models) => Some(models),
+                        Err(_) if !config.provider.is_empty() => None,
+                        Err(error) => return Err(error),
+                    },
                 };
                 Ok((config, models))
             }
@@ -5013,6 +5040,30 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_reports_model_catalog_errors() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('m'));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(
+            screen.contains("no model catalog stub"),
+            "model catalog errors should be visible. Screen: {}",
+            screen
+        );
+        assert!(
+            !screen.contains("No models found in server config"),
+            "model catalog errors should not be hidden behind the empty state. Screen: {}",
+            screen
+        );
+    }
+
+    #[test]
     fn select_model_updates_backend_config() {
         let mut backend = MockBackend::default();
         backend.config_info = Some(ocpncord_backend::Config {
@@ -5052,6 +5103,83 @@ mod tests {
                 .as_ref()
                 .and_then(|cfg| cfg.model.as_deref()),
             Some("openrouter/new")
+        );
+    }
+
+    #[test]
+    fn selecting_model_keeps_populated_picker_while_request_is_pending() {
+        let mut backend = MockBackend::default();
+        backend.models = Some(vec![ocpncord_backend::ModelSummary {
+            id: "claude-sonnet".into(),
+            provider_id: "anthropic".into(),
+            name: Some("Claude Sonnet".into()),
+            ..Default::default()
+        }]);
+        let mut app = new_app(backend);
+
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('m'));
+
+        let running = app.state.handle_event(enter_key());
+        assert!(running);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(
+            screen.contains("Claude Sonnet"),
+            "pending selection should leave the populated picker mounted. Screen: {screen}"
+        );
+        assert!(
+            !screen.contains("No models found in server config"),
+            "pending selection should not flash an empty picker. Screen: {screen}"
+        );
+    }
+
+    #[test]
+    fn selecting_model_preserves_picker_search_after_config_update() {
+        let mut backend = MockBackend::default();
+        backend.models = Some(vec![
+            ocpncord_backend::ModelSummary {
+                id: "claude-sonnet".into(),
+                provider_id: "anthropic".into(),
+                name: Some("Claude Sonnet".into()),
+                ..Default::default()
+            },
+            ocpncord_backend::ModelSummary {
+                id: "qwen3.6".into(),
+                provider_id: "qwen".into(),
+                name: Some("Qwen3.6".into()),
+                ..Default::default()
+            },
+        ]);
+        let mut app = new_app(backend);
+
+        run(&mut app, ctrl('x'));
+        run(&mut app, char_key('m'));
+        for ch in ['q', 'w', 'e', 'n'] {
+            run(&mut app, char_key(ch));
+        }
+
+        app.state.handle_event(enter_key());
+        futures::executor::block_on(app.drain_backend_ops_for_test());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(
+            screen.contains("Search: qwen"),
+            "selection should preserve the picker search instead of rebuilding it. Screen: {screen}"
+        );
+        assert!(
+            screen.contains("* Qwen3.6"),
+            "selection should update the current marker in the existing filtered list. Screen: {screen}"
+        );
+        assert!(
+            !screen.contains("Claude Sonnet"),
+            "selection should not reset the filtered list. Screen: {screen}"
         );
     }
 
