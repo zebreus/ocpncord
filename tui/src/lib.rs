@@ -14,7 +14,6 @@ mod command_palette;
 mod event;
 mod key_chord;
 mod modal;
-mod part_renderer;
 mod prompt_bar;
 mod theme;
 
