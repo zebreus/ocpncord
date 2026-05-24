@@ -15,12 +15,14 @@ use ocpncord_backend::*;
 use reqwless::client::HttpClient;
 use reqwless::headers::ContentType;
 use reqwless::request::{Method, RequestBuilder};
+use reqwless::response::Response;
 use serde::Deserialize;
 
 mod stream;
 pub use stream::{BufferedStream, SseParser};
 
-const RX_BUF_SIZE: usize = 32 * 1024;
+const HTTP_HEADER_BUF_SIZE: usize = 4 * 1024;
+const HTTP_BODY_READ_BUF_SIZE: usize = 4 * 1024;
 const SSE_READ_BUF_SIZE: usize = 4 * 1024;
 const SSE_HEADERS: [(&str, &str); 1] = [("Accept", "text/event-stream")];
 
@@ -33,7 +35,7 @@ pub struct OpenCodeBackend<
     D: embedded_nal_async::Dns + 'static,
 > {
     base_url: String,
-    rx_buf: Vec<u8>,
+    header_buf: Vec<u8>,
     transport: &'static T,
     dns: &'static D,
 }
@@ -44,7 +46,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
     pub fn new(base_url: &str, transport: &'static T, dns: &'static D) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_owned(),
-            rx_buf: vec![0; RX_BUF_SIZE],
+            header_buf: vec![0; HTTP_HEADER_BUF_SIZE],
             transport,
             dns,
         }
@@ -79,6 +81,28 @@ fn api_err(status: u16, body: &[u8]) -> BackendError {
 
 fn should_fallback_to_api_models(error: &BackendError) -> bool {
     matches!(error, BackendError::Api { status: 404, .. })
+}
+
+async fn read_body_to_vec<C>(response: Response<'_, '_, C>) -> Result<Vec<u8>>
+where
+    C: Read,
+{
+    let content_length = response.content_length.unwrap_or(0);
+    let mut body = Vec::new();
+    body.try_reserve(content_length)
+        .map_err(|_| conn_err("response body too large"))?;
+
+    let mut reader = response.body().reader();
+    let mut chunk = alloc::vec![0u8; HTTP_BODY_READ_BUF_SIZE];
+    loop {
+        let read = reader.read(&mut chunk).await.map_err(conn_err)?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+
+    Ok(body)
 }
 
 fn encode_query_component(input: &str) -> String {
@@ -225,24 +249,22 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             let mut handle = handle
                 .body(bytes)
                 .content_type(ContentType::ApplicationJson);
-            let response = handle.send(&mut self.rx_buf).await.map_err(conn_err)?;
+            let response = handle.send(&mut self.header_buf).await.map_err(conn_err)?;
             if !response.status.is_successful() {
                 let status = response.status.0;
-                let b = response.body().read_to_end().await.map_err(conn_err)?;
-                return Err(api_err(status, b));
+                let b = read_body_to_vec(response).await?;
+                return Err(api_err(status, &b));
             }
-            let body = response.body().read_to_end().await.map_err(conn_err)?;
-            Ok(body.to_vec())
+            read_body_to_vec(response).await
         } else {
             let mut handle = client.request(method, url).await.map_err(conn_err)?;
-            let response = handle.send(&mut self.rx_buf).await.map_err(conn_err)?;
+            let response = handle.send(&mut self.header_buf).await.map_err(conn_err)?;
             if !response.status.is_successful() {
                 let status = response.status.0;
-                let b = response.body().read_to_end().await.map_err(conn_err)?;
-                return Err(api_err(status, b));
+                let b = read_body_to_vec(response).await?;
+                return Err(api_err(status, &b));
             }
-            let body = response.body().read_to_end().await.map_err(conn_err)?;
-            Ok(body.to_vec())
+            read_body_to_vec(response).await
         }
     }
 }
@@ -256,7 +278,7 @@ fn incremental_sse_stream<
     url: String,
 ) -> BufferedStream {
     BufferedStream::live(move |sink| async move {
-        let mut header_buf = alloc::vec![0u8; RX_BUF_SIZE];
+        let mut header_buf = alloc::vec![0u8; HTTP_HEADER_BUF_SIZE];
         let mut read_buf = alloc::vec![0u8; SSE_READ_BUF_SIZE];
         let mut parser = SseParser::new();
         let mut client = HttpClient::new(transport, dns);
@@ -281,8 +303,8 @@ fn incremental_sse_stream<
 
         if !response.status.is_successful() {
             let status = response.status.0;
-            match response.body().read_to_end().await {
-                Ok(body) => sink.push(Err(api_err(status, body))),
+            match read_body_to_vec(response).await {
+                Ok(body) => sink.push(Err(api_err(status, &body))),
                 Err(error) => sink.push(Err(conn_err(error))),
             }
             sink.finish();
@@ -1020,8 +1042,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_models_does_not_fallback_on_oversized_config_providers_response() {
-        let oversized_body = "x".repeat(RX_BUF_SIZE + 1);
+    async fn list_models_reads_config_providers_response_larger_than_header_buffer() {
+        let model_count = 160;
+        let mut large_body = String::from(r#"{"providers":[{"id":"opencode","models":{"#);
+        for index in 0..model_count {
+            if index > 0 {
+                large_body.push(',');
+            }
+            large_body.push_str(&alloc::format!(
+                r#""model-{index}":{{"id":"model-{index}","providerID":"opencode","name":"Model {index}","family":"large","status":"active"}}"#
+            ));
+        }
+        large_body.push_str(r#"}}]}"#);
+        assert!(large_body.len() > HTTP_HEADER_BUF_SIZE);
+
+        let (base_url, requests_rx) =
+            spawn_response_sequence_server(vec![http_response("HTTP/1.1 200 OK", &large_body)])
+                .await;
+        let mut backend = backend(&base_url);
+
+        let models = backend.list_models().await.unwrap();
+        let requests = requests_rx.await.unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("GET /config/providers HTTP/1.1"));
+        assert_eq!(models.len(), model_count);
+        assert_eq!(models[0].id, "model-0");
+        assert_eq!(models[0].provider_id, "opencode");
+        assert!(models.iter().any(|model| model.id == "model-159"));
+    }
+
+    #[tokio::test]
+    async fn list_models_does_not_fallback_on_malformed_config_providers_response() {
+        let malformed_body = "x".repeat(HTTP_HEADER_BUF_SIZE + 1);
         let fallback_body = r#"[
             {
                 "id": "should-not-be-requested",
@@ -1030,7 +1083,7 @@ mod tests {
             }
         ]"#;
         let (base_url, requests_rx) = spawn_response_sequence_server(vec![
-            http_response("HTTP/1.1 200 OK", &oversized_body),
+            http_response("HTTP/1.1 200 OK", &malformed_body),
             http_response("HTTP/1.1 200 OK", fallback_body),
         ])
         .await;
@@ -1041,7 +1094,7 @@ mod tests {
 
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("GET /config/providers HTTP/1.1"));
-        assert!(matches!(error, BackendError::Connection { .. }));
+        assert!(matches!(error, BackendError::Parse { .. }));
     }
 
     #[tokio::test]
