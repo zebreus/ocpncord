@@ -402,7 +402,7 @@ enum BackendOp {
     },
     CreateSession {
         title: String,
-        cwd: String,
+        session_directory: String,
         purpose: CreateSessionPurpose,
     },
     Submit {
@@ -529,8 +529,8 @@ pub struct AppState {
     lsp_diagnostics: alloc::collections::BTreeMap<String, Vec<LspDiagnostic>>,
     // Todo cache
     todos: Vec<ocpncord_backend::Todo>,
-    // Workspace state
-    current_workspace: Option<String>,
+    // Optional directory override for creating new sessions.
+    session_directory_override: Option<String>,
     current_branch: Option<String>,
 }
 
@@ -575,7 +575,7 @@ impl AppState {
             terminal_view_height: Cell::new(10),
             lsp_diagnostics: alloc::collections::BTreeMap::new(),
             todos: Vec::new(),
-            current_workspace: None,
+            session_directory_override: None,
             current_branch: None,
         }
     }
@@ -676,13 +676,24 @@ impl AppState {
         self.pending_ops.push_back(op);
     }
 
-    fn event_scope(&self) -> EventScope {
-        EventScope::instance(self.current_workspace.clone(), None)
+    fn active_session_scope(&self) -> EventScope {
+        let Some(session) = &self.active_session else {
+            return EventScope::default();
+        };
+
+        EventScope::instance(
+            Some(session.directory.clone()),
+            session.workspace_id.clone(),
+        )
+    }
+
+    fn create_session_directory(&self) -> String {
+        self.session_directory_override.clone().unwrap_or_default()
     }
 
     fn sync_history_request(&self) -> ocpncord_backend::SyncHistoryRequest {
         ocpncord_backend::SyncHistoryRequest {
-            scope: self.event_scope(),
+            scope: self.active_session_scope(),
             known_sequences: self.sync_known_sequences.clone(),
         }
     }
@@ -713,7 +724,7 @@ impl AppState {
     }
 
     fn envelope_matches_scope(&self, envelope: &EventEnvelope) -> bool {
-        let wanted = self.event_scope();
+        let wanted = self.active_session_scope();
         if let Some(directory) = wanted.directory.as_deref() {
             if let Some(event_directory) = envelope.scope.directory.as_deref() {
                 return event_directory == directory;
@@ -794,8 +805,8 @@ impl AppState {
         self.active_session.as_ref()
     }
 
-    pub fn set_cwd(&mut self, cwd: String) {
-        self.current_workspace = Some(cwd);
+    pub fn set_session_directory_override(&mut self, session_directory: String) {
+        self.session_directory_override = Some(session_directory);
     }
 
     pub fn prompt_text(&self) -> &str {
@@ -1482,9 +1493,7 @@ impl AppState {
                             duration: 6,
                         });
                     }
-                    ocpncord_backend::BackendEvent::WorkspaceReady { name } => {
-                        self.current_workspace = Some(name);
-                    }
+                    ocpncord_backend::BackendEvent::WorkspaceReady { .. } => {}
                     ocpncord_backend::BackendEvent::WorkspaceFailed { message } => {
                         self.error = Some(alloc::format!("Workspace error: {message}"));
                     }
@@ -1555,9 +1564,7 @@ impl AppState {
                             duration: 8,
                         });
                     }
-                    ocpncord_backend::BackendEvent::ProjectUpdated(project) => {
-                        self.current_workspace = project.name.or(self.current_workspace.clone());
-                    }
+                    ocpncord_backend::BackendEvent::ProjectUpdated(_) => {}
                     _ => {}
                 }
             }
@@ -1602,7 +1609,7 @@ impl AppState {
         } else {
             self.queue_op(BackendOp::CreateSession {
                 title: "Chat".into(),
-                cwd: self.current_workspace.clone().unwrap_or_default(),
+                session_directory: self.create_session_directory(),
                 purpose: CreateSessionPurpose::Send { text, mode, agent },
             });
         }
@@ -1640,7 +1647,7 @@ impl AppState {
                 self.clear_active_modal();
                 self.queue_op(BackendOp::CreateSession {
                     title: "Chat".into(),
-                    cwd: self.current_workspace.clone().unwrap_or_default(),
+                    session_directory: self.create_session_directory(),
                     purpose: CreateSessionPurpose::NewChat,
                 });
                 true
@@ -1741,7 +1748,7 @@ impl AppState {
         } else {
             self.queue_op(BackendOp::CreateSession {
                 title: "Chat".into(),
-                cwd: self.current_workspace.clone().unwrap_or_default(),
+                session_directory: self.create_session_directory(),
                 purpose: CreateSessionPurpose::Send {
                     text: text.into(),
                     mode: InputMode::Normal,
@@ -2760,11 +2767,11 @@ async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> Backe
         }
         BackendOp::CreateSession {
             title,
-            cwd,
+            session_directory,
             purpose,
         } => BackendOpResult::CreateSession {
             purpose,
-            result: backend.create_session(&title, &cwd).await,
+            result: backend.create_session(&title, &session_directory).await,
         },
         BackendOp::Submit { submission } => {
             let result = match submission.kind {
@@ -2924,8 +2931,8 @@ where
         &mut self.ratatui_terminal
     }
 
-    pub fn set_cwd(&mut self, cwd: String) {
-        self.state.set_cwd(cwd);
+    pub fn set_session_directory_override(&mut self, session_directory: String) {
+        self.state.set_session_directory_override(session_directory);
     }
 
     #[cfg(test)]
@@ -3114,7 +3121,7 @@ mod tests {
         async fn create_session(
             &mut self,
             _title: &str,
-            _cwd: &str,
+            _session_directory: &str,
         ) -> BackendResult<ocpncord_backend::Session> {
             Err(pending_backend_error())
         }

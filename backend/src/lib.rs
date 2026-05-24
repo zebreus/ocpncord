@@ -315,7 +315,7 @@ pub trait Backend {
 
     async fn list_sessions(&mut self) -> Result<Vec<Session>>;
     async fn get_session(&mut self, id: &SessionId) -> Result<Session>;
-    async fn create_session(&mut self, title: &str, cwd: &str) -> Result<Session>;
+    async fn create_session(&mut self, title: &str, session_directory: &str) -> Result<Session>;
     async fn delete_session(&mut self, id: &SessionId) -> Result<()>;
     async fn update_session(&mut self, id: &SessionId, title: &str) -> Result<Session>;
     async fn children_sessions(&mut self, id: &SessionId) -> Result<Vec<Session>>;

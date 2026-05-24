@@ -332,11 +332,11 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
-    async fn create_session(&mut self, title: &str, cwd: &str) -> Result<Session> {
+    async fn create_session(&mut self, title: &str, session_directory: &str) -> Result<Session> {
         let url = alloc::format!("{}/session", self.base_url);
         let body = ocpncord_backend::CreateSessionBody {
             title,
-            directory: cwd,
+            directory: session_directory,
         };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
         let body = self

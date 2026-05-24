@@ -122,7 +122,7 @@ impl Backend for MockBackend {
         })
     }
 
-    async fn create_session(&mut self, title: &str, cwd: &str) -> Result<Session> {
+    async fn create_session(&mut self, title: &str, session_directory: &str) -> Result<Session> {
         if let Some(err) = self.fail_create_session.take() {
             return Err(err);
         }
@@ -130,7 +130,7 @@ impl Backend for MockBackend {
             id: "mock-session-id".into(),
             title: title.into(),
             project_id: "mock-project".into(),
-            directory: cwd.into(),
+            directory: session_directory.into(),
             parent_id: None,
             time: SessionTime {
                 created: 0,

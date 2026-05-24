@@ -443,9 +443,9 @@ struct Cli {
     #[arg(long = "url", default_value = "http://localhost:4096")]
     url: String,
 
-    /// Working directory for sessions
-    #[arg(long = "cwd", default_value = ".")]
-    cwd: String,
+    /// Optional server-side working directory for new sessions
+    #[arg(long = "session-directory")]
+    session_directory: Option<String>,
 }
 
 // --- Render target setup --------------------------------------------------
@@ -469,7 +469,9 @@ async fn main() {
     let events = NativeEvents::new();
     let mut app = App::new(backend, events, terminal);
 
-    app.set_cwd(cli.cwd);
+    if let Some(session_directory) = cli.session_directory {
+        app.set_session_directory_override(session_directory);
+    }
     app.run().await;
 
     let _ = execute!(stdout(), LeaveAlternateScreen);
