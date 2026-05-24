@@ -23,7 +23,6 @@ pub enum BackendEvent {
         part: Part,
         delta: Option<String>,
     },
-    Done,
     Error {
         message: String,
     },
@@ -209,7 +208,6 @@ impl fmt::Display for BackendEvent {
         match self {
             Self::Part { part, .. } => write!(f, "part: {part:?}"),
             Self::Error { message } => write!(f, "error: {message}"),
-            Self::Done => write!(f, "done"),
             Self::SessionCreated { session } => write!(f, "session.created: {}", session.id),
             Self::SessionDeleted { session_id } => write!(f, "session.deleted: {session_id}"),
             Self::SessionUpdated { session } => write!(f, "session.updated: {}", session.id),
@@ -309,7 +307,7 @@ pub type Result<T> = core::result::Result<T, BackendError>;
 // --- The Backend trait ---
 
 pub trait Backend {
-    type EventStream: Stream<Item = Result<BackendEvent>> + Unpin;
+    type EventStream: Stream<Item = Result<EventEnvelope>> + Unpin;
 
     async fn health(&mut self) -> Result<Health>;
 
@@ -352,12 +350,9 @@ pub trait Backend {
 
     async fn find_text(&mut self, pattern: &str) -> Result<Vec<TextMatch>>;
 
-    async fn subscribe_events(
-        &mut self,
-        subscription: &EventSubscription,
-    ) -> Result<Self::EventStream>;
+    async fn subscribe_live(&mut self) -> Result<Self::EventStream>;
 
-    async fn sync_history(&mut self, request: &SyncHistoryRequest) -> Result<Vec<BackendEvent>>;
+    async fn sync_history(&mut self, request: &SyncHistoryRequest) -> Result<SyncHistoryBatch>;
 
     async fn get_config(&mut self) -> Result<Config>;
 

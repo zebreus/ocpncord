@@ -9,7 +9,9 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use futures_core::Stream;
-use ocpncord_backend::{BackendError, BackendEvent, Result};
+use ocpncord_backend::{
+    BackendError, BackendEvent, EventCursor, EventEnvelope, EventScope, Result,
+};
 use serde::Deserialize;
 
 /// Incremental SSE parser for streaming responses.
@@ -32,7 +34,7 @@ impl SseParser {
     }
 
     /// Feed raw bytes and return any complete events parsed from the stream.
-    pub fn feed(&mut self, data: &[u8]) -> Vec<Result<BackendEvent>> {
+    pub fn feed(&mut self, data: &[u8]) -> Vec<Result<EventEnvelope>> {
         self.buf.extend_from_slice(data);
         let mut events = Vec::new();
         loop {
@@ -79,11 +81,11 @@ impl Default for SseParser {
 
 enum SseSource {
     PreParsed {
-        events: Vec<Result<BackendEvent>>,
+        events: Vec<Result<EventEnvelope>>,
         pos: usize,
     },
     /// HTTP request in flight — lazily resolved on first poll.
-    Pending(Pin<Box<dyn Future<Output = Vec<Result<BackendEvent>>>>>),
+    Pending(Pin<Box<dyn Future<Output = Vec<Result<EventEnvelope>>>>>),
     Live {
         state: Rc<RefCell<LiveState>>,
         driver: Pin<Box<dyn Future<Output = ()>>>,
@@ -91,7 +93,7 @@ enum SseSource {
 }
 
 struct LiveState {
-    queue: VecDeque<Result<BackendEvent>>,
+    queue: VecDeque<Result<EventEnvelope>>,
     done: bool,
 }
 
@@ -101,13 +103,13 @@ pub struct BufferedStreamSink {
 }
 
 impl BufferedStreamSink {
-    pub fn push(&self, event: Result<BackendEvent>) {
+    pub fn push(&self, event: Result<EventEnvelope>) {
         self.state.borrow_mut().queue.push_back(event);
     }
 
     pub fn extend<I>(&self, events: I)
     where
-        I: IntoIterator<Item = Result<BackendEvent>>,
+        I: IntoIterator<Item = Result<EventEnvelope>>,
     {
         self.state.borrow_mut().queue.extend(events);
     }
@@ -117,7 +119,7 @@ impl BufferedStreamSink {
     }
 }
 
-/// A stream that yields [`BackendEvent`]s.
+/// A stream that yields [`EventEnvelope`]s.
 ///
 /// Can be either pre-parsed from a completed HTTP response body, or
 /// backed by a lazy future that performs the HTTP request on first poll.
@@ -126,14 +128,14 @@ pub struct BufferedStream {
 }
 
 impl BufferedStream {
-    pub fn new(events: Vec<Result<BackendEvent>>) -> Self {
+    pub fn new(events: Vec<Result<EventEnvelope>>) -> Self {
         Self {
             source: SseSource::PreParsed { events, pos: 0 },
         }
     }
 
     /// Create a stream that lazily evaluates the HTTP request on first poll.
-    pub fn from_pending(fut: Pin<Box<dyn Future<Output = Vec<Result<BackendEvent>>>>>) -> Self {
+    pub fn from_pending(fut: Pin<Box<dyn Future<Output = Vec<Result<EventEnvelope>>>>>) -> Self {
         Self {
             source: SseSource::Pending(fut),
         }
@@ -177,7 +179,7 @@ impl BufferedStream {
     /// event: session.status
     /// data: {"sessionID": "...", "status": {"type": "idle"}}
     /// ```
-    pub fn parse_sse(body: &[u8]) -> Vec<Result<BackendEvent>> {
+    pub fn parse_sse(body: &[u8]) -> Vec<Result<EventEnvelope>> {
         let mut events = Vec::new();
         let mut pos = 0;
 
@@ -205,7 +207,7 @@ impl BufferedStream {
 }
 
 impl Stream for BufferedStream {
-    type Item = Result<BackendEvent>;
+    type Item = Result<EventEnvelope>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -278,7 +280,10 @@ fn parse_json<'a, T: Deserialize<'a>>(data: &'a str) -> core::result::Result<T, 
     })
 }
 
-fn parse_backend_event_value(value: &serde_json::Value) -> Option<Result<BackendEvent>> {
+fn parse_backend_event_value(value: &serde_json::Value) -> Option<Result<EventEnvelope>> {
+    let scope = parse_event_scope(value);
+    let mut cursor = None;
+
     // Try nested GlobalEvent format first; fall back to flat Event format.
     let payload = value.get("payload").unwrap_or(value);
     let event_type = payload.get("type").and_then(|v| v.as_str())?;
@@ -288,6 +293,7 @@ fn parse_backend_event_value(value: &serde_json::Value) -> Option<Result<Backend
     // and use `syncEvent.data` as properties.
     let (event_type, props) = if event_type == "sync" {
         let sync_event = payload.get("syncEvent")?;
+        cursor = parse_sync_cursor(payload, sync_event);
         let inner_type = sync_event.get("type").and_then(|v| v.as_str())?;
         // Strip the version suffix (e.g. "message.part.updated.1" → "message.part.updated")
         let inner_type = inner_type
@@ -300,7 +306,7 @@ fn parse_backend_event_value(value: &serde_json::Value) -> Option<Result<Backend
         (event_type, props)
     };
 
-    match event_type {
+    let parsed = match event_type {
         "message.part.updated" => parse_part_updated_value(props),
         "message.updated" => parse_message_updated_value(props),
         "session.idle" => {
@@ -645,15 +651,71 @@ fn parse_backend_event_value(value: &serde_json::Value) -> Option<Result<Backend
         }
 
         _ => None,
+    };
+
+    parsed.map(|result| {
+        result.map(|event| EventEnvelope {
+            event,
+            scope,
+            cursor,
+        })
+    })
+}
+
+fn parse_event_scope(value: &serde_json::Value) -> EventScope {
+    EventScope {
+        directory: value
+            .get("directory")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned()),
+        workspace: value
+            .get("workspace")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned()),
+        project: value
+            .get("project")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned()),
     }
 }
 
-pub(crate) fn parse_sync_history_record(value: &serde_json::Value) -> Option<Result<BackendEvent>> {
+fn string_field(value: &serde_json::Value, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(|v| v.as_str()))
+        .map(|s| s.to_owned())
+}
+
+fn parse_sync_cursor(
+    envelope: &serde_json::Value,
+    sync_event: &serde_json::Value,
+) -> Option<EventCursor> {
+    let event_id = string_field(sync_event, &["id"]).or_else(|| string_field(envelope, &["id"]));
+    let aggregate_id = string_field(sync_event, &["aggregateID", "aggregate_id"]);
+    let seq = sync_event.get("seq").and_then(|v| v.as_u64());
+
+    if event_id.is_some() || aggregate_id.is_some() || seq.is_some() {
+        Some(EventCursor {
+            event_id,
+            aggregate_id,
+            seq,
+        })
+    } else {
+        None
+    }
+}
+
+pub(crate) fn parse_sync_history_record(
+    value: &serde_json::Value,
+) -> Option<Result<EventEnvelope>> {
     let mut wrapped = serde_json::Map::new();
     wrapped.insert(
         alloc::string::String::from("type"),
         serde_json::Value::String(alloc::string::String::from("sync")),
     );
+    if let Some(id) = value.get("id") {
+        wrapped.insert(alloc::string::String::from("id"), id.clone());
+    }
     wrapped.insert(alloc::string::String::from("syncEvent"), value.clone());
     parse_backend_event_value(&serde_json::Value::Object(wrapped))
 }
@@ -677,7 +739,7 @@ pub(crate) fn parse_sync_history_record(value: &serde_json::Value) -> Option<Res
 /// ```json
 /// {"type": "message.part.updated", "properties": {...}}
 /// ```
-fn parse_sse_block(block: &[u8]) -> Option<Result<BackendEvent>> {
+fn parse_sse_block(block: &[u8]) -> Option<Result<EventEnvelope>> {
     let text = core::str::from_utf8(block).ok()?;
 
     let mut data = "";
@@ -717,25 +779,16 @@ fn parse_wrapped_session_event(
     }
 }
 
-/// Parse a `message.updated` event into the appropriate `BackendEvent`.
-///
-/// Only assistant messages produce `BackendEvent::Done` (which finalizes the
-/// streaming response).  The server emits `message.updated` for **every**
-/// message — including the user's.  The user's `message.updated` arrives
-/// *before* the assistant even starts processing, so treating it as `Done`
-/// would prematurely reset `is_streaming` and cause all subsequent assistant
-/// parts to be silently dropped.
+/// Parse a `message.updated` event into the normalized transcript event.
 fn parse_message_updated_value(props: &serde_json::Value) -> Option<Result<BackendEvent>> {
-    let info = props.get("info")?;
-    let role = info.get("role").and_then(|v| v.as_str()).unwrap_or("");
-
-    if role == "assistant" {
-        // Assistant message finalized — this is the real "done" signal.
-        Some(Ok(BackendEvent::Done))
-    } else {
-        // User or unknown message — ignore. Do NOT emit Done.
-        None
-    }
+    let session_id = props.get("sessionID").and_then(|v| v.as_str())?;
+    let message = props
+        .get("info")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())?;
+    Some(Ok(BackendEvent::MessageUpdated {
+        session_id: session_id.to_owned(),
+        message,
+    }))
 }
 
 /// Parse a `message.part.updated` event data JSON into a `BackendEvent::Part`.
@@ -772,14 +825,22 @@ mod tests {
         )
     }
 
+    fn event_at(events: &[Result<EventEnvelope>], index: usize) -> &BackendEvent {
+        &events[index].as_ref().expect("event should parse").event
+    }
+
+    fn envelope_at(events: &[Result<EventEnvelope>], index: usize) -> &EventEnvelope {
+        events[index].as_ref().expect("event should parse")
+    }
+
     #[test]
     fn parse_text_part() {
         let data = wrap_sse_data("message.part.updated", "{\"sessionID\":\"ses1\",\"part\":{\"id\":\"prt1\",\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"type\":\"text\",\"text\":\"Hello\"},\"time\":0}");
         let sse = format!("event: message.part.updated\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::MessagePartUpdated { part, .. }) => {
+        match event_at(&events, 0) {
+            BackendEvent::MessagePartUpdated { part, .. } => {
                 assert!(matches!(part, ocpncord_backend::Part::Text(_)));
             }
             _ => panic!("expected text part"),
@@ -792,8 +853,8 @@ mod tests {
         let sse = format!("event: message.part.updated\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::MessagePartUpdated { part, .. }) => {
+        match event_at(&events, 0) {
+            BackendEvent::MessagePartUpdated { part, .. } => {
                 assert!(matches!(part, ocpncord_backend::Part::Tool(_)));
             }
             _ => panic!("expected tool part"),
@@ -801,26 +862,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_done_event_for_assistant_message() {
-        let data = wrap_sse_data("message.updated", "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"summary\":null,\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}");
+    fn parse_message_updated_for_assistant_message() {
+        let data = wrap_sse_data("message.updated", "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"modelID\":\"model-1\",\"providerID\":\"provider-1\",\"mode\":\"build\",\"agent\":\"builder\",\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}");
         let sse = format!("event: message.updated\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], Ok(BackendEvent::Done)));
+        assert!(matches!(
+            event_at(&events, 0),
+            BackendEvent::MessageUpdated { .. }
+        ));
     }
 
-    /// User message.updated MUST NOT produce Done — it arrives before the
-    /// assistant even starts, and emitting Done would reset is_streaming.
     #[test]
-    fn parse_user_message_updated_does_not_produce_done() {
+    fn parse_user_message_updated_produces_transcript_event() {
         let data = wrap_sse_data("message.updated", "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"user\",\"time\":{\"created\":0},\"agent\":\"build\",\"model\":{\"providerID\":\"anthropic\",\"modelID\":\"claude-sonnet\"}}}");
         let sse = format!("event: message.updated\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
-        assert_eq!(
-            events.len(),
-            0,
-            "user message.updated should NOT produce any event"
-        );
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            event_at(&events, 0),
+            BackendEvent::MessageUpdated { .. }
+        ));
     }
 
     #[test]
@@ -829,7 +891,14 @@ mod tests {
         let sse = format!("event: server.connected\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], Ok(BackendEvent::ServerConnected)));
+        assert!(matches!(
+            event_at(&events, 0),
+            BackendEvent::ServerConnected
+        ));
+        assert_eq!(
+            envelope_at(&events, 0).scope.directory.as_deref(),
+            Some("/tmp")
+        );
     }
 
     #[test]
@@ -838,8 +907,8 @@ mod tests {
         let sse = format!("event: session.created\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::SessionCreated { session }) => {
+        match event_at(&events, 0) {
+            BackendEvent::SessionCreated { session } => {
                 assert_eq!(session.id, "ses123");
             }
             _ => panic!("expected session.created"),
@@ -852,8 +921,8 @@ mod tests {
         let sse = format!("event: session.deleted\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::SessionDeleted { session_id }) => {
+        match event_at(&events, 0) {
+            BackendEvent::SessionDeleted { session_id } => {
                 assert_eq!(session_id, "ses123");
             }
             _ => panic!("expected session.deleted"),
@@ -866,8 +935,8 @@ mod tests {
         let sse = format!("event: session.idle\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::SessionIdle { session_id }) => {
+        match event_at(&events, 0) {
+            BackendEvent::SessionIdle { session_id } => {
                 assert_eq!(session_id, "ses123");
             }
             _ => panic!("expected session.idle"),
@@ -883,8 +952,8 @@ mod tests {
         let sse = format!("event: session.status\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::SessionIdle { session_id }) => {
+        match event_at(&events, 0) {
+            BackendEvent::SessionIdle { session_id } => {
                 assert_eq!(session_id, "ses123");
             }
             _ => panic!("expected session.idle"),
@@ -897,8 +966,8 @@ mod tests {
         let sse = format!("event: session.error\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::SessionError { session_id, .. }) => {
+        match event_at(&events, 0) {
+            BackendEvent::SessionError { session_id, .. } => {
                 assert_eq!(session_id, "ses123");
             }
             _ => panic!("expected session.error"),
@@ -911,8 +980,8 @@ mod tests {
         let sse = format!("event: permission.asked\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::PermissionAsked { request }) => {
+        match event_at(&events, 0) {
+            BackendEvent::PermissionAsked { request } => {
                 assert_eq!(request.permission, "bash");
             }
             _ => panic!("expected permission.asked"),
@@ -925,8 +994,8 @@ mod tests {
         let sse = format!("event: question.asked\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::QuestionAsked { request }) => {
+        match event_at(&events, 0) {
+            BackendEvent::QuestionAsked { request } => {
                 assert_eq!(request.questions[0].question, "Proceed?");
             }
             _ => panic!("expected question.asked"),
@@ -942,12 +1011,12 @@ mod tests {
         let sse = format!("event: question.replied\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::QuestionReplied {
+        match event_at(&events, 0) {
+            BackendEvent::QuestionReplied {
                 session_id,
                 request_id,
                 answers,
-            }) => {
+            } => {
                 assert_eq!(session_id, "ses1");
                 assert_eq!(request_id, "que1");
                 assert_eq!(
@@ -968,8 +1037,8 @@ mod tests {
         let sse = format!("event: command.executed\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::CommandExecuted { name, .. }) => {
+        match event_at(&events, 0) {
+            BackendEvent::CommandExecuted { name, .. } => {
                 assert_eq!(name, "build");
             }
             _ => panic!("expected command.executed"),
@@ -982,8 +1051,8 @@ mod tests {
         let sse = format!("event: file.edited\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::FileEdited { file }) => {
+        match event_at(&events, 0) {
+            BackendEvent::FileEdited { file } => {
                 assert_eq!(file, "src/main.rs");
             }
             _ => panic!("expected file.edited"),
@@ -996,8 +1065,8 @@ mod tests {
         let sse = format!("event: pty.created\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::PtyCreated { info }) => {
+        match event_at(&events, 0) {
+            BackendEvent::PtyCreated { info } => {
                 assert_eq!(info.id, "pty1");
             }
             _ => panic!("expected pty.created"),
@@ -1013,8 +1082,8 @@ mod tests {
         let sse = format!("event: lsp.client.diagnostics\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::LspDiagnostics { server_id, path }) => {
+        match event_at(&events, 0) {
+            BackendEvent::LspDiagnostics { server_id, path } => {
                 assert_eq!(server_id, "rust-analyzer");
                 assert_eq!(path, "src/main.rs");
             }
@@ -1028,8 +1097,8 @@ mod tests {
         let sse = format!("event: mcp.tools.changed\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::McpToolsChanged { server }) => {
+        match event_at(&events, 0) {
+            BackendEvent::McpToolsChanged { server } => {
                 assert_eq!(server, "my-mcp");
             }
             _ => panic!("expected mcp.tools.changed"),
@@ -1042,8 +1111,8 @@ mod tests {
         let sse = format!("event: installation.update-available\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::InstallationUpdateAvailable { version }) => {
+        match event_at(&events, 0) {
+            BackendEvent::InstallationUpdateAvailable { version } => {
                 assert_eq!(version, "1.2.3");
             }
             _ => panic!("expected installation.update-available"),
@@ -1056,8 +1125,8 @@ mod tests {
         let sse = format!("event: workspace.ready\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::WorkspaceReady { name }) => {
+        match event_at(&events, 0) {
+            BackendEvent::WorkspaceReady { name } => {
                 assert_eq!(name, "my-project");
             }
             _ => panic!("expected workspace.ready"),
@@ -1070,8 +1139,8 @@ mod tests {
         let sse = format!("event: todo.updated\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::TodoUpdated { todos, .. }) => {
+        match event_at(&events, 0) {
+            BackendEvent::TodoUpdated { todos, .. } => {
                 assert_eq!(todos[0].content, "Fix bug");
             }
             _ => panic!("expected todo.updated"),
@@ -1087,10 +1156,10 @@ mod tests {
         let sse = format!("event: tui.toast.show\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::TuiToastShow {
+        match event_at(&events, 0) {
+            BackendEvent::TuiToastShow {
                 message, variant, ..
-            }) => {
+            } => {
                 assert_eq!(message, "Done!");
                 assert_eq!(variant, "success");
             }
@@ -1104,20 +1173,23 @@ mod tests {
         let sse = format!("event: global.disposed\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], Ok(BackendEvent::GlobalDisposed)));
+        assert!(matches!(event_at(&events, 0), BackendEvent::GlobalDisposed));
     }
 
     #[test]
     fn parse_multiple_events() {
         let d1 = wrap_sse_data("message.part.updated", "{\"sessionID\":\"ses1\",\"part\":{\"id\":\"prt1\",\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"type\":\"text\",\"text\":\"One\"},\"time\":0}");
         let d2 = wrap_sse_data("message.part.updated", "{\"sessionID\":\"ses1\",\"part\":{\"id\":\"prt2\",\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"type\":\"text\",\"text\":\"Two\"},\"time\":0}");
-        let d3 = wrap_sse_data("message.updated", "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"summary\":null,\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}");
+        let d3 = wrap_sse_data("message.updated", "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"modelID\":\"model-1\",\"providerID\":\"provider-1\",\"mode\":\"build\",\"agent\":\"builder\",\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}");
         let sse = format!(
             "event: message.part.updated\ndata: {d1}\n\nevent: message.part.updated\ndata: {d2}\n\nevent: message.updated\ndata: {d3}\n\n"
         );
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 3);
-        assert!(matches!(events[2], Ok(BackendEvent::Done)));
+        assert!(matches!(
+            event_at(&events, 2),
+            BackendEvent::MessageUpdated { .. }
+        ));
     }
 
     #[test]
@@ -1146,8 +1218,8 @@ mod tests {
         let sse = format!("event: message\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1, "wrapped payload should be parsed");
-        match &events[0] {
-            Ok(BackendEvent::MessagePartUpdated { session_id, part }) => {
+        match event_at(&events, 0) {
+            BackendEvent::MessagePartUpdated { session_id, part } => {
                 assert_eq!(session_id, "ses1");
                 assert!(matches!(part, ocpncord_backend::Part::Text(_)));
             }
@@ -1156,20 +1228,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_wrapped_message_updated_as_done() {
+    fn parse_wrapped_message_updated_as_transcript_event() {
         let data = wrap_wire_event(
             "message.updated",
             1,
-            "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"summary\":null,\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}",
+            "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"modelID\":\"model-1\",\"providerID\":\"provider-1\",\"mode\":\"build\",\"agent\":\"builder\",\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}",
         );
         let sse = format!("event: message\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(
             events.len(),
             1,
-            "wrapped message.updated should be parsed as Done"
+            "wrapped message.updated should be parsed as MessageUpdated"
         );
-        assert!(matches!(events[0], Ok(BackendEvent::Done)));
+        assert!(matches!(
+            event_at(&events, 0),
+            BackendEvent::MessageUpdated { .. }
+        ));
+        let cursor = envelope_at(&events, 0).cursor.as_ref().unwrap();
+        assert_eq!(cursor.event_id.as_deref(), Some("evt_test"));
+        assert_eq!(cursor.aggregate_id.as_deref(), Some("ses1"));
+        assert_eq!(cursor.seq, Some(0));
     }
 
     #[test]
@@ -1182,8 +1261,8 @@ mod tests {
         let sse = format!("event: message\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::SessionCreated { session }) => {
+        match event_at(&events, 0) {
+            BackendEvent::SessionCreated { session } => {
                 assert_eq!(session.id, "ses123");
             }
             other => panic!("expected SessionCreated, got {other:?}"),
@@ -1200,12 +1279,12 @@ mod tests {
         let sse = format!("event: message\ndata: {data}\n\n");
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            Ok(BackendEvent::MessagePartRemoved {
+        match event_at(&events, 0) {
+            BackendEvent::MessagePartRemoved {
                 session_id,
                 message_id,
                 part_id,
-            }) => {
+            } => {
                 assert_eq!(session_id, "ses1");
                 assert_eq!(message_id, "msg1");
                 assert_eq!(part_id, "prt1");
@@ -1230,7 +1309,7 @@ mod tests {
         let done = wrap_wire_event(
             "message.updated",
             1,
-            "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"summary\":null,\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}",
+            "{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0,\"updated\":0},\"parentID\":\"\",\"modelID\":\"model-1\",\"providerID\":\"provider-1\",\"mode\":\"build\",\"agent\":\"builder\",\"cost\":0,\"tokens\":{\"total\":0,\"input\":0,\"output\":0,\"reasoning\":0},\"finishReason\":null}}",
         );
         let sse = format!(
             "event: message\ndata: {wrapped}\n\nevent: message\ndata: {bus}\n\nevent: message\ndata: {done}\n\n"
@@ -1238,18 +1317,21 @@ mod tests {
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 3, "all three events should parse");
         assert!(matches!(
-            events[0],
-            Ok(BackendEvent::MessagePartUpdated { .. })
+            event_at(&events, 0),
+            BackendEvent::MessagePartUpdated { .. }
         ));
         assert!(matches!(
-            events[1],
-            Ok(BackendEvent::MessagePartDelta { .. })
+            event_at(&events, 1),
+            BackendEvent::MessagePartDelta { .. }
         ));
-        assert!(matches!(events[2], Ok(BackendEvent::Done)));
+        assert!(matches!(
+            event_at(&events, 2),
+            BackendEvent::MessageUpdated { .. }
+        ));
     }
 
     #[test]
-    fn parse_sync_history_record_as_done() {
+    fn parse_sync_history_record_with_cursor() {
         let record: serde_json::Value = serde_json::from_str(
             "{\"type\":\"message.updated.1\",\"id\":\"evt_1\",\"seq\":1,\"aggregateID\":\"ses1\",\"data\":{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0},\"parentID\":null,\"modelID\":\"mock/model\",\"providerID\":\"mock\",\"mode\":\"default\",\"agent\":\"build\",\"cost\":0.0}}}",
         )
@@ -1259,6 +1341,10 @@ mod tests {
             .expect("record should normalize")
             .expect("record should parse");
 
-        assert!(matches!(event, BackendEvent::Done));
+        assert!(matches!(event.event, BackendEvent::MessageUpdated { .. }));
+        let cursor = event.cursor.expect("sync event should carry cursor");
+        assert_eq!(cursor.event_id.as_deref(), Some("evt_1"));
+        assert_eq!(cursor.aggregate_id.as_deref(), Some("ses1"));
+        assert_eq!(cursor.seq, Some(1));
     }
 }

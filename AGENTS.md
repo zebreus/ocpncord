@@ -39,7 +39,7 @@ Before committing, always run `cargo fmt --all` and `cargo check`.
 ## Key facts
 
 - All serde types use `#[serde(rename_all = "camelCase")]` — JSON from the Agent API is camelCase.
-- `submit_prompt()` and `submit_command()` return immediate JSON receipts. Live assistant activity arrives on `subscribe_events()`, and `/sync/history` is the pull-style catch-up API.
+- `submit_prompt()` and `submit_command()` return immediate JSON receipts. Live assistant activity arrives as `EventEnvelope`s from `subscribe_live()` (`/global/event`), and `/sync/history` is the scoped pull-style catch-up API.
 - `MockBackend` (feature `mock` on `ocpncord-backend`) returns canned data for TUI tests.
 - `App<B, E, T>` owns the backend, platform event stream, backend streams, and Ratatui terminal. Screens: `StartPage`, `Chat`, `Terminal` (PTY). PromptBar modes: `/` command, `!` shell, `@` fileref.
 - Key bindings (`tui/src/key_chord.rs`): `Ctrl+C` quit, `Ctrl+X` leader (40-tick timeout → Q/L/M/H/T/D/O), `Ctrl+P` palette, `D`/`O` both toggle side panel. `Esc` closes modal / interrupts streaming. `Tab`/`Shift+Tab` cycles agents.

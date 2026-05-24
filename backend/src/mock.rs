@@ -24,9 +24,10 @@ pub struct MockBackend {
     pub agents: Vec<Agent>,
     pub prompt_receipt: Option<SubmissionReceipt>,
     pub command_receipt: Option<SubmissionReceipt>,
-    pub live_events: Vec<Result<BackendEvent>>,
+    pub live_events: Vec<Result<EventEnvelope>>,
     pub live_event_stream_pending_polls: usize,
-    pub sync_history_events: Vec<BackendEvent>,
+    pub sync_history_batch: SyncHistoryBatch,
+    pub sync_history_error: Option<BackendError>,
     pub sync_history_requests: Vec<SyncHistoryRequest>,
     pub text_matches: Vec<TextMatch>,
     pub prompt_calls: Vec<MockSubmissionCall>,
@@ -61,7 +62,8 @@ impl Default for MockBackend {
             command_receipt: None,
             live_events: Vec::new(),
             live_event_stream_pending_polls: 0,
-            sync_history_events: Vec::new(),
+            sync_history_batch: SyncHistoryBatch::default(),
+            sync_history_error: None,
             sync_history_requests: Vec::new(),
             text_matches: Vec::new(),
             prompt_calls: Vec::new(),
@@ -248,10 +250,7 @@ impl Backend for MockBackend {
         Ok(self.text_matches.clone())
     }
 
-    async fn subscribe_events(
-        &mut self,
-        _subscription: &EventSubscription,
-    ) -> Result<Self::EventStream> {
+    async fn subscribe_live(&mut self) -> Result<Self::EventStream> {
         let events = core::mem::take(&mut self.live_events);
         Ok(MockStream {
             events,
@@ -260,9 +259,12 @@ impl Backend for MockBackend {
         })
     }
 
-    async fn sync_history(&mut self, request: &SyncHistoryRequest) -> Result<Vec<BackendEvent>> {
+    async fn sync_history(&mut self, request: &SyncHistoryRequest) -> Result<SyncHistoryBatch> {
         self.sync_history_requests.push(request.clone());
-        Ok(self.sync_history_events.clone())
+        if let Some(error) = self.sync_history_error.take() {
+            return Err(error);
+        }
+        Ok(self.sync_history_batch.clone())
     }
 
     async fn get_config(&mut self) -> Result<Config> {
@@ -310,13 +312,13 @@ impl Backend for MockBackend {
 }
 
 pub struct MockStream {
-    events: Vec<Result<BackendEvent>>,
+    events: Vec<Result<EventEnvelope>>,
     pos: usize,
     pending_polls: usize,
 }
 
 impl Stream for MockStream {
-    type Item = Result<BackendEvent>;
+    type Item = Result<EventEnvelope>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.pending_polls > 0 {

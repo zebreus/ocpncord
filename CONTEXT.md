@@ -17,10 +17,13 @@ The Rust trait in the `backend` crate that abstracts the Agent protocol. Impleme
 _Avoid_: Client, transport
 
 **BackendEvent**:
-A normalized event delivered either from the live SSE subscription or from sync-history catch-up. Covers text deltas, tool state changes, step markers, errors, and stream completion.
+A normalized Agent event delivered inside an **EventEnvelope** from the live SSE subscription or sync-history catch-up. Covers message updates/removals, text deltas, tool state changes, step markers, and errors.
+
+**EventEnvelope**:
+The transport wrapper for a `BackendEvent`. Carries the normalized event plus optional **EventScope** (directory/workspace/project) and **EventCursor** (event id, aggregate id, sequence) so the TUI can filter global live traffic and resume through **SyncHistory**.
 
 **EventStream**:
-An async `Stream` of `BackendEvent`s from the SSE subscription endpoints (`/event` or `/global/event`). Carries assistant progress and other server notifications.
+An async `Stream` of `EventEnvelope`s from `Backend::subscribe_live()`, backed by the Agent's `/global/event` SSE endpoint. Carries assistant progress and other server notifications.
 
 **Message**:
 A single turn in a **Session**, authored by either the **User** or the **Assistant** (Agent). Contains zero or more **Part**s.
@@ -36,7 +39,7 @@ _Avoid_: Command (refers to a specific API call)
 An API call to the Agent that returns an immediate structured receipt (e.g., "run a shell command"). Follow-up activity still arrives on the **EventStream**.
 
 **SyncHistory**:
-A pull API that returns missed protocol events from `/sync/history`. Used for catch-up and reconciliation rather than as a second live stream.
+A scoped pull API that returns missed protocol events from `/sync/history` as a `SyncHistoryBatch`. Used for reconnect catch-up and reconciliation rather than as a second live stream.
 
 **Session**:
 A single conversation with the **Agent**, consisting of a sequence of **Message**s.
@@ -70,7 +73,7 @@ The primary interaction screen. Shows a scrollable list of **Messages** (user + 
 - A **Session** contains zero or more **Messages**
 - A **Message** contains zero or more **Parts**
 - **Prompt** and **Command** both return immediate receipts and continue on the **EventStream**
-- **SyncHistory** is the catch-up path when the client needs missed events
+- **SyncHistory** is the cursor-based catch-up path when the client needs missed events
 - The **Backend** trait is implemented by `ocpncord-backend-opencode` for the real **Agent**
 - The `backend` crate owns the Backend trait and the shared JSON contract types
 
@@ -88,5 +91,5 @@ native/         — Binary: tokio + Crossterm, the only binary crate
 > **Dev:** "Does the TUI know the Agent is an opencode server?"
 > **Domain expert:** "No — the TUI only imports the Backend trait. The fact that it's an opencode server is an implementation detail of `ocpncord-backend-opencode`."
 
-> **Dev:** "Should I use `subscribe()` to get streaming responses?"
-> **Domain expert:** "Use `subscribe_events()` for live progress and `sync_history()` for catch-up. `submit_prompt()` only returns the immediate receipt for the submission itself."
+> **Dev:** "Should I use a per-prompt stream to get streaming responses?"
+> **Domain expert:** "No — use `subscribe_live()` for `/global/event` live progress and `sync_history()` for catch-up. `submit_prompt()` only returns the immediate receipt for the submission itself."

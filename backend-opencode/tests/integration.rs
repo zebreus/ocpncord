@@ -211,13 +211,7 @@ async fn prompt_and_messages() {
 
     let mut b = backend();
     let s = b.create_session("prompt-test", "/tmp").await.unwrap();
-    let mut stream = b
-        .subscribe_events(&EventSubscription::Instance {
-            directory: Some("/tmp".into()),
-            workspace: None,
-        })
-        .await
-        .expect("subscribe should succeed");
+    let mut stream = b.subscribe_live().await.expect("subscribe should succeed");
 
     // Send a prompt (will actually call the AI)
     let _receipt = b
@@ -225,10 +219,20 @@ async fn prompt_and_messages() {
         .await
         .expect("prompt should succeed");
 
-    // Consume the stream until Done to let the server complete processing
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(ocpncord_backend::BackendEvent::Done) => break,
+    // Consume the stream until the assistant message is finalized.
+    while let Some(envelope) = stream.next().await {
+        match envelope {
+            Ok(envelope)
+                if matches!(
+                    envelope.event,
+                    ocpncord_backend::BackendEvent::MessageUpdated {
+                        ref session_id,
+                        message: ocpncord_backend::Message::Assistant(_),
+                    } if session_id == &s.id
+                ) =>
+            {
+                break
+            }
             Ok(_) => {}
             Err(e) => panic!("unexpected error in prompt stream: {e}"),
         }
@@ -257,22 +261,26 @@ async fn send_command() {
 
     let mut b = backend();
     let s = b.create_session("command-test", "/tmp").await.unwrap();
-    let mut stream = b
-        .subscribe_events(&EventSubscription::Instance {
-            directory: Some("/tmp".into()),
-            workspace: None,
-        })
-        .await
-        .expect("subscribe should succeed");
+    let mut stream = b.subscribe_live().await.expect("subscribe should succeed");
     let _receipt = b
         .submit_command(&s.id, "init", None)
         .await
         .expect("command should succeed");
 
-    // Consume the stream until Done
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(ocpncord_backend::BackendEvent::Done) => break,
+    // Consume the stream until the assistant command message is finalized.
+    while let Some(envelope) = stream.next().await {
+        match envelope {
+            Ok(envelope)
+                if matches!(
+                    envelope.event,
+                    ocpncord_backend::BackendEvent::MessageUpdated {
+                        ref session_id,
+                        message: ocpncord_backend::Message::Assistant(_),
+                    } if session_id == &s.id
+                ) =>
+            {
+                break
+            }
             Ok(_) => {}
             Err(e) => panic!("unexpected error in command stream: {e}"),
         }
@@ -295,10 +303,7 @@ async fn delete_session() {
 #[tokio::test]
 async fn subscribe_connects() {
     let mut b = backend();
-    let stream = b
-        .subscribe_events(&EventSubscription::Global)
-        .await
-        .expect("subscribe should succeed");
+    let stream = b.subscribe_live().await.expect("subscribe should succeed");
     // Connection established, drop it
     drop(stream);
 }

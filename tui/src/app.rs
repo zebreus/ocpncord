@@ -1,4 +1,6 @@
+use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
@@ -10,7 +12,7 @@ use core::pin::Pin;
 use core::task::Poll;
 
 use futures_core::Stream;
-use ocpncord_backend::{Backend, BackendEvent};
+use ocpncord_backend::{Backend, BackendEvent, EventEnvelope, EventScope};
 
 use crate::chat::{render_chat, ChatTranscript};
 use crate::command_palette::CommandPaletteModal;
@@ -49,6 +51,7 @@ pub enum ToastVariant {
 
 const MAX_STORED_TOASTS: usize = 16;
 const MAX_VISIBLE_TOASTS: usize = 5;
+const LIVE_RECONNECT_DELAY_TICKS: u64 = 4;
 const START_PAGE_LOGO: &str = r#"██████   ██████ ██████  ███    ██ ██████  ██████  ██████  ██████
 ██    ██ ██      ██   ██ ████   ██ ██      ██    ██ ██   ██ ██   ██
 ██    ██ ██      ██████  ██ ██  ██ ██      ██    ██ ██████  ██   ██
@@ -126,6 +129,8 @@ enum ActiveBlockingPrompt {
 /// A message held in memory, built from streaming Parts.
 #[derive(Debug, Clone)]
 pub struct LoadedMessage {
+    pub id: Option<String>,
+    pub session_id: Option<String>,
     pub role: ocpncord_backend::MessageRole,
     pub parts: Vec<ocpncord_backend::Part>,
 }
@@ -269,6 +274,8 @@ fn tool_states_equivalent(
 
 fn user_loaded_message(text: &str) -> LoadedMessage {
     LoadedMessage {
+        id: None,
+        session_id: None,
         role: ocpncord_backend::MessageRole::User,
         parts: vec![ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
             text: text.into(),
@@ -389,8 +396,9 @@ impl TuiCommandContext {
 #[derive(Debug, Clone)]
 enum BackendOp {
     LoadAgents,
-    Subscribe {
-        subscription: ocpncord_backend::EventSubscription,
+    Subscribe,
+    SyncHistory {
+        request: ocpncord_backend::SyncHistoryRequest,
     },
     CreateSession {
         title: String,
@@ -399,10 +407,6 @@ enum BackendOp {
     },
     Submit {
         submission: Submission,
-    },
-    ReloadMessages {
-        session_id: String,
-        dispatch_next: bool,
     },
     ListSessions,
     LoadSession {
@@ -441,6 +445,7 @@ enum BackendOp {
 enum BackendOpResult<B: Backend> {
     Agents(ocpncord_backend::Result<Vec<ocpncord_backend::Agent>>),
     Subscribe(ocpncord_backend::Result<B::EventStream>),
+    SyncHistory(ocpncord_backend::Result<ocpncord_backend::SyncHistoryBatch>),
     CreateSession {
         purpose: CreateSessionPurpose,
         result: ocpncord_backend::Result<ocpncord_backend::Session>,
@@ -448,10 +453,6 @@ enum BackendOpResult<B: Backend> {
     Submit {
         submission: Submission,
         result: ocpncord_backend::Result<ocpncord_backend::SubmissionReceipt>,
-    },
-    ReloadMessages {
-        dispatch_next: bool,
-        result: ocpncord_backend::Result<Vec<LoadedMessage>>,
     },
     ListSessions(ocpncord_backend::Result<Vec<ocpncord_backend::Session>>),
     LoadSession {
@@ -502,8 +503,8 @@ pub struct AppState {
     active_submission: Option<Submission>,
     queued_submissions: Vec<Submission>,
     queued_messages: Vec<LoadedMessage>,
-    ignore_done_until_tick: u64,
-    response_seen_assistant_activity: bool,
+    sync_known_sequences: BTreeMap<String, u64>,
+    live_reconnect_at_tick: Option<u64>,
     pending_ops: alloc::collections::VecDeque<BackendOp>,
     active_modal: Option<Box<dyn Modal>>,
     active_blocking_prompt: Option<ActiveBlockingPrompt>,
@@ -555,8 +556,8 @@ impl AppState {
             active_submission: None,
             queued_submissions: Vec::new(),
             queued_messages: Vec::new(),
-            ignore_done_until_tick: 0,
-            response_seen_assistant_activity: false,
+            sync_known_sequences: BTreeMap::new(),
+            live_reconnect_at_tick: None,
             pending_ops: alloc::collections::VecDeque::new(),
             active_modal: None,
             active_blocking_prompt: None,
@@ -675,21 +676,102 @@ impl AppState {
         self.pending_ops.push_back(op);
     }
 
-    fn event_subscription(&self) -> ocpncord_backend::EventSubscription {
-        match self.current_workspace.clone() {
-            Some(directory) => ocpncord_backend::EventSubscription::Instance {
-                directory: Some(directory),
-                workspace: None,
-            },
-            None => ocpncord_backend::EventSubscription::Global,
+    fn event_scope(&self) -> EventScope {
+        EventScope::instance(self.current_workspace.clone(), None)
+    }
+
+    fn sync_history_request(&self) -> ocpncord_backend::SyncHistoryRequest {
+        ocpncord_backend::SyncHistoryRequest {
+            scope: self.event_scope(),
+            known_sequences: self.sync_known_sequences.clone(),
+        }
+    }
+
+    fn queue_sync_history(&mut self) {
+        self.queue_op(BackendOp::SyncHistory {
+            request: self.sync_history_request(),
+        });
+    }
+
+    fn queue_live_resubscribe(&mut self) {
+        self.live_reconnect_at_tick = None;
+        self.queue_sync_history();
+        self.queue_op(BackendOp::Subscribe);
+    }
+
+    fn schedule_live_reconnect(&mut self) {
+        if self.live_reconnect_at_tick.is_none() {
+            self.live_reconnect_at_tick =
+                Some(self.tick.saturating_add(LIVE_RECONNECT_DELAY_TICKS));
+        }
+    }
+
+    fn live_reconnect_due(&self) -> bool {
+        self.live_reconnect_at_tick
+            .map(|tick| self.tick >= tick)
+            .unwrap_or(false)
+    }
+
+    fn envelope_matches_scope(&self, envelope: &EventEnvelope) -> bool {
+        let wanted = self.event_scope();
+        if let Some(directory) = wanted.directory.as_deref() {
+            if let Some(event_directory) = envelope.scope.directory.as_deref() {
+                return event_directory == directory;
+            }
+        }
+        if let Some(workspace) = wanted.workspace.as_deref() {
+            if let Some(event_workspace) = envelope.scope.workspace.as_deref() {
+                return event_workspace == workspace;
+            }
+        }
+        true
+    }
+
+    fn update_known_sequence(&mut self, envelope: &EventEnvelope) {
+        let Some(cursor) = &envelope.cursor else {
+            return;
+        };
+        let (Some(aggregate_id), Some(seq)) = (&cursor.aggregate_id, cursor.seq) else {
+            return;
+        };
+        let entry = self
+            .sync_known_sequences
+            .entry(aggregate_id.clone())
+            .or_insert(0);
+        *entry = (*entry).max(seq);
+    }
+
+    fn apply_live_envelope(&mut self, envelope: EventEnvelope) -> bool {
+        if !self.envelope_matches_scope(&envelope) {
+            return true;
+        }
+        self.update_known_sequence(&envelope);
+        self.handle_event(Event::Backend(envelope.event))
+    }
+
+    fn handle_sync_history_result(
+        &mut self,
+        result: ocpncord_backend::Result<ocpncord_backend::SyncHistoryBatch>,
+    ) {
+        match result {
+            Ok(batch) => {
+                for (aggregate_id, seq) in batch.known_sequences {
+                    let entry = self.sync_known_sequences.entry(aggregate_id).or_insert(0);
+                    *entry = (*entry).max(seq);
+                }
+                for envelope in batch.envelopes {
+                    self.apply_live_envelope(envelope);
+                }
+            }
+            Err(error) => {
+                self.error = Some(alloc::format!("sync history: {error}"));
+            }
         }
     }
 
     fn queue_startup(&mut self) {
         self.queue_op(BackendOp::LoadAgents);
-        self.queue_op(BackendOp::Subscribe {
-            subscription: self.event_subscription(),
-        });
+        self.queue_live_resubscribe();
     }
 
     pub fn active_mode(&self) -> AppMode {
@@ -850,6 +932,8 @@ impl AppState {
         if !self.partial_parts.is_empty() {
             let parts = core::mem::take(&mut self.partial_parts);
             self.messages.push(LoadedMessage {
+                id: None,
+                session_id: self.active_session_id(),
                 role: ocpncord_backend::MessageRole::Assistant,
                 parts,
             });
@@ -874,7 +958,6 @@ impl AppState {
         self.partial_texts.clear();
         self.partial_part_indices.clear();
         self.latest_text_part_index = None;
-        self.response_seen_assistant_activity = false;
         self.queue_op(BackendOp::Submit { submission });
     }
 
@@ -883,7 +966,6 @@ impl AppState {
             return;
         };
 
-        self.ignore_done_until_tick = self.tick.saturating_add(2);
         self.start_submission(submission, message);
     }
 
@@ -891,6 +973,118 @@ impl AppState {
         self.active_session
             .as_ref()
             .map(|session| session.id.clone())
+    }
+
+    fn message_identity(
+        message: &ocpncord_backend::Message,
+    ) -> (&str, &str, ocpncord_backend::MessageRole) {
+        match message {
+            ocpncord_backend::Message::User(message) => {
+                (&message.id, &message.session_id, message.role.clone())
+            }
+            ocpncord_backend::Message::Assistant(message) => {
+                (&message.id, &message.session_id, message.role.clone())
+            }
+        }
+    }
+
+    fn active_session_matches(&self, session_id: &str) -> bool {
+        self.active_session.as_ref().map(|s| s.id.as_str()) == Some(session_id)
+    }
+
+    fn find_message_index(&self, message_id: &str) -> Option<usize> {
+        self.messages
+            .iter()
+            .position(|message| message.id.as_deref() == Some(message_id))
+    }
+
+    fn attach_id_to_optimistic_user_message(&mut self, message_id: &str, session_id: &str) -> bool {
+        let Some(index) = self.messages.iter().position(|message| {
+            message.id.is_none() && matches!(message.role, ocpncord_backend::MessageRole::User)
+        }) else {
+            return false;
+        };
+
+        self.messages[index].id = Some(message_id.to_owned());
+        self.messages[index].session_id = Some(session_id.to_owned());
+        true
+    }
+
+    fn upsert_assistant_message_from_partial(&mut self, message_id: &str, session_id: &str) {
+        let parts = core::mem::take(&mut self.partial_parts);
+        if let Some(index) = self.find_message_index(message_id) {
+            self.messages[index].session_id = Some(session_id.to_owned());
+            self.messages[index].role = ocpncord_backend::MessageRole::Assistant;
+            if !parts.is_empty() {
+                self.messages[index].parts = parts;
+            }
+            return;
+        }
+
+        self.messages.push(LoadedMessage {
+            id: Some(message_id.to_owned()),
+            session_id: Some(session_id.to_owned()),
+            role: ocpncord_backend::MessageRole::Assistant,
+            parts,
+        });
+    }
+
+    fn finish_streaming_response(&mut self, message_id: Option<&str>, session_id: Option<&str>) {
+        let was_streaming = self.is_streaming;
+        if let (Some(message_id), Some(session_id)) = (message_id, session_id) {
+            self.upsert_assistant_message_from_partial(message_id, session_id);
+        } else if !self.partial_parts.is_empty() {
+            let parts = core::mem::take(&mut self.partial_parts);
+            self.messages.push(LoadedMessage {
+                id: None,
+                session_id: self.active_session_id(),
+                role: ocpncord_backend::MessageRole::Assistant,
+                parts,
+            });
+        }
+
+        self.is_streaming = false;
+        self.active_submission = None;
+        self.partial_parts.clear();
+        self.partial_texts.clear();
+        self.partial_part_indices.clear();
+        self.latest_text_part_index = None;
+
+        if was_streaming {
+            self.dispatch_next_queued_submission();
+        }
+    }
+
+    fn apply_message_updated(&mut self, session_id: String, message: ocpncord_backend::Message) {
+        if !self.active_session_matches(&session_id) {
+            return;
+        }
+
+        let (message_id, message_session_id, role) = Self::message_identity(&message);
+        let message_id = message_id.to_owned();
+        let message_session_id = message_session_id.to_owned();
+
+        match role {
+            ocpncord_backend::MessageRole::User => {
+                if let Some(index) = self.find_message_index(&message_id) {
+                    self.messages[index].session_id = Some(message_session_id.clone());
+                    self.messages[index].role = ocpncord_backend::MessageRole::User;
+                } else {
+                    self.attach_id_to_optimistic_user_message(&message_id, &message_session_id);
+                }
+            }
+            ocpncord_backend::MessageRole::Assistant => {
+                self.finish_streaming_response(Some(&message_id), Some(&message_session_id));
+            }
+        }
+    }
+
+    fn apply_message_removed(&mut self, session_id: String, message_id: String) {
+        if !self.active_session_matches(&session_id) {
+            return;
+        }
+        self.messages
+            .retain(|message| message.id.as_deref() != Some(message_id.as_str()));
     }
 
     fn open_permission_modal_if_idle(&mut self) -> bool {
@@ -1077,34 +1271,13 @@ impl AppState {
                     }
                 }
             }
-            Event::Backend(event) => {
+            Event::Backend(event) =>
+            {
                 #[allow(unreachable_patterns)]
                 match event {
                     ocpncord_backend::BackendEvent::Part { part, delta: _ } => {
                         self.mark_response_active();
-                        self.response_seen_assistant_activity = true;
                         self.merge_stream_part(part);
-                    }
-                    ocpncord_backend::BackendEvent::Done => {
-                        if self.tick >= self.ignore_done_until_tick
-                            && self.response_seen_assistant_activity
-                        {
-                            let was_streaming = self.is_streaming;
-                            self.is_streaming = false;
-                            self.active_submission = None;
-                            self.partial_texts.clear();
-                            self.partial_part_indices.clear();
-                            self.latest_text_part_index = None;
-
-                            if let Some(ref session) = self.active_session.clone() {
-                                self.queue_op(BackendOp::ReloadMessages {
-                                    session_id: session.id.clone(),
-                                    dispatch_next: was_streaming,
-                                });
-                            } else if was_streaming {
-                                self.dispatch_next_queued_submission();
-                            }
-                        }
                     }
                     ocpncord_backend::BackendEvent::Error { message } => {
                         self.error = Some(message);
@@ -1115,7 +1288,6 @@ impl AppState {
                         self.partial_texts.clear();
                         self.partial_part_indices.clear();
                         self.latest_text_part_index = None;
-                        self.response_seen_assistant_activity = false;
                         self.dispatch_next_queued_submission();
                     }
                     ocpncord_backend::BackendEvent::SessionCreated { session } => {
@@ -1149,13 +1321,16 @@ impl AppState {
                     }
                     ocpncord_backend::BackendEvent::SessionDiff { .. } => {}
                     ocpncord_backend::BackendEvent::SessionCompacted { .. } => {}
-                    ocpncord_backend::BackendEvent::MessageUpdated { .. } => {
-                        // MessageUpdated is a persistence/status notification.
-                        // The visible stream is built from part events, and
-                        // Done performs the REST fallback for committed
-                        // messages. Flushing here duplicates replayed parts.
+                    ocpncord_backend::BackendEvent::MessageUpdated {
+                        session_id,
+                        message,
+                    } => {
+                        self.apply_message_updated(session_id, message);
                     }
-                    ocpncord_backend::BackendEvent::MessageRemoved { .. } => {}
+                    ocpncord_backend::BackendEvent::MessageRemoved {
+                        session_id,
+                        message_id,
+                    } => self.apply_message_removed(session_id, message_id),
                     ocpncord_backend::BackendEvent::MessagePartUpdated {
                         session_id,
                         ref part,
@@ -1164,9 +1339,6 @@ impl AppState {
                             == Some(session_id.as_str())
                         {
                             self.mark_response_active();
-                            if !self.is_echoed_user_text(part) {
-                                self.response_seen_assistant_activity = true;
-                            }
                             self.merge_stream_part(part.clone());
                         }
                     }
@@ -1181,11 +1353,18 @@ impl AppState {
                             == Some(session_id.as_str()) =>
                     {
                         self.mark_response_active();
-                        self.response_seen_assistant_activity = true;
                         self.merge_stream_delta(part_id, delta);
                     }
                     ocpncord_backend::BackendEvent::MessagePartDelta { .. } => {}
-                    ocpncord_backend::BackendEvent::MessagePartRemoved { .. } => {}
+                    ocpncord_backend::BackendEvent::MessagePartRemoved {
+                        session_id,
+                        part_id,
+                        ..
+                    } => {
+                        if self.active_session_matches(&session_id) {
+                            self.remove_stream_part(&part_id);
+                        }
+                    }
                     ocpncord_backend::BackendEvent::PermissionAsked { request } => {
                         self.pending_permissions.push_back(request);
                         self.open_next_blocking_modal_if_idle();
@@ -1393,6 +1572,9 @@ impl AppState {
                 if let Some(action) = self.key_chord.tick(self.tick) {
                     return self.apply_action(Some(action));
                 }
+                if self.live_reconnect_due() {
+                    self.queue_live_resubscribe();
+                }
             }
             Event::Quit => return false,
         }
@@ -1583,7 +1765,6 @@ impl AppState {
         self.partial_texts.clear();
         self.partial_part_indices.clear();
         self.latest_text_part_index = None;
-        self.response_seen_assistant_activity = false;
         self.active_submission = None;
         self.queued_submissions.clear();
         self.queued_messages.clear();
@@ -1780,7 +1961,6 @@ impl AppState {
                 self.partial_texts.clear();
                 self.partial_part_indices.clear();
                 self.latest_text_part_index = None;
-                self.response_seen_assistant_activity = false;
                 self.active_submission = None;
                 self.dispatch_next_queued_submission();
             }
@@ -1822,22 +2002,6 @@ impl AppState {
             Err(e) => {
                 self.error = Some(alloc::format!("{}", e));
             }
-        }
-    }
-
-    fn handle_reload_messages(
-        &mut self,
-        dispatch_next: bool,
-        result: ocpncord_backend::Result<Vec<LoadedMessage>>,
-    ) {
-        if let Ok(api_messages) = result {
-            if !api_messages.is_empty() && api_messages.len() >= self.messages.len() {
-                self.messages = api_messages;
-                self.partial_parts.clear();
-            }
-        }
-        if dispatch_next {
-            self.dispatch_next_queued_submission();
         }
     }
 
@@ -2133,6 +2297,32 @@ impl AppState {
         set_stream_text(&mut self.partial_parts[index], text, kind);
         self.partial_part_indices.insert(part_id, index);
         self.latest_text_part_index = Some(index);
+    }
+
+    fn remove_stream_part(&mut self, part_id: &str) {
+        self.partial_texts.remove(part_id);
+        let Some(index) = self.partial_part_indices.remove(part_id) else {
+            return;
+        };
+        if index >= self.partial_parts.len() {
+            return;
+        }
+
+        self.partial_parts.remove(index);
+        for value in self.partial_part_indices.values_mut() {
+            if *value > index {
+                *value -= 1;
+            }
+        }
+        self.latest_text_part_index = self.latest_text_part_index.and_then(|latest| {
+            if latest == index {
+                None
+            } else if latest > index {
+                Some(latest - 1)
+            } else {
+                Some(latest)
+            }
+        });
     }
 
     fn is_echoed_user_text(&self, part: &ocpncord_backend::Part) -> bool {
@@ -2522,7 +2712,7 @@ impl AppState {
 
 enum DriverEvent {
     Platform(Event),
-    Live(Option<ocpncord_backend::Result<BackendEvent>>),
+    Live(Option<ocpncord_backend::Result<EventEnvelope>>),
     Operation,
     PlatformClosed,
 }
@@ -2535,6 +2725,8 @@ fn loaded_messages_from_details(
     details
         .into_iter()
         .map(|detail| LoadedMessage {
+            id: Some(detail.info.id),
+            session_id: Some(detail.info.session_id),
             role: detail.info.role,
             parts: detail.parts,
         })
@@ -2562,8 +2754,9 @@ fn backend_op_future_from_ptr<'a, B: Backend + 'a>(
 async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> BackendOpResult<B> {
     match op {
         BackendOp::LoadAgents => BackendOpResult::Agents(backend.list_agents().await),
-        BackendOp::Subscribe { subscription } => {
-            BackendOpResult::Subscribe(backend.subscribe_events(&subscription).await)
+        BackendOp::Subscribe => BackendOpResult::Subscribe(backend.subscribe_live().await),
+        BackendOp::SyncHistory { request } => {
+            BackendOpResult::SyncHistory(backend.sync_history(&request).await)
         }
         BackendOp::CreateSession {
             title,
@@ -2595,16 +2788,6 @@ async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> Backe
                 }
             };
             BackendOpResult::Submit { submission, result }
-        }
-        BackendOp::ReloadMessages {
-            session_id,
-            dispatch_next,
-        } => {
-            let result = load_messages(backend, &session_id).await;
-            BackendOpResult::ReloadMessages {
-                dispatch_next,
-                result,
-            }
         }
         BackendOp::ListSessions => BackendOpResult::ListSessions(backend.list_sessions().await),
         BackendOp::LoadSession { session_id } => {
@@ -2769,16 +2952,13 @@ where
                 Ok(stream) => *live_events = Some(stream),
                 Err(e) => state.error = Some(alloc::format!("{}", e)),
             },
+            BackendOpResult::SyncHistory(result) => state.handle_sync_history_result(result),
             BackendOpResult::CreateSession { purpose, result } => {
                 state.handle_create_session_result(purpose, result)
             }
             BackendOpResult::Submit { submission, result } => {
                 state.handle_submit_result::<B>(submission, result);
             }
-            BackendOpResult::ReloadMessages {
-                dispatch_next,
-                result,
-            } => state.handle_reload_messages(dispatch_next, result),
             BackendOpResult::ListSessions(result) => state.handle_list_sessions(result),
             BackendOpResult::LoadSession { result } => state.handle_load_session(result),
             BackendOpResult::DeleteSession(result) => state.handle_delete_session(result),
@@ -2861,15 +3041,17 @@ where
 
             let running = match event {
                 DriverEvent::Platform(event) => state.handle_event(event),
-                DriverEvent::Live(Some(Ok(event))) => state.handle_event(Event::Backend(event)),
+                DriverEvent::Live(Some(Ok(envelope))) => state.apply_live_envelope(envelope),
                 DriverEvent::Live(Some(Err(error))) => {
                     *live_events = None;
+                    state.schedule_live_reconnect();
                     state.handle_event(Event::Backend(BackendEvent::Error {
                         message: alloc::format!("{error}"),
                     }))
                 }
                 DriverEvent::Live(None) => {
                     *live_events = None;
+                    state.schedule_live_reconnect();
                     true
                 }
                 DriverEvent::Operation => true,
@@ -2908,7 +3090,7 @@ mod tests {
     }
 
     impl Backend for PendingStartupBackend {
-        type EventStream = futures::stream::Pending<BackendResult<BackendEvent>>;
+        type EventStream = futures::stream::Pending<BackendResult<EventEnvelope>>;
 
         async fn health(&mut self) -> BackendResult<ocpncord_backend::Health> {
             Err(pending_backend_error())
@@ -3018,17 +3200,14 @@ mod tests {
             Err(pending_backend_error())
         }
 
-        async fn subscribe_events(
-            &mut self,
-            _subscription: &ocpncord_backend::EventSubscription,
-        ) -> BackendResult<Self::EventStream> {
+        async fn subscribe_live(&mut self) -> BackendResult<Self::EventStream> {
             Err(pending_backend_error())
         }
 
         async fn sync_history(
             &mut self,
             _request: &ocpncord_backend::SyncHistoryRequest,
-        ) -> BackendResult<Vec<BackendEvent>> {
+        ) -> BackendResult<ocpncord_backend::SyncHistoryBatch> {
             Err(pending_backend_error())
         }
 
@@ -3108,6 +3287,43 @@ mod tests {
         )
     }
 
+    fn live_event(event: BackendEvent) -> BackendResult<EventEnvelope> {
+        Ok(EventEnvelope::new(event))
+    }
+
+    fn sync_envelope(event: BackendEvent, aggregate_id: &str, seq: u64) -> EventEnvelope {
+        EventEnvelope {
+            event,
+            scope: EventScope::default(),
+            cursor: Some(ocpncord_backend::EventCursor {
+                event_id: Some(format!("evt-{seq}")),
+                aggregate_id: Some(aggregate_id.into()),
+                seq: Some(seq),
+            }),
+        }
+    }
+
+    fn assistant_message_updated(session_id: &str, message_id: &str) -> BackendEvent {
+        BackendEvent::MessageUpdated {
+            session_id: session_id.into(),
+            message: ocpncord_backend::Message::Assistant(ocpncord_backend::AssistantMessage {
+                id: message_id.into(),
+                session_id: session_id.into(),
+                role: ocpncord_backend::MessageRole::Assistant,
+                time: ocpncord_backend::MessageTime {
+                    created: 0,
+                    completed: Some(1),
+                },
+                parent_id: None,
+                model_id: "mock/model".into(),
+                provider_id: "mock".into(),
+                mode: "default".into(),
+                agent: "build".into(),
+                cost: 0.0,
+            }),
+        }
+    }
+
     fn run<B: Backend>(app: &mut TestApp<B>, event: Event) -> bool {
         let running = app.state.handle_event(event);
         futures::executor::block_on(app.drain_backend_ops_for_test());
@@ -3130,7 +3346,7 @@ mod tests {
             if event.is_none() {
                 app.live_events = None;
             }
-            event
+            event.map(|result| result.map(|envelope| envelope.event))
         })
     }
 
@@ -3516,7 +3732,7 @@ mod tests {
     #[test]
     fn run_handles_live_events_from_subscribe() {
         let mut backend = MockBackend::default();
-        backend.live_events = vec![Ok(ocpncord_backend::BackendEvent::SessionCreated {
+        backend.live_events = vec![live_event(ocpncord_backend::BackendEvent::SessionCreated {
             session: make_session("session-from-background", "Background"),
         })];
         let events = futures::stream::iter(vec![Event::Tick, Event::Quit]);
@@ -3536,7 +3752,7 @@ mod tests {
     fn run_keeps_platform_events_responsive_while_live_stream_is_active() {
         let mut backend = MockBackend::default();
         backend.live_event_stream_pending_polls = 2;
-        backend.live_events = vec![Ok(ocpncord_backend::BackendEvent::Part {
+        backend.live_events = vec![live_event(ocpncord_backend::BackendEvent::Part {
             part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
                 text: "assistant".into(),
             }),
@@ -3583,13 +3799,16 @@ mod tests {
     fn send_message_starts_stream_and_accumulates_parts() {
         let mut backend = MockBackend::default();
         backend.live_events = vec![
-            Ok(ocpncord_backend::BackendEvent::Part {
+            live_event(ocpncord_backend::BackendEvent::Part {
                 part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
                     text: "Hello".into(),
                 }),
                 delta: None,
             }),
-            Ok(ocpncord_backend::BackendEvent::Done),
+            live_event(assistant_message_updated(
+                "mock-session-id",
+                "msg-assistant-1",
+            )),
         ];
         let mut app = new_app(backend);
         init(&mut app);
@@ -3607,21 +3826,133 @@ mod tests {
         assert_eq!(app.state.partial_parts().len(), 1);
 
         let event = next_live_event(&mut app)
-            .expect("prompt stream should yield Done")
-            .expect("Done event should not error");
+            .expect("prompt stream should yield assistant MessageUpdated")
+            .expect("MessageUpdated event should not error");
         run(&mut app, Event::Backend(event));
         assert!(!app.state.is_streaming());
-        // Done no longer flushes partial_parts to messages; the REST API
-        // fallback populates messages when the server has persisted them.
         assert_eq!(
             app.state.messages().len(),
-            1,
-            "only user msg (no flush on Done)"
+            2,
+            "user and assistant messages should be visible after finalization"
         );
         assert_eq!(
             app.state.partial_parts().len(),
-            1,
-            "content stays in partial_parts for rendering"
+            0,
+            "finalized content moves out of partial_parts"
+        );
+    }
+
+    #[test]
+    fn sync_history_replay_finalizes_transcript_and_tracks_cursor() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+        app.state.active_session = Some(make_session("mock-session-id", "Mock"));
+        app.state.is_streaming = true;
+
+        let batch = ocpncord_backend::SyncHistoryBatch {
+            envelopes: vec![
+                sync_envelope(
+                    ocpncord_backend::BackendEvent::MessagePartUpdated {
+                        session_id: "mock-session-id".into(),
+                        part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                            text: "from catch-up".into(),
+                        }),
+                    },
+                    "mock-session-id",
+                    1,
+                ),
+                sync_envelope(
+                    assistant_message_updated("mock-session-id", "msg-assistant-1"),
+                    "mock-session-id",
+                    2,
+                ),
+            ],
+            known_sequences: BTreeMap::new(),
+        };
+
+        app.state.handle_sync_history_result(Ok(batch));
+
+        assert!(!app.state.is_streaming());
+        assert_eq!(app.state.messages().len(), 1);
+        assert_eq!(
+            app.state.sync_known_sequences.get("mock-session-id"),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn message_removed_deletes_loaded_transcript_entry() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+        app.state.active_session = Some(make_session("mock-session-id", "Mock"));
+        app.state.messages.push(LoadedMessage {
+            id: Some("msg-1".into()),
+            session_id: Some("mock-session-id".into()),
+            role: ocpncord_backend::MessageRole::Assistant,
+            parts: vec![ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                text: "remove me".into(),
+            })],
+        });
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::MessageRemoved {
+                session_id: "mock-session-id".into(),
+                message_id: "msg-1".into(),
+            }),
+        );
+
+        assert!(app.state.messages().is_empty());
+    }
+
+    #[test]
+    fn message_part_removed_deletes_partial_delta_part() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+        app.state.active_session = Some(make_session("mock-session-id", "Mock"));
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::MessagePartDelta {
+                session_id: "mock-session-id".into(),
+                message_id: "msg-1".into(),
+                part_id: "part-1".into(),
+                field: "text".into(),
+                delta: "temporary".into(),
+            }),
+        );
+        assert_eq!(app.state.partial_parts().len(), 1);
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::MessagePartRemoved {
+                session_id: "mock-session-id".into(),
+                message_id: "msg-1".into(),
+                part_id: "part-1".into(),
+            }),
+        );
+
+        assert!(app.state.partial_parts().is_empty());
+    }
+
+    #[test]
+    fn live_stream_close_schedules_sync_history_reconnect() {
+        let backend = MockBackend::default();
+        let events = futures::stream::iter(vec![
+            Event::Tick,
+            Event::Tick,
+            Event::Tick,
+            Event::Tick,
+            Event::Tick,
+            Event::Quit,
+        ]);
+        let mut app = new_app_with_events(backend, events);
+
+        futures::executor::block_on(app.run());
+
+        assert!(
+            app.backend().sync_history_requests.len() >= 2,
+            "startup catch-up plus reconnect catch-up should be requested"
         );
     }
 
@@ -3805,7 +4136,10 @@ mod tests {
 
         run(
             &mut app,
-            Event::Backend(ocpncord_backend::BackendEvent::Done),
+            Event::Backend(assistant_message_updated(
+                "mock-session-id",
+                "msg-assistant-1",
+            )),
         );
 
         assert_eq!(app.backend().prompt_calls.len(), 2);
@@ -3814,7 +4148,7 @@ mod tests {
     }
 
     #[test]
-    fn response_indicator_survives_early_done_for_late_sse_parts() {
+    fn response_indicator_survives_while_waiting_for_assistant_finalization() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
 
@@ -3823,10 +4157,6 @@ mod tests {
         run(&mut app, enter_key());
         assert!(app.state.is_streaming());
 
-        run(
-            &mut app,
-            Event::Backend(ocpncord_backend::BackendEvent::Done),
-        );
         assert!(app.state.is_streaming());
 
         let test_backend = TestBackend::new(80, 8);
@@ -3856,15 +4186,17 @@ mod tests {
 
         run(
             &mut app,
-            Event::Backend(ocpncord_backend::BackendEvent::Done),
+            Event::Backend(assistant_message_updated(
+                "mock-session-id",
+                "msg-assistant-1",
+            )),
         );
 
         assert!(
-            app.backend().prompt_calls.len() == 1,
-            "early Done without assistant activity must not dispatch queued prompt"
+            app.backend().prompt_calls.len() == 2,
+            "assistant finalization should dispatch queued prompt"
         );
-        assert_eq!(app.state.queued_submissions()[0].text, "second");
-        assert!(app.state.is_streaming());
+        assert_eq!(app.backend().prompt_calls[1].text, "second");
     }
 
     #[test]
@@ -3894,7 +4226,7 @@ mod tests {
         );
     }
 
-    /// Test that the real SSE event path (MessagePartUpdated + Done) works.
+    /// Test that the real SSE event path (MessagePartUpdated + MessageUpdated) works.
     /// The SSE background task emits MessagePartUpdated (not Part), which
     /// requires is_streaming to be true.
     #[test]
@@ -3924,21 +4256,24 @@ mod tests {
             "MessagePartUpdated should push to partial_parts"
         );
 
-        // Simulate SSE: Done
+        // Simulate SSE: assistant message finalized
         run(
             &mut app,
-            Event::Backend(ocpncord_backend::BackendEvent::Done),
+            Event::Backend(assistant_message_updated(
+                "mock-session-id",
+                "msg-assistant-1",
+            )),
         );
         assert!(!app.state.is_streaming());
         assert_eq!(
             app.state.messages().len(),
-            1,
-            "only user msg (no flush on Done)"
+            2,
+            "user and assistant messages should be visible after finalization"
         );
         assert_eq!(
             app.state.partial_parts().len(),
-            1,
-            "content stays in partial_parts for rendering"
+            0,
+            "finalized content moves out of partial_parts"
         );
     }
 
@@ -4115,18 +4450,21 @@ mod tests {
         // Finalize
         run(
             &mut app,
-            Event::Backend(ocpncord_backend::BackendEvent::Done),
+            Event::Backend(assistant_message_updated(
+                "mock-session-id",
+                "msg-assistant-1",
+            )),
         );
         assert!(!app.state.is_streaming());
         assert_eq!(
             app.state.messages().len(),
-            1,
-            "only user msg (no flush on Done)"
+            2,
+            "user and assistant messages should be visible after finalization"
         );
         assert_eq!(
             app.state.partial_parts().len(),
-            1,
-            "content stays in partial_parts for rendering"
+            0,
+            "finalized content moves out of partial_parts"
         );
     }
 
@@ -4219,7 +4557,7 @@ mod tests {
     #[test]
     fn backend_error_during_stream_shows_error_and_clears_stream() {
         let mut backend = MockBackend::default();
-        backend.live_events = vec![Ok(ocpncord_backend::BackendEvent::Error {
+        backend.live_events = vec![live_event(ocpncord_backend::BackendEvent::Error {
             message: "connection lost".into(),
         })];
         let mut app = new_app(backend);
@@ -4465,7 +4803,10 @@ mod tests {
     #[test]
     fn unknown_slash_command_submits_as_message() {
         let mut backend = MockBackend::default();
-        backend.live_events = vec![Ok(ocpncord_backend::BackendEvent::Done)];
+        backend.live_events = vec![live_event(assistant_message_updated(
+            "mock-session-id",
+            "msg-assistant-1",
+        ))];
         let mut app = new_app(backend);
         init(&mut app);
 
@@ -4503,7 +4844,10 @@ mod tests {
         // Complete the stream so input is accepted again
         run(
             &mut app,
-            Event::Backend(ocpncord_backend::BackendEvent::Done),
+            Event::Backend(assistant_message_updated(
+                "mock-session-id",
+                "msg-assistant-1",
+            )),
         );
 
         let session_count_before = app.backend().sessions.len();
@@ -5229,13 +5573,16 @@ mod tests {
     fn ctrl_c_during_streaming_interrupts_not_quits() {
         let mut backend = MockBackend::default();
         backend.live_events = vec![
-            Ok(ocpncord_backend::BackendEvent::Part {
+            live_event(ocpncord_backend::BackendEvent::Part {
                 part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
                     text: "streaming".into(),
                 }),
                 delta: None,
             }),
-            Ok(ocpncord_backend::BackendEvent::Done),
+            live_event(assistant_message_updated(
+                "mock-session-id",
+                "msg-assistant-1",
+            )),
         ];
         let mut app = new_app(backend);
         init(&mut app);

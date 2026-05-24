@@ -14,7 +14,7 @@ Add agent awareness to the TUI so that users can switch between primary agents (
   - Build → green (`theme.agent_indicator` with green tint)
   - Plan → yellow/orange tint
   - Custom agents → default `theme.agent_indicator` colour
-- **Agent sent with prompt**: When `Backend::prompt()` is called, the active agent name is passed as the `agent` parameter (the Backend trait already supports this). The model is not overridden — the agent's default model from the server config is used.
+- **Agent sent with prompt**: When `Backend::submit_prompt()` or `Backend::submit_command()` is called, the active agent name is passed as the `agent` parameter. The model is not overridden — the agent's default model from the server config is used.
 - **Agent list as a data dependency**: If `list_agents()` fails on startup, the TUI defaults to a hardcoded list `["build", "plan"]` and continues. A warning is logged but no error is shown to the user.
 - **Display fallback**: If no agents are returned (empty list), the indicator shows "build" as a sensible default.
 
@@ -23,12 +23,12 @@ Add agent awareness to the TUI so that users can switch between primary agents (
 - [ ] `Backend::list_agents()` is called on startup; primary agents are stored in App state
 - [ ] Tab cycles through primary agents forward, Shift+Tab cycles backward
 - [ ] Active agent name is displayed in the PromptBar indicator on both StartPage and Chat
-- [ ] Agent name is passed to `Backend::prompt()` when sending a message
+- [ ] Agent name is passed to `Backend::submit_prompt()` when sending a message
 - [ ] If `list_agents()` fails, defaults to `["build", "plan"]` with a warning only
 - [ ] If agent list is empty, indicator shows "build"
 - [ ] `cargo test -p ocpncord-tui` passes with tests for:
   - Agent cycling logic
-  - Agent parameter passed through to prompt()
+  - Agent parameter passed through to `submit_prompt()`
   - MockBackend returns agent list, TUI uses it
   - Failure fallback behaviour
 

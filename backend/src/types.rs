@@ -474,34 +474,66 @@ pub struct SubmissionReceipt {
     pub parts: Vec<Part>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EventSubscription {
-    Global,
-    Instance {
-        directory: Option<String>,
-        workspace: Option<String>,
-    },
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventScope {
+    pub directory: Option<String>,
+    pub workspace: Option<String>,
+    pub project: Option<String>,
 }
 
-impl Default for EventSubscription {
-    fn default() -> Self {
-        Self::Global
+impl EventScope {
+    pub fn instance(directory: Option<String>, workspace: Option<String>) -> Self {
+        Self {
+            directory,
+            workspace,
+            project: None,
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventCursor {
+    pub event_id: Option<String>,
+    pub aggregate_id: Option<String>,
+    pub seq: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EventEnvelope {
+    pub event: crate::BackendEvent,
+    pub scope: EventScope,
+    pub cursor: Option<EventCursor>,
+}
+
+impl EventEnvelope {
+    pub fn new(event: crate::BackendEvent) -> Self {
+        Self {
+            event,
+            scope: EventScope::default(),
+            cursor: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SyncHistoryRequest {
-    pub subscription: EventSubscription,
+    pub scope: EventScope,
     pub known_sequences: BTreeMap<String, u64>,
 }
 
 impl Default for SyncHistoryRequest {
     fn default() -> Self {
         Self {
-            subscription: EventSubscription::Global,
+            scope: EventScope::default(),
             known_sequences: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SyncHistoryBatch {
+    pub envelopes: Vec<EventEnvelope>,
+    pub known_sequences: BTreeMap<String, u64>,
 }
 
 // --- Request body types ---

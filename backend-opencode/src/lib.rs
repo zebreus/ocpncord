@@ -113,29 +113,13 @@ fn append_instance_scope_query(
     }
 }
 
-fn event_subscription_url(base_url: &str, subscription: &EventSubscription) -> String {
-    match subscription {
-        EventSubscription::Global => alloc::format!("{base_url}/global/event"),
-        EventSubscription::Instance {
-            directory,
-            workspace,
-        } => {
-            let mut url = alloc::format!("{base_url}/event");
-            append_instance_scope_query(&mut url, directory, workspace);
-            url
-        }
-    }
+fn global_event_url(base_url: &str) -> String {
+    alloc::format!("{base_url}/global/event")
 }
 
-fn sync_history_url(base_url: &str, subscription: &EventSubscription) -> String {
+fn sync_history_url(base_url: &str, scope: &EventScope) -> String {
     let mut url = alloc::format!("{base_url}/sync/history");
-    if let EventSubscription::Instance {
-        directory,
-        workspace,
-    } = subscription
-    {
-        append_instance_scope_query(&mut url, directory, workspace);
-    }
+    append_instance_scope_query(&mut url, &scope.directory, &scope.workspace);
     url
 }
 
@@ -195,19 +179,33 @@ fn parse_submission_receipt(body: &[u8]) -> Result<SubmissionReceipt> {
     serde_json::from_slice(body).map_err(parse_err)
 }
 
-fn parse_sync_history(body: &[u8]) -> Result<Vec<BackendEvent>> {
+fn parse_sync_history(body: &[u8], scope: &EventScope) -> Result<SyncHistoryBatch> {
     let records: Vec<serde_json::Value> = serde_json::from_slice(body).map_err(parse_err)?;
-    let mut events = Vec::new();
+    let mut batch = SyncHistoryBatch::default();
 
     for record in records {
         match stream::parse_sync_history_record(&record) {
-            Some(Ok(event)) => events.push(event),
+            Some(Ok(mut envelope)) => {
+                if envelope.scope == EventScope::default() {
+                    envelope.scope = scope.clone();
+                }
+                if let Some(cursor) = &envelope.cursor {
+                    if let (Some(aggregate_id), Some(seq)) = (&cursor.aggregate_id, cursor.seq) {
+                        let entry = batch
+                            .known_sequences
+                            .entry(aggregate_id.clone())
+                            .or_insert(0);
+                        *entry = (*entry).max(seq);
+                    }
+                }
+                batch.envelopes.push(envelope);
+            }
             Some(Err(error)) => return Err(error),
             None => {}
         }
     }
 
-    Ok(events)
+    Ok(batch)
 }
 
 // --- Helper: send + check status + return body (blocking within the async fn) ---
@@ -478,21 +476,18 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
-    async fn subscribe_events(
-        &mut self,
-        subscription: &EventSubscription,
-    ) -> Result<Self::EventStream> {
-        let url = event_subscription_url(&self.base_url, subscription);
+    async fn subscribe_live(&mut self) -> Result<Self::EventStream> {
+        let url = global_event_url(&self.base_url);
         Ok(incremental_sse_stream(self.transport, self.dns, url))
     }
 
-    async fn sync_history(&mut self, request: &SyncHistoryRequest) -> Result<Vec<BackendEvent>> {
-        let url = sync_history_url(&self.base_url, &request.subscription);
+    async fn sync_history(&mut self, request: &SyncHistoryRequest) -> Result<SyncHistoryBatch> {
+        let url = sync_history_url(&self.base_url, &request.scope);
         let json = serde_json::to_string(&request.known_sequences).map_err(parse_err)?;
         let body = self
             .send_get_body(Method::POST, &url, Some(json.as_bytes()))
             .await?;
-        parse_sync_history(&body)
+        parse_sync_history(&body, &request.scope)
     }
 
     async fn get_config(&mut self) -> Result<Config> {
@@ -1154,31 +1149,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_events_uses_instance_event_endpoint() {
+    async fn subscribe_live_uses_global_event_endpoint() {
         let (base_url, request_rx, release_tx) = spawn_capture_streaming_sse_server(
-            "data: {\"type\":\"server.connected\",\"properties\":{}}\n\n",
+            "data: {\"directory\":\"/tmp/project\",\"workspace\":\"wrk_1\",\"payload\":{\"type\":\"server.connected\",\"properties\":{}}}\n\n",
         )
         .await;
         let mut backend = backend(&base_url);
 
-        let mut stream = backend
-            .subscribe_events(&EventSubscription::Instance {
-                directory: Some("/tmp/project".into()),
-                workspace: Some("wrk_1".into()),
-            })
-            .await
-            .unwrap();
+        let mut stream = backend.subscribe_live().await.unwrap();
 
-        let event = timeout(Duration::from_millis(500), stream.next())
+        let envelope = timeout(Duration::from_millis(500), stream.next())
             .await
             .expect("stream should yield before the SSE connection closes")
             .expect("stream should produce an event")
             .expect("event should parse successfully");
 
-        assert!(matches!(event, BackendEvent::ServerConnected));
+        assert!(matches!(envelope.event, BackendEvent::ServerConnected));
+        assert_eq!(envelope.scope.directory.as_deref(), Some("/tmp/project"));
+        assert_eq!(envelope.scope.workspace.as_deref(), Some("wrk_1"));
 
         let request = request_rx.await.unwrap();
-        assert!(request.contains("GET /event?directory=%2Ftmp%2Fproject&workspace=wrk_1 HTTP/1.1"));
+        assert!(request.contains("GET /global/event HTTP/1.1"));
 
         let _ = release_tx.send(());
     }
@@ -1191,17 +1182,14 @@ mod tests {
         .await;
         let mut backend = backend(&base_url);
 
-        let mut stream = backend
-            .subscribe_events(&EventSubscription::Global)
-            .await
-            .unwrap();
-        let event = timeout(Duration::from_millis(500), stream.next())
+        let mut stream = backend.subscribe_live().await.unwrap();
+        let envelope = timeout(Duration::from_millis(500), stream.next())
             .await
             .expect("stream should yield before the SSE connection closes")
             .expect("stream should produce an event")
             .expect("event should parse successfully");
 
-        assert!(matches!(event, BackendEvent::ServerConnected));
+        assert!(matches!(envelope.event, BackendEvent::ServerConnected));
 
         let _ = release_tx.send(());
     }
@@ -1212,14 +1200,21 @@ mod tests {
         let (base_url, _) = spawn_capture_server(response_body).await;
         let mut backend = backend(&base_url);
 
-        let events = backend
+        let batch = backend
             .sync_history(&SyncHistoryRequest::default())
             .await
             .unwrap();
 
-        assert_eq!(events.len(), 2);
-        assert!(matches!(events[0], BackendEvent::MessagePartUpdated { .. }));
-        assert!(matches!(events[1], BackendEvent::Done));
+        assert_eq!(batch.envelopes.len(), 2);
+        assert!(matches!(
+            batch.envelopes[0].event,
+            BackendEvent::MessagePartUpdated { .. }
+        ));
+        assert!(matches!(
+            batch.envelopes[1].event,
+            BackendEvent::MessageUpdated { .. }
+        ));
+        assert_eq!(batch.known_sequences.get("ses1"), Some(&2));
     }
 
     #[tokio::test]
@@ -1227,10 +1222,7 @@ mod tests {
         let (base_url, request_rx) = spawn_capture_server("[]").await;
         let mut backend = backend(&base_url);
         let mut request = SyncHistoryRequest::default();
-        request.subscription = EventSubscription::Instance {
-            directory: Some("/tmp/project".into()),
-            workspace: Some("wrk_1".into()),
-        };
+        request.scope = EventScope::instance(Some("/tmp/project".into()), Some("wrk_1".into()));
 
         let _ = backend.sync_history(&request).await.unwrap();
 

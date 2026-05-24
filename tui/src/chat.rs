@@ -277,6 +277,8 @@ mod tests {
     fn renders_user_message() {
         let theme = Theme::default();
         let msgs = vec![LoadedMessage {
+            id: None,
+            session_id: None,
             role: MessageRole::User,
             parts: vec![Part::Text(TextPart {
                 text: "hello".into(),

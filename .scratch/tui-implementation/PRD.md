@@ -14,7 +14,7 @@ Without a TUI, the client is unusable. Users cannot see sessions, send prompts, 
 
 Build a full terminal UI matching the look, feel, and interaction model of the official opencode TUI (Go/Bubble Tea). The TUI connects to a remote `opencode serve` instance via the existing Backend trait. It runs on desktop (tokio + crossterm) today and can target embedded terminals via the existing `no_std`+`alloc` foundation.
 
-The architecture uses app-owned modes for the full-screen surfaces — **StartPage** (launch), **Chat** (primary interaction), and **Terminal** — with all other views as overlay **Modals** (sessions list, help, model picker, command palette). The **PromptBar** input widget supports live detection of `/` slash commands, `!` shell commands, and `@` file references. Agent switching via Tab cycles through primary agents listed from the server, with the active agent name shown in the PromptBar indicator. Streaming responses from `Backend::prompt()` render Parts in real-time as they arrive.
+The architecture uses app-owned modes for the full-screen surfaces — **StartPage** (launch), **Chat** (primary interaction), and **Terminal** — with all other views as overlay **Modals** (sessions list, help, model picker, command palette). The **PromptBar** input widget supports live detection of `/` slash commands, `!` shell commands, and `@` file references. Agent switching via Tab cycles through primary agents listed from the server, with the active agent name shown in the PromptBar indicator. Prompt and command submissions return receipts; streaming responses render from the live `/global/event` feed as Parts arrive.
 
 ## User Stories
 
@@ -121,7 +121,8 @@ Full-screen surfaces are app-owned **modes**, not separate Screen adapters. The 
 - **active_modal**: `Option<Box<dyn Modal>>`
 - **active_session**: `Option<Session>`
 - **messages**: `Vec<LoadedMessage>` — local copy of message+parts for the active session
-- **stream**: `Option<B::PromptStream>` — in-progress stream, if any
+- **live_events**: `Option<B::EventStream>` — global live event stream from `Backend::subscribe_live()`, if connected
+- **sync_known_sequences**: cursor map used for `/sync/history` catch-up after reconnects
 - **partial_parts**: `Vec<Part>` — parts being accumulated for the last (streaming) message
 - **agents**: `Vec<Agent>` — cached from `Backend::list_agents()`
 - **active_agent**: `usize` — index into agents (the current primary agent)
@@ -138,7 +139,7 @@ The native binary uses `tokio::select!` to multiplex three sources:
 loop {
     tokio::select! {
         input = read_crossterm_event()  -> Event::Key(translate(input)),
-        ev = stream.next()              -> Event::Backend(ev?),
+        ev = live_events.next()         -> Event::Backend(envelope.event),
         _ = tick(50ms)                  -> Event::Tick,
     }
     app.handle_event(event);
@@ -146,7 +147,7 @@ loop {
 }
 ```
 
-The `tui` crate receives `Event::Key`, `Event::Backend`, `Event::Tick` through a single `handle_event` method. No channels, no separate dispatch — the `Backend` trait's `Stream` is polled directly in the select.
+The `tui` crate receives `Event::Key`, `Event::Backend`, `Event::Tick` through a single `handle_event` method. The driver polls `Backend::EventStream` directly, filters `EventEnvelope` scope metadata, updates cursor state, and replays `sync_history()` batches on reconnect.
 
 The `Event` enum in `tui` gains:
 
@@ -188,17 +189,17 @@ The detection is character-level and updates the PromptBar's visual style accord
 
 ### Streaming Rendering
 
-When `Backend::prompt()` returns a `PromptStream`, the stream is stored in `App.stream`. On each `Event::Backend(BackendEvent::Part { part, delta })`, the `part` is appended to `App.partial_parts`. On `BackendEvent::Done`, the partial parts are committed into a final `LoadedMessage` and appended to `App.messages`, and the stream is set to `None`.
+`Backend::submit_prompt()`/`submit_command()` return immediate receipts. Live output arrives through `Backend::subscribe_live()` as `EventEnvelope`s from `/global/event`. `MessagePartUpdated`/`MessagePartDelta` update `App.partial_parts`; assistant `MessageUpdated` finalizes the partial parts into a `LoadedMessage`. `MessageRemoved` and `MessagePartRemoved` remove visible or partial transcript state where possible.
 
 The Chat mode render path in `App` reads `App.messages` (complete) and passes `App.partial_parts` into `chat.rs::render_chat()` if a stream is active. This keeps top-level mode layout in `App` while keeping transcript rendering encapsulated in `chat.rs`, and it ensures in-place updates to tool state transitions.
 
 ### Agent Selection
 
-The agent is selected via `Backend::list_agents()` on launch. Only `mode: "primary"` agents are shown for Tab cycling. The selected agent name is passed as the `agent` parameter to `Backend::prompt()` and `Backend::command()`. The active agent is displayed in the PromptBar.
+The agent is selected via `Backend::list_agents()` on launch. Only `mode: "primary"` agents are shown for Tab cycling. The selected agent name is passed as the `agent` parameter to `Backend::submit_prompt()` and `Backend::submit_command()`. The active agent is displayed in the PromptBar.
 
 ### Session Auto-Creation
 
-No mandatory session picker step. When the user sends the first message and `active_session` is `None`, `App` calls `Backend::create_session()` automatically before calling `prompt()`. The created session ID is stored and used for subsequent messages.
+No mandatory session picker step. When the user sends the first message and `active_session` is `None`, `App` calls `Backend::create_session()` automatically before calling `submit_prompt()`/`submit_command()`. The created session ID is stored and used for subsequent messages.
 
 ### Theme System
 
@@ -278,7 +279,7 @@ Slash input, command palette entries, key-chord commands, and `BackendEvent::Tui
 - **`PartRenderer`** — Pure function, easy to unit test. Feed every `Part` variant, assert the returned `Line`s have the expected styles and content. Cover all Tool states, edge cases (empty text, long step reason).
 - **`KeyChord`** — State machine, easy to unit test. Test: direct binding fires immediately, leader key enters waiting state, second key completes chord, timeout cancels leader, multiple leaders stack.
 - **`PromptBar`** — Unit test with simulated key events. Test: character insertion, backspace, enter, prefix detection (`/`, `!`, `@` at start-of-input changes mode), cursor movement, text extraction.
-- **`App`** — Integration-level tests using `MockBackend`. Test: session auto-creation on first message, stream event handling (Part → partial_parts, Done → commit), agent cycling, screen transition on send, modal open/close, error handling from Backend.
+- **`App`** — Integration-level tests using `MockBackend`. Test: session auto-creation on first message, stream event handling (part updates/deltas → partial_parts, assistant MessageUpdated → commit), agent cycling, screen transition on send, modal open/close, error handling from Backend.
 - **`Theme`** — Verify `Default` impl compiles and all fields have non-reset styles.
 
 ### Prior art
