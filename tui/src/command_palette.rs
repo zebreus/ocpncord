@@ -73,6 +73,12 @@ pub fn default_commands() -> Vec<PaletteCommand> {
             action: Action::ExecuteCommand("/server".into()),
         },
         PaletteCommand {
+            name: "Display",
+            slash_command: "/display",
+            keybinding: "",
+            action: Action::ExecuteCommand("/display".into()),
+        },
+        PaletteCommand {
             name: "Exit",
             slash_command: "/exit",
             keybinding: "Ctrl+X Q",
