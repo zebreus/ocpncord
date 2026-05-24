@@ -6,12 +6,12 @@ All `no_std` crates use `#![cfg_attr(not(test), no_std)]` + `extern crate alloc;
 
 ## Workspace
 
-| Crate | Dir | `no_std` | Role |
-|---|---|---|---|
-| `ocpncord-backend` | `backend/` | yes (`not(test)`) | `Backend` trait + event/error/mock + JSON contract types |
-| `ocpncord-backend-opencode` | `backend-opencode/` | yes | HTTP impl via reqwless + embedded-nal-async, generic over TCP transport |
-| `ocpncord-tui` | `tui/` | yes (`not(test)`) | Ratatui widgets, platform-agnostic key events |
-| `ocpncord-native` | `native/` | no | **Single binary** via `[[bin]]` (no `lib.rs`) — tokio + Crossterm |
+| Crate                       | Dir                 | `no_std`          | Role                                                                    |
+| --------------------------- | ------------------- | ----------------- | ----------------------------------------------------------------------- |
+| `ocpncord-backend`          | `backend/`          | yes (`not(test)`) | `Backend` trait + event/error/mock + JSON contract types                |
+| `ocpncord-backend-opencode` | `backend-opencode/` | yes               | HTTP impl via reqwless + embedded-nal-async, generic over TCP transport |
+| `ocpncord-tui`              | `tui/`              | yes (`not(test)`) | Ratatui widgets, platform-agnostic key events                           |
+| `ocpncord-native`           | `native/`           | no                | **Single binary** via `[[bin]]` (no `lib.rs`) — tokio + Crossterm       |
 
 TUI depends only on `Backend` trait (`ocpncord-backend`), never on `ocpncord-backend-opencode`. `tui` always enables `mock` feature on `ocpncord-backend` as a regular dep.
 
@@ -39,7 +39,7 @@ Before committing, always run `cargo fmt --all` and `cargo check`.
 ## Key facts
 
 - All serde types use `#[serde(rename_all = "camelCase")]` — JSON from the Agent API is camelCase.
-- `prompt()`/`command()` are fire-and-forget (HTTP returns immediately, response through SSE). `subscribe()` uses `BufferedStream` for SSE parsing.
+- `submit_prompt()` and `submit_command()` return immediate JSON receipts. Live assistant activity arrives on `subscribe_events()`, and `/sync/history` is the pull-style catch-up API.
 - `MockBackend` (feature `mock` on `ocpncord-backend`) returns canned data for TUI tests.
 - `App<B, E, T>` owns the backend, platform event stream, backend streams, and Ratatui terminal. Screens: `StartPage`, `Chat`, `Terminal` (PTY). PromptBar modes: `/` command, `!` shell, `@` fileref.
 - Key bindings (`tui/src/key_chord.rs`): `Ctrl+C` quit, `Ctrl+X` leader (40-tick timeout → Q/L/M/H/T/D/O), `Ctrl+P` palette, `D`/`O` both toggle side panel. `Esc` closes modal / interrupts streaming. `Tab`/`Shift+Tab` cycles agents.

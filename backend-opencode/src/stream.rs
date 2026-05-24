@@ -278,44 +278,9 @@ fn parse_json<'a, T: Deserialize<'a>>(data: &'a str) -> core::result::Result<T, 
     })
 }
 
-/// Parse a single SSE block into a `BackendEvent`.
-///
-/// The SSE `data:` field can contain one of three formats:
-///
-/// **Bus event (GlobalEvent) format** — emitted by `BusEvent`s (e.g. `message.part.delta`):
-/// ```json
-/// {"directory": "/path", "payload": {"type": "message.part.delta", "properties": {...}}}
-/// ```
-///
-/// **Wrapped wire payload format** — emitted with `type: "sync"` envelopes
-/// (e.g. `message.part.updated`, `session.created`):
-/// ```json
-/// {"directory": "/path", "payload": {"type": "sync", "syncEvent": {"type": "message.part.updated.1", "data": {...}}}}
-/// ```
-///
-/// **Flat (Event) format** — accepted for wire compatibility:
-/// ```json
-/// {"type": "message.part.updated", "properties": {...}}
-/// ```
-fn parse_sse_block(block: &[u8]) -> Option<Result<BackendEvent>> {
-    let text = core::str::from_utf8(block).ok()?;
-
-    let mut data = "";
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if let Some(value) = line.strip_prefix("data: ") {
-            data = value;
-        }
-    }
-
-    if data.is_empty() {
-        return None;
-    }
-
-    let value: serde_json::Value = parse_json::<serde_json::Value>(data).ok()?;
-
+fn parse_backend_event_value(value: &serde_json::Value) -> Option<Result<BackendEvent>> {
     // Try nested GlobalEvent format first; fall back to flat Event format.
-    let payload = value.get("payload").unwrap_or(&value);
+    let payload = value.get("payload").unwrap_or(value);
     let event_type = payload.get("type").and_then(|v| v.as_str())?;
 
     // Some server events arrive wrapped as { type: "sync", syncEvent: { type:
@@ -676,12 +641,59 @@ fn parse_sse_block(block: &[u8]) -> Option<Result<BackendEvent>> {
             }))
         }
         "session.created.1" | "session.updated.1" | "session.deleted.1" => {
-            // Wrapped session payloads carry the session object in `data.info`.
             parse_wrapped_session_event(event_type, props)
         }
 
         _ => None,
     }
+}
+
+pub(crate) fn parse_sync_history_record(value: &serde_json::Value) -> Option<Result<BackendEvent>> {
+    let mut wrapped = serde_json::Map::new();
+    wrapped.insert(
+        alloc::string::String::from("type"),
+        serde_json::Value::String(alloc::string::String::from("sync")),
+    );
+    wrapped.insert(alloc::string::String::from("syncEvent"), value.clone());
+    parse_backend_event_value(&serde_json::Value::Object(wrapped))
+}
+
+/// Parse a single SSE block into a `BackendEvent`.
+///
+/// The SSE `data:` field can contain one of three formats:
+///
+/// **Bus event (GlobalEvent) format** — emitted by `BusEvent`s (e.g. `message.part.delta`):
+/// ```json
+/// {"directory": "/path", "payload": {"type": "message.part.delta", "properties": {...}}}
+/// ```
+///
+/// **Wrapped wire payload format** — emitted with `type: "sync"` envelopes
+/// (e.g. `message.part.updated`, `session.created`):
+/// ```json
+/// {"directory": "/path", "payload": {"type": "sync", "syncEvent": {"type": "message.part.updated.1", "data": {...}}}}
+/// ```
+///
+/// **Flat (Event) format** — accepted for wire compatibility:
+/// ```json
+/// {"type": "message.part.updated", "properties": {...}}
+/// ```
+fn parse_sse_block(block: &[u8]) -> Option<Result<BackendEvent>> {
+    let text = core::str::from_utf8(block).ok()?;
+
+    let mut data = "";
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(value) = line.strip_prefix("data: ") {
+            data = value;
+        }
+    }
+
+    if data.is_empty() {
+        return None;
+    }
+
+    let value: serde_json::Value = parse_json::<serde_json::Value>(data).ok()?;
+    parse_backend_event_value(&value)
 }
 
 fn parse_wrapped_session_event(
@@ -1234,5 +1246,19 @@ mod tests {
             Ok(BackendEvent::MessagePartDelta { .. })
         ));
         assert!(matches!(events[2], Ok(BackendEvent::Done)));
+    }
+
+    #[test]
+    fn parse_sync_history_record_as_done() {
+        let record: serde_json::Value = serde_json::from_str(
+            "{\"type\":\"message.updated.1\",\"id\":\"evt_1\",\"seq\":1,\"aggregateID\":\"ses1\",\"data\":{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0},\"parentID\":null,\"modelID\":\"mock/model\",\"providerID\":\"mock\",\"mode\":\"default\",\"agent\":\"build\",\"cost\":0.0}}}",
+        )
+        .unwrap();
+
+        let event = parse_sync_history_record(&record)
+            .expect("record should normalize")
+            .expect("record should parse");
+
+        assert!(matches!(event, BackendEvent::Done));
     }
 }

@@ -17,11 +17,10 @@ The Rust trait in the `backend` crate that abstracts the Agent protocol. Impleme
 _Avoid_: Client, transport
 
 **BackendEvent**:
-A single item yielded by a `PromptStream` or `EventStream`. Covers text deltas, tool state changes, step markers, errors, and stream completion.
+A normalized event delivered either from the live SSE subscription or from sync-history catch-up. Covers text deltas, tool state changes, step markers, errors, and stream completion.
 
 **EventStream**:
-An async `Stream` of `BackendEvent`s from the SSE `/events` subscription. Carries out-of-band notifications (session created/deleted, status changes).
-_Avoid_: Confusing with `PromptStream` — they are separate streams
+An async `Stream` of `BackendEvent`s from the SSE subscription endpoints (`/event` or `/global/event`). Carries assistant progress and other server notifications.
 
 **Message**:
 A single turn in a **Session**, authored by either the **User** or the **Assistant** (Agent). Contains zero or more **Part**s.
@@ -30,14 +29,14 @@ A single turn in a **Session**, authored by either the **User** or the **Assista
 A typed content chunk within a **Message**. Variants: `Text`, `Tool` (with state: pending/running/completed/error), `StepStart`, `StepFinish`.
 
 **Prompt**:
-Sending a user message to the **Agent** and receiving a streaming response. The primary interaction mode.
+Sending a user message to the **Agent**. The submission returns an immediate receipt, and live progress arrives on the **EventStream**. The primary interaction mode.
 _Avoid_: Command (refers to a specific API call)
 
 **Command**:
-An API call to the Agent that expects a non-streaming structured response (e.g., "run a shell command"). Returns the same `PromptStream` event types.
+An API call to the Agent that returns an immediate structured receipt (e.g., "run a shell command"). Follow-up activity still arrives on the **EventStream**.
 
-**PromptStream**:
-An async `Stream` of `BackendEvent`s returned by `prompt()` or `command()`. Carries the Agent's response as it is generated.
+**SyncHistory**:
+A pull API that returns missed protocol events from `/sync/history`. Used for catch-up and reconciliation rather than as a second live stream.
 
 **Session**:
 A single conversation with the **Agent**, consisting of a sequence of **Message**s.
@@ -67,11 +66,11 @@ The primary interaction screen. Shows a scrollable list of **Messages** (user + 
 ## Relationships
 
 - The **TUI** calls a **Backend** to interact with the **Agent** (the server)
-- The **TUI** lists **Agent**s (the type) from the server via `Backend::list_agents()` and passes the selected agent name to `prompt()`/`command()`
+- The **TUI** lists **Agent**s (the type) from the server via `Backend::list_agents()` and passes the selected agent name to `submit_prompt()`/`submit_command()`
 - A **Session** contains zero or more **Messages**
 - A **Message** contains zero or more **Parts**
-- **Prompt** and **Command** both yield a **PromptStream**
-- The **EventStream** is a separate out-of-band channel for server-side events
+- **Prompt** and **Command** both return immediate receipts and continue on the **EventStream**
+- **SyncHistory** is the catch-up path when the client needs missed events
 - The **Backend** trait is implemented by `ocpncord-backend-opencode` for the real **Agent**
 - The `backend` crate owns the Backend trait and the shared JSON contract types
 
@@ -90,4 +89,4 @@ native/         — Binary: tokio + Crossterm, the only binary crate
 > **Domain expert:** "No — the TUI only imports the Backend trait. The fact that it's an opencode server is an implementation detail of `ocpncord-backend-opencode`."
 
 > **Dev:** "Should I use `subscribe()` to get streaming responses?"
-> **Domain expert:** "No — streaming responses come from `prompt()`, which returns a `PromptStream`. The `EventStream` from `subscribe()` is for out-of-band events like session creation from another client."
+> **Domain expert:** "Use `subscribe_events()` for live progress and `sync_history()` for catch-up. `submit_prompt()` only returns the immediate receipt for the submission itself."

@@ -467,6 +467,43 @@ pub struct AssistantMessage {
     pub cost: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmissionReceipt {
+    pub info: AssistantMessage,
+    pub parts: Vec<Part>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventSubscription {
+    Global,
+    Instance {
+        directory: Option<String>,
+        workspace: Option<String>,
+    },
+}
+
+impl Default for EventSubscription {
+    fn default() -> Self {
+        Self::Global
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncHistoryRequest {
+    pub subscription: EventSubscription,
+    pub known_sequences: BTreeMap<String, u64>,
+}
+
+impl Default for SyncHistoryRequest {
+    fn default() -> Self {
+        Self {
+            subscription: EventSubscription::Global,
+            known_sequences: BTreeMap::new(),
+        }
+    }
+}
+
 // --- Request body types ---
 
 #[derive(Serialize)]

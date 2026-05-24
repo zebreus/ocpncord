@@ -309,7 +309,6 @@ pub type Result<T> = core::result::Result<T, BackendError>;
 // --- The Backend trait ---
 
 pub trait Backend {
-    type PromptStream: Stream<Item = Result<BackendEvent>> + Unpin;
     type EventStream: Stream<Item = Result<BackendEvent>> + Unpin;
 
     async fn health(&mut self) -> Result<Health>;
@@ -331,18 +330,19 @@ pub trait Backend {
         message_id: &MessageId,
     ) -> Result<MessageDetail>;
 
-    async fn prompt(
+    async fn submit_prompt(
         &mut self,
         id: &SessionId,
         text: &str,
         agent: Option<&str>,
-    ) -> Result<Self::PromptStream>;
-    async fn command(
+    ) -> Result<SubmissionReceipt>;
+
+    async fn submit_command(
         &mut self,
         id: &SessionId,
         text: &str,
         agent: Option<&str>,
-    ) -> Result<Self::PromptStream>;
+    ) -> Result<SubmissionReceipt>;
 
     async fn reply_permission(&mut self, reply: &PermissionReply) -> Result<()>;
 
@@ -352,7 +352,12 @@ pub trait Backend {
 
     async fn find_text(&mut self, pattern: &str) -> Result<Vec<TextMatch>>;
 
-    async fn subscribe(&mut self) -> Result<Self::EventStream>;
+    async fn subscribe_events(
+        &mut self,
+        subscription: &EventSubscription,
+    ) -> Result<Self::EventStream>;
+
+    async fn sync_history(&mut self, request: &SyncHistoryRequest) -> Result<Vec<BackendEvent>>;
 
     async fn get_config(&mut self) -> Result<Config>;
 

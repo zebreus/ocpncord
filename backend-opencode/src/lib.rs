@@ -81,6 +81,64 @@ fn should_fallback_to_api_models(error: &BackendError) -> bool {
     matches!(error, BackendError::Api { status: 404, .. })
 }
 
+fn encode_query_component(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => alloc::vec![c],
+            ' ' => alloc::vec!['+'],
+            c => alloc::format!("%{:02X}", c as u8).chars().collect(),
+        })
+        .collect()
+}
+
+fn append_instance_scope_query(
+    url: &mut String,
+    directory: &Option<String>,
+    workspace: &Option<String>,
+) {
+    let mut first = true;
+
+    if let Some(directory) = directory {
+        url.push(if first { '?' } else { '&' });
+        first = false;
+        url.push_str("directory=");
+        url.push_str(&encode_query_component(directory));
+    }
+
+    if let Some(workspace) = workspace {
+        url.push(if first { '?' } else { '&' });
+        url.push_str("workspace=");
+        url.push_str(&encode_query_component(workspace));
+    }
+}
+
+fn event_subscription_url(base_url: &str, subscription: &EventSubscription) -> String {
+    match subscription {
+        EventSubscription::Global => alloc::format!("{base_url}/global/event"),
+        EventSubscription::Instance {
+            directory,
+            workspace,
+        } => {
+            let mut url = alloc::format!("{base_url}/event");
+            append_instance_scope_query(&mut url, directory, workspace);
+            url
+        }
+    }
+}
+
+fn sync_history_url(base_url: &str, subscription: &EventSubscription) -> String {
+    let mut url = alloc::format!("{base_url}/sync/history");
+    if let EventSubscription::Instance {
+        directory,
+        workspace,
+    } = subscription
+    {
+        append_instance_scope_query(&mut url, directory, workspace);
+    }
+    url
+}
+
 #[derive(Deserialize)]
 struct ConfigProvidersResponse {
     #[serde(default)]
@@ -133,6 +191,25 @@ fn parse_api_models(body: &[u8]) -> Result<Vec<ModelSummary>> {
     serde_json::from_slice(body).map_err(parse_err)
 }
 
+fn parse_submission_receipt(body: &[u8]) -> Result<SubmissionReceipt> {
+    serde_json::from_slice(body).map_err(parse_err)
+}
+
+fn parse_sync_history(body: &[u8]) -> Result<Vec<BackendEvent>> {
+    let records: Vec<serde_json::Value> = serde_json::from_slice(body).map_err(parse_err)?;
+    let mut events = Vec::new();
+
+    for record in records {
+        match stream::parse_sync_history_record(&record) {
+            Some(Ok(event)) => events.push(event),
+            Some(Err(error)) => return Err(error),
+            None => {}
+        }
+    }
+
+    Ok(events)
+}
+
 // --- Helper: send + check status + return body (blocking within the async fn) ---
 
 impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + 'static>
@@ -170,35 +247,6 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             Ok(body.to_vec())
         }
     }
-}
-
-// --- Non-blocking HTTP POST for streaming endpoints (allocates own buffer) ---
-
-/// Send a POST request and return immediately after receiving the status code.
-/// The response body is discarded — used for fire-and-forget triggers where
-/// the actual response arrives via the SSE event stream.
-async fn http_post_fire_and_forget<
-    T: embedded_nal_async::TcpConnect + 'static,
-    D: embedded_nal_async::Dns + 'static,
->(
-    transport: &'static T,
-    dns: &'static D,
-    url: &str,
-    json: &[u8],
-) -> Result<()> {
-    let mut rx_buf = alloc::vec![0u8; RX_BUF_SIZE];
-    let mut client = HttpClient::new(transport, dns);
-    let handle = client.request(Method::POST, url).await.map_err(conn_err)?;
-    let mut handle = handle.body(json).content_type(ContentType::ApplicationJson);
-    let response = handle.send(&mut rx_buf).await.map_err(conn_err)?;
-    if !response.status.is_successful() {
-        let status = response.status.0;
-        return Err(BackendError::Api {
-            status,
-            message: alloc::format!("POST {url} failed with status {status}"),
-        });
-    }
-    Ok(())
 }
 
 fn incremental_sse_stream<
@@ -266,7 +314,6 @@ fn incremental_sse_stream<
 impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + 'static> Backend
     for OpenCodeBackend<T, D>
 {
-    type PromptStream = BufferedStream;
     type EventStream = BufferedStream;
 
     async fn health(&mut self) -> Result<Health> {
@@ -350,12 +397,12 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
-    async fn prompt(
+    async fn submit_prompt(
         &mut self,
         id: &SessionId,
         text: &str,
         agent: Option<&str>,
-    ) -> Result<Self::PromptStream> {
+    ) -> Result<SubmissionReceipt> {
         let url = alloc::format!("{}/session/{id}/message", self.base_url);
         let prompt_body = ocpncord_backend::PromptBody {
             parts: &[ocpncord_backend::TextPartBody {
@@ -365,16 +412,18 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             agent,
         };
         let json = serde_json::to_string(&prompt_body).map_err(parse_err)?;
-        http_post_fire_and_forget(self.transport, self.dns, &url, json.as_bytes()).await?;
-        Ok(BufferedStream::empty())
+        let body = self
+            .send_get_body(Method::POST, &url, Some(json.as_bytes()))
+            .await?;
+        parse_submission_receipt(&body)
     }
 
-    async fn command(
+    async fn submit_command(
         &mut self,
         id: &SessionId,
         text: &str,
         agent: Option<&str>,
-    ) -> Result<Self::PromptStream> {
+    ) -> Result<SubmissionReceipt> {
         let url = alloc::format!("{}/session/{id}/command", self.base_url);
         let cmd_body = ocpncord_backend::CommandBody {
             command: text,
@@ -382,8 +431,10 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             agent,
         };
         let json = serde_json::to_string(&cmd_body).map_err(parse_err)?;
-        http_post_fire_and_forget(self.transport, self.dns, &url, json.as_bytes()).await?;
-        Ok(BufferedStream::empty())
+        let body = self
+            .send_get_body(Method::POST, &url, Some(json.as_bytes()))
+            .await?;
+        parse_submission_receipt(&body)
     }
 
     async fn reply_permission(&mut self, reply: &PermissionReply) -> Result<()> {
@@ -421,24 +472,27 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
     }
 
     async fn find_text(&mut self, pattern: &str) -> Result<Vec<TextMatch>> {
-        let encoded: String = pattern
-            .chars()
-            .flat_map(|c| match c {
-                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => {
-                    alloc::vec![c]
-                }
-                ' ' => alloc::vec!['+'],
-                c => alloc::format!("%{:02X}", c as u8).chars().collect(),
-            })
-            .collect();
+        let encoded = encode_query_component(pattern);
         let url = alloc::format!("{}/find?pattern={}", self.base_url, encoded);
         let body = self.send_get_body(Method::GET, &url, None).await?;
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
-    async fn subscribe(&mut self) -> Result<Self::EventStream> {
-        let url = alloc::format!("{}/global/event", self.base_url);
+    async fn subscribe_events(
+        &mut self,
+        subscription: &EventSubscription,
+    ) -> Result<Self::EventStream> {
+        let url = event_subscription_url(&self.base_url, subscription);
         Ok(incremental_sse_stream(self.transport, self.dns, url))
+    }
+
+    async fn sync_history(&mut self, request: &SyncHistoryRequest) -> Result<Vec<BackendEvent>> {
+        let url = sync_history_url(&self.base_url, &request.subscription);
+        let json = serde_json::to_string(&request.known_sequences).map_err(parse_err)?;
+        let body = self
+            .send_get_body(Method::POST, &url, Some(json.as_bytes()))
+            .await?;
+        parse_sync_history(&body)
     }
 
     async fn get_config(&mut self) -> Result<Config> {
@@ -779,6 +833,50 @@ mod tests {
         (alloc::format!("http://127.0.0.1:{}", addr.port()), tx)
     }
 
+    async fn spawn_capture_streaming_sse_server(
+        first_chunk: &'static str,
+    ) -> (String, oneshot::Receiver<String>, oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let _ = request_tx.send(String::from_utf8(request).unwrap());
+
+            let response = alloc::format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n{}",
+                first_chunk,
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+
+            let _ = release_rx.await;
+            stream.shutdown().await.unwrap();
+        });
+
+        (
+            alloc::format!("http://127.0.0.1:{}", addr.port()),
+            request_rx,
+            release_tx,
+        )
+    }
+
     #[test]
     fn model_list_parses_compact_fields_and_ignores_heavy_payloads() {
         let raw = br#"[
@@ -1008,6 +1106,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_prompt_returns_created_message_receipt() {
+        let response_body = r#"{"info":{"id":"msg_1","sessionID":"ses_1","role":"assistant","time":{"created":1},"parentID":"msg_0","modelID":"model-1","providerID":"provider-1","mode":"build","agent":"builder","cost":0.0},"parts":[]}"#;
+        let (base_url, request_rx) = spawn_capture_server(response_body).await;
+        let mut backend = backend(&base_url);
+
+        let receipt = backend
+            .submit_prompt(&"ses_1".into(), "hello world", Some("builder"))
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.info.id, "msg_1");
+        assert_eq!(receipt.info.session_id, "ses_1");
+        assert_eq!(receipt.info.agent, "builder");
+        assert!(receipt.parts.is_empty());
+
+        let request = request_rx.await.unwrap();
+        assert!(request.contains("POST /session/ses_1/message HTTP/1.1"));
+        assert_eq!(
+            request.split("\r\n\r\n").nth(1).unwrap_or(""),
+            "{\"parts\":[{\"type\":\"text\",\"text\":\"hello world\"}],\"agent\":\"builder\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_command_returns_created_message_receipt() {
+        let response_body = r#"{"info":{"id":"msg_2","sessionID":"ses_2","role":"assistant","time":{"created":2},"parentID":"msg_1","modelID":"model-2","providerID":"provider-2","mode":"command","agent":"runner","cost":0.0},"parts":[]}"#;
+        let (base_url, request_rx) = spawn_capture_server(response_body).await;
+        let mut backend = backend(&base_url);
+
+        let receipt = backend
+            .submit_command(&"ses_2".into(), "build", Some("runner"))
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.info.id, "msg_2");
+        assert_eq!(receipt.info.session_id, "ses_2");
+        assert_eq!(receipt.info.agent, "runner");
+        assert!(receipt.parts.is_empty());
+
+        let request = request_rx.await.unwrap();
+        assert!(request.contains("POST /session/ses_2/command HTTP/1.1"));
+        assert_eq!(
+            request.split("\r\n\r\n").nth(1).unwrap_or(""),
+            "{\"command\":\"build\",\"arguments\":\"\",\"agent\":\"runner\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_events_uses_instance_event_endpoint() {
+        let (base_url, request_rx, release_tx) = spawn_capture_streaming_sse_server(
+            "data: {\"type\":\"server.connected\",\"properties\":{}}\n\n",
+        )
+        .await;
+        let mut backend = backend(&base_url);
+
+        let mut stream = backend
+            .subscribe_events(&EventSubscription::Instance {
+                directory: Some("/tmp/project".into()),
+                workspace: Some("wrk_1".into()),
+            })
+            .await
+            .unwrap();
+
+        let event = timeout(Duration::from_millis(500), stream.next())
+            .await
+            .expect("stream should yield before the SSE connection closes")
+            .expect("stream should produce an event")
+            .expect("event should parse successfully");
+
+        assert!(matches!(event, BackendEvent::ServerConnected));
+
+        let request = request_rx.await.unwrap();
+        assert!(request.contains("GET /event?directory=%2Ftmp%2Fproject&workspace=wrk_1 HTTP/1.1"));
+
+        let _ = release_tx.send(());
+    }
+
+    #[tokio::test]
     async fn subscribe_yields_event_before_connection_closes() {
         let (base_url, release_tx) = spawn_streaming_sse_server(
             "data: {\"type\":\"server.connected\",\"properties\":{}}\n\n",
@@ -1015,7 +1191,10 @@ mod tests {
         .await;
         let mut backend = backend(&base_url);
 
-        let mut stream = backend.subscribe().await.unwrap();
+        let mut stream = backend
+            .subscribe_events(&EventSubscription::Global)
+            .await
+            .unwrap();
         let event = timeout(Duration::from_millis(500), stream.next())
             .await
             .expect("stream should yield before the SSE connection closes")
@@ -1025,5 +1204,39 @@ mod tests {
         assert!(matches!(event, BackendEvent::ServerConnected));
 
         let _ = release_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn sync_history_parses_sync_records() {
+        let response_body = "[{\"type\":\"message.part.updated.1\",\"id\":\"evt_part\",\"seq\":1,\"aggregateID\":\"ses1\",\"data\":{\"sessionID\":\"ses1\",\"part\":{\"id\":\"prt1\",\"sessionID\":\"ses1\",\"messageID\":\"msg1\",\"type\":\"text\",\"text\":\"Hello\"},\"time\":0}},{\"type\":\"message.updated.1\",\"id\":\"evt_done\",\"seq\":2,\"aggregateID\":\"ses1\",\"data\":{\"sessionID\":\"ses1\",\"info\":{\"id\":\"msg1\",\"sessionID\":\"ses1\",\"role\":\"assistant\",\"time\":{\"created\":0},\"parentID\":null,\"modelID\":\"mock/model\",\"providerID\":\"mock\",\"mode\":\"default\",\"agent\":\"build\",\"cost\":0.0}}}]";
+        let (base_url, _) = spawn_capture_server(response_body).await;
+        let mut backend = backend(&base_url);
+
+        let events = backend
+            .sync_history(&SyncHistoryRequest::default())
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], BackendEvent::MessagePartUpdated { .. }));
+        assert!(matches!(events[1], BackendEvent::Done));
+    }
+
+    #[tokio::test]
+    async fn sync_history_uses_instance_scope_query() {
+        let (base_url, request_rx) = spawn_capture_server("[]").await;
+        let mut backend = backend(&base_url);
+        let mut request = SyncHistoryRequest::default();
+        request.subscription = EventSubscription::Instance {
+            directory: Some("/tmp/project".into()),
+            workspace: Some("wrk_1".into()),
+        };
+
+        let _ = backend.sync_history(&request).await.unwrap();
+
+        let request = request_rx.await.unwrap();
+        assert!(request
+            .contains("POST /sync/history?directory=%2Ftmp%2Fproject&workspace=wrk_1 HTTP/1.1"));
+        assert!(request.contains("\r\n\r\n{}"));
     }
 }

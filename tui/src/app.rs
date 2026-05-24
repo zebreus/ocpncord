@@ -389,7 +389,9 @@ impl TuiCommandContext {
 #[derive(Debug, Clone)]
 enum BackendOp {
     LoadAgents,
-    Subscribe,
+    Subscribe {
+        subscription: ocpncord_backend::EventSubscription,
+    },
     CreateSession {
         title: String,
         cwd: String,
@@ -445,7 +447,7 @@ enum BackendOpResult<B: Backend> {
     },
     Submit {
         submission: Submission,
-        result: ocpncord_backend::Result<B::PromptStream>,
+        result: ocpncord_backend::Result<ocpncord_backend::SubmissionReceipt>,
     },
     ReloadMessages {
         dispatch_next: bool,
@@ -673,9 +675,21 @@ impl AppState {
         self.pending_ops.push_back(op);
     }
 
+    fn event_subscription(&self) -> ocpncord_backend::EventSubscription {
+        match self.current_workspace.clone() {
+            Some(directory) => ocpncord_backend::EventSubscription::Instance {
+                directory: Some(directory),
+                workspace: None,
+            },
+            None => ocpncord_backend::EventSubscription::Global,
+        }
+    }
+
     fn queue_startup(&mut self) {
         self.queue_op(BackendOp::LoadAgents);
-        self.queue_op(BackendOp::Subscribe);
+        self.queue_op(BackendOp::Subscribe {
+            subscription: self.event_subscription(),
+        });
     }
 
     pub fn active_mode(&self) -> AppMode {
@@ -1753,12 +1767,11 @@ impl AppState {
     fn handle_submit_result<B: Backend>(
         &mut self,
         submission: Submission,
-        result: ocpncord_backend::Result<B::PromptStream>,
-    ) -> Option<B::PromptStream> {
+        result: ocpncord_backend::Result<ocpncord_backend::SubmissionReceipt>,
+    ) {
         match result {
-            Ok(stream) => {
+            Ok(_) => {
                 self.active_submission = Some(submission);
-                Some(stream)
             }
             Err(e) => {
                 self.error = Some(alloc::format!("{}", e));
@@ -1770,7 +1783,6 @@ impl AppState {
                 self.response_seen_assistant_activity = false;
                 self.active_submission = None;
                 self.dispatch_next_queued_submission();
-                None
             }
         }
     }
@@ -2510,8 +2522,7 @@ impl AppState {
 
 enum DriverEvent {
     Platform(Event),
-    Response(Option<ocpncord_backend::Result<BackendEvent>>),
-    Background(Option<ocpncord_backend::Result<BackendEvent>>),
+    Live(Option<ocpncord_backend::Result<BackendEvent>>),
     Operation,
     PlatformClosed,
 }
@@ -2551,7 +2562,9 @@ fn backend_op_future_from_ptr<'a, B: Backend + 'a>(
 async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> BackendOpResult<B> {
     match op {
         BackendOp::LoadAgents => BackendOpResult::Agents(backend.list_agents().await),
-        BackendOp::Subscribe => BackendOpResult::Subscribe(backend.subscribe().await),
+        BackendOp::Subscribe { subscription } => {
+            BackendOpResult::Subscribe(backend.subscribe_events(&subscription).await)
+        }
         BackendOp::CreateSession {
             title,
             cwd,
@@ -2564,7 +2577,7 @@ async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> Backe
             let result = match submission.kind {
                 SubmissionKind::Prompt => {
                     backend
-                        .prompt(
+                        .submit_prompt(
                             &submission.session_id,
                             &submission.execution_text,
                             Some(&submission.agent),
@@ -2573,7 +2586,7 @@ async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> Backe
                 }
                 SubmissionKind::Command => {
                     backend
-                        .command(
+                        .submit_command(
                             &submission.session_id,
                             &submission.execution_text,
                             Some(&submission.agent),
@@ -2682,8 +2695,7 @@ where
     state: AppState,
     backend: B,
     events: E,
-    response_events: Option<B::PromptStream>,
-    background_events: Option<B::EventStream>,
+    live_events: Option<B::EventStream>,
     ratatui_terminal: ratatui_core::terminal::Terminal<T>,
     poll_cursor: u8,
 }
@@ -2699,8 +2711,7 @@ where
             state: AppState::new(),
             backend,
             events,
-            response_events: None,
-            background_events: None,
+            live_events: None,
             ratatui_terminal: terminal,
             poll_cursor: 0,
         }
@@ -2744,31 +2755,25 @@ where
 
     #[cfg(test)]
     fn apply_backend_op_result(&mut self, result: BackendOpResult<B>) {
-        Self::apply_backend_op_result_to(
-            &mut self.state,
-            &mut self.response_events,
-            &mut self.background_events,
-            result,
-        );
+        Self::apply_backend_op_result_to(&mut self.state, &mut self.live_events, result);
     }
 
     fn apply_backend_op_result_to(
         state: &mut AppState,
-        response_events: &mut Option<B::PromptStream>,
-        background_events: &mut Option<B::EventStream>,
+        live_events: &mut Option<B::EventStream>,
         result: BackendOpResult<B>,
     ) {
         match result {
             BackendOpResult::Agents(result) => state.apply_agent_result(result),
             BackendOpResult::Subscribe(result) => match result {
-                Ok(stream) => *background_events = Some(stream),
+                Ok(stream) => *live_events = Some(stream),
                 Err(e) => state.error = Some(alloc::format!("{}", e)),
             },
             BackendOpResult::CreateSession { purpose, result } => {
                 state.handle_create_session_result(purpose, result)
             }
             BackendOpResult::Submit { submission, result } => {
-                *response_events = state.handle_submit_result::<B>(submission, result);
+                state.handle_submit_result::<B>(submission, result);
             }
             BackendOpResult::ReloadMessages {
                 dispatch_next,
@@ -2798,8 +2803,7 @@ where
             state,
             backend,
             events,
-            response_events,
-            background_events,
+            live_events,
             ratatui_terminal,
             poll_cursor,
         } = self;
@@ -2818,7 +2822,7 @@ where
 
             let mut completed_op = None;
             let event = futures::future::poll_fn(|cx| {
-                for offset in 0..4 {
+                for offset in 0..3 {
                     match offset {
                         0 => {
                             if let Some(op) = active_op.as_mut() {
@@ -2829,16 +2833,9 @@ where
                             }
                         }
                         1 => {
-                            if let Some(stream) = response_events {
+                            if let Some(stream) = live_events {
                                 if let Poll::Ready(event) = Pin::new(stream).poll_next(cx) {
-                                    return Poll::Ready(DriverEvent::Response(event));
-                                }
-                            }
-                        }
-                        2 => {
-                            if let Some(stream) = background_events {
-                                if let Poll::Ready(event) = Pin::new(stream).poll_next(cx) {
-                                    return Poll::Ready(DriverEvent::Background(event));
+                                    return Poll::Ready(DriverEvent::Live(event));
                                 }
                             }
                         }
@@ -2855,44 +2852,24 @@ where
                 Poll::Pending
             })
             .await;
-            *poll_cursor = (*poll_cursor + 1) % 4;
+            *poll_cursor = (*poll_cursor + 1) % 3;
 
             if let Some(result) = completed_op {
                 active_op = None;
-                Self::apply_backend_op_result_to(state, response_events, background_events, result);
+                Self::apply_backend_op_result_to(state, live_events, result);
             }
 
             let running = match event {
                 DriverEvent::Platform(event) => state.handle_event(event),
-                DriverEvent::Response(Some(Ok(event))) => {
-                    let closes_response =
-                        matches!(event, BackendEvent::Done | BackendEvent::Error { .. });
-                    let running = state.handle_event(Event::Backend(event));
-                    if closes_response {
-                        *response_events = None;
-                    }
-                    running
-                }
-                DriverEvent::Background(Some(Ok(event))) => {
-                    state.handle_event(Event::Backend(event))
-                }
-                DriverEvent::Response(Some(Err(error))) => {
-                    *response_events = None;
+                DriverEvent::Live(Some(Ok(event))) => state.handle_event(Event::Backend(event)),
+                DriverEvent::Live(Some(Err(error))) => {
+                    *live_events = None;
                     state.handle_event(Event::Backend(BackendEvent::Error {
                         message: alloc::format!("{error}"),
                     }))
                 }
-                DriverEvent::Background(Some(Err(error))) => {
-                    state.handle_event(Event::Backend(BackendEvent::Error {
-                        message: alloc::format!("{error}"),
-                    }))
-                }
-                DriverEvent::Response(None) => {
-                    *response_events = None;
-                    true
-                }
-                DriverEvent::Background(None) => {
-                    *background_events = None;
+                DriverEvent::Live(None) => {
+                    *live_events = None;
                     true
                 }
                 DriverEvent::Operation => true,
@@ -2931,7 +2908,6 @@ mod tests {
     }
 
     impl Backend for PendingStartupBackend {
-        type PromptStream = futures::stream::Pending<BackendResult<BackendEvent>>;
         type EventStream = futures::stream::Pending<BackendResult<BackendEvent>>;
 
         async fn health(&mut self) -> BackendResult<ocpncord_backend::Health> {
@@ -2999,21 +2975,21 @@ mod tests {
             Err(pending_backend_error())
         }
 
-        async fn prompt(
+        async fn submit_prompt(
             &mut self,
             _id: &ocpncord_backend::SessionId,
             _text: &str,
             _agent: Option<&str>,
-        ) -> BackendResult<Self::PromptStream> {
+        ) -> BackendResult<ocpncord_backend::SubmissionReceipt> {
             Err(pending_backend_error())
         }
 
-        async fn command(
+        async fn submit_command(
             &mut self,
             _id: &ocpncord_backend::SessionId,
             _text: &str,
             _agent: Option<&str>,
-        ) -> BackendResult<Self::PromptStream> {
+        ) -> BackendResult<ocpncord_backend::SubmissionReceipt> {
             Err(pending_backend_error())
         }
 
@@ -3042,7 +3018,17 @@ mod tests {
             Err(pending_backend_error())
         }
 
-        async fn subscribe(&mut self) -> BackendResult<Self::EventStream> {
+        async fn subscribe_events(
+            &mut self,
+            _subscription: &ocpncord_backend::EventSubscription,
+        ) -> BackendResult<Self::EventStream> {
+            Err(pending_backend_error())
+        }
+
+        async fn sync_history(
+            &mut self,
+            _request: &ocpncord_backend::SyncHistoryRequest,
+        ) -> BackendResult<Vec<BackendEvent>> {
             Err(pending_backend_error())
         }
 
@@ -3133,16 +3119,16 @@ mod tests {
         futures::executor::block_on(app.drain_backend_ops_for_test());
     }
 
-    fn next_response_event<B: Backend>(
+    fn next_live_event<B: Backend>(
         app: &mut TestApp<B>,
     ) -> Option<Result<BackendEvent, ocpncord_backend::BackendError>> {
         futures::executor::block_on(async {
             use futures::StreamExt;
 
-            let stream = app.response_events.as_mut()?;
+            let stream = app.live_events.as_mut()?;
             let event = stream.next().await;
             if event.is_none() {
-                app.response_events = None;
+                app.live_events = None;
             }
             event
         })
@@ -3458,7 +3444,6 @@ mod tests {
                 steps: None,
             },
         ];
-        backend.prompt_events = vec![Ok(ocpncord_backend::BackendEvent::Done)];
         let mut app = new_app(backend);
 
         init(&mut app);
@@ -3529,9 +3514,9 @@ mod tests {
     }
 
     #[test]
-    fn run_handles_background_events_from_subscribe() {
+    fn run_handles_live_events_from_subscribe() {
         let mut backend = MockBackend::default();
-        backend.event_events = vec![Ok(ocpncord_backend::BackendEvent::SessionCreated {
+        backend.live_events = vec![Ok(ocpncord_backend::BackendEvent::SessionCreated {
             session: make_session("session-from-background", "Background"),
         })];
         let events = futures::stream::iter(vec![Event::Tick, Event::Quit]);
@@ -3548,9 +3533,10 @@ mod tests {
     }
 
     #[test]
-    fn run_keeps_platform_events_responsive_while_response_stream_is_active() {
+    fn run_keeps_platform_events_responsive_while_live_stream_is_active() {
         let mut backend = MockBackend::default();
-        backend.prompt_events = vec![Ok(ocpncord_backend::BackendEvent::Part {
+        backend.live_event_stream_pending_polls = 2;
+        backend.live_events = vec![Ok(ocpncord_backend::BackendEvent::Part {
             part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
                 text: "assistant".into(),
             }),
@@ -3576,8 +3562,7 @@ mod tests {
         futures::executor::block_on(app.run());
 
         assert_eq!(app.state.prompt_text(), "n");
-        assert!(app.response_events.is_none());
-        assert!(app.background_events.is_none());
+        assert!(app.live_events.is_none());
     }
 
     fn enter_key() -> Event {
@@ -3597,7 +3582,7 @@ mod tests {
     #[test]
     fn send_message_starts_stream_and_accumulates_parts() {
         let mut backend = MockBackend::default();
-        backend.prompt_events = vec![
+        backend.live_events = vec![
             Ok(ocpncord_backend::BackendEvent::Part {
                 part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
                     text: "Hello".into(),
@@ -3607,6 +3592,7 @@ mod tests {
             Ok(ocpncord_backend::BackendEvent::Done),
         ];
         let mut app = new_app(backend);
+        init(&mut app);
 
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
@@ -3614,13 +3600,13 @@ mod tests {
         assert!(running);
         assert!(app.state.is_streaming());
 
-        let event = next_response_event(&mut app)
+        let event = next_live_event(&mut app)
             .expect("prompt stream should yield a part")
             .expect("part event should not error");
         run(&mut app, Event::Backend(event));
         assert_eq!(app.state.partial_parts().len(), 1);
 
-        let event = next_response_event(&mut app)
+        let event = next_live_event(&mut app)
             .expect("prompt stream should yield Done")
             .expect("Done event should not error");
         run(&mut app, Event::Backend(event));
@@ -4233,10 +4219,11 @@ mod tests {
     #[test]
     fn backend_error_during_stream_shows_error_and_clears_stream() {
         let mut backend = MockBackend::default();
-        backend.prompt_events = vec![Ok(ocpncord_backend::BackendEvent::Error {
+        backend.live_events = vec![Ok(ocpncord_backend::BackendEvent::Error {
             message: "connection lost".into(),
         })];
         let mut app = new_app(backend);
+        init(&mut app);
 
         run(&mut app, char_key('h'));
         run(&mut app, enter_key());
@@ -4478,8 +4465,9 @@ mod tests {
     #[test]
     fn unknown_slash_command_submits_as_message() {
         let mut backend = MockBackend::default();
-        backend.prompt_events = vec![Ok(ocpncord_backend::BackendEvent::Done)];
+        backend.live_events = vec![Ok(ocpncord_backend::BackendEvent::Done)];
         let mut app = new_app(backend);
+        init(&mut app);
 
         run(&mut app, char_key('/'));
         run(&mut app, char_key('u'));
@@ -5240,7 +5228,7 @@ mod tests {
     #[test]
     fn ctrl_c_during_streaming_interrupts_not_quits() {
         let mut backend = MockBackend::default();
-        backend.prompt_events = vec![
+        backend.live_events = vec![
             Ok(ocpncord_backend::BackendEvent::Part {
                 part: ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
                     text: "streaming".into(),

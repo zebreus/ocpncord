@@ -211,10 +211,17 @@ async fn prompt_and_messages() {
 
     let mut b = backend();
     let s = b.create_session("prompt-test", "/tmp").await.unwrap();
+    let mut stream = b
+        .subscribe_events(&EventSubscription::Instance {
+            directory: Some("/tmp".into()),
+            workspace: None,
+        })
+        .await
+        .expect("subscribe should succeed");
 
     // Send a prompt (will actually call the AI)
-    let mut stream = b
-        .prompt(&s.id, "say hello in one word", None)
+    let _receipt = b
+        .submit_prompt(&s.id, "say hello in one word", None)
         .await
         .expect("prompt should succeed");
 
@@ -251,7 +258,14 @@ async fn send_command() {
     let mut b = backend();
     let s = b.create_session("command-test", "/tmp").await.unwrap();
     let mut stream = b
-        .command(&s.id, "init", None)
+        .subscribe_events(&EventSubscription::Instance {
+            directory: Some("/tmp".into()),
+            workspace: None,
+        })
+        .await
+        .expect("subscribe should succeed");
+    let _receipt = b
+        .submit_command(&s.id, "init", None)
         .await
         .expect("command should succeed");
 
@@ -281,7 +295,10 @@ async fn delete_session() {
 #[tokio::test]
 async fn subscribe_connects() {
     let mut b = backend();
-    let stream = b.subscribe().await.expect("subscribe should succeed");
+    let stream = b
+        .subscribe_events(&EventSubscription::Global)
+        .await
+        .expect("subscribe should succeed");
     // Connection established, drop it
     drop(stream);
 }

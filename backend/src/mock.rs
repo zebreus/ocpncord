@@ -22,8 +22,12 @@ pub struct MockBackend {
     pub models: Option<Vec<ModelSummary>>,
     pub list_models_calls: usize,
     pub agents: Vec<Agent>,
-    pub prompt_events: Vec<Result<BackendEvent>>,
-    pub event_events: Vec<Result<BackendEvent>>,
+    pub prompt_receipt: Option<SubmissionReceipt>,
+    pub command_receipt: Option<SubmissionReceipt>,
+    pub live_events: Vec<Result<BackendEvent>>,
+    pub live_event_stream_pending_polls: usize,
+    pub sync_history_events: Vec<BackendEvent>,
+    pub sync_history_requests: Vec<SyncHistoryRequest>,
     pub text_matches: Vec<TextMatch>,
     pub prompt_calls: Vec<MockSubmissionCall>,
     pub command_calls: Vec<MockSubmissionCall>,
@@ -53,8 +57,12 @@ impl Default for MockBackend {
             models: None,
             list_models_calls: 0,
             agents: Vec::new(),
-            prompt_events: Vec::new(),
-            event_events: Vec::new(),
+            prompt_receipt: None,
+            command_receipt: None,
+            live_events: Vec::new(),
+            live_event_stream_pending_polls: 0,
+            sync_history_events: Vec::new(),
+            sync_history_requests: Vec::new(),
             text_matches: Vec::new(),
             prompt_calls: Vec::new(),
             command_calls: Vec::new(),
@@ -67,8 +75,28 @@ impl Default for MockBackend {
     }
 }
 
+fn default_submission_receipt(session_id: &SessionId) -> SubmissionReceipt {
+    SubmissionReceipt {
+        info: AssistantMessage {
+            id: "mock-message-id".into(),
+            session_id: session_id.clone(),
+            role: MessageRole::Assistant,
+            time: MessageTime {
+                created: 0,
+                completed: None,
+            },
+            parent_id: None,
+            model_id: "mock/model".into(),
+            provider_id: "mock".into(),
+            mode: "default".into(),
+            agent: "mock-agent".into(),
+            cost: 0.0,
+        },
+        parts: Vec::new(),
+    }
+}
+
 impl Backend for MockBackend {
-    type PromptStream = MockStream;
     type EventStream = MockStream;
 
     async fn health(&mut self) -> Result<Health> {
@@ -166,34 +194,38 @@ impl Backend for MockBackend {
         })
     }
 
-    async fn prompt(
+    async fn submit_prompt(
         &mut self,
         id: &SessionId,
         text: &str,
         agent: Option<&str>,
-    ) -> Result<Self::PromptStream> {
+    ) -> Result<SubmissionReceipt> {
         self.prompt_calls.push(MockSubmissionCall {
             session_id: id.clone(),
             text: text.into(),
             agent: agent.map(|value| value.into()),
         });
-        let events = core::mem::take(&mut self.prompt_events);
-        Ok(MockStream { events, pos: 0 })
+        Ok(self
+            .prompt_receipt
+            .clone()
+            .unwrap_or_else(|| default_submission_receipt(id)))
     }
 
-    async fn command(
+    async fn submit_command(
         &mut self,
         id: &SessionId,
         text: &str,
         agent: Option<&str>,
-    ) -> Result<Self::PromptStream> {
+    ) -> Result<SubmissionReceipt> {
         self.command_calls.push(MockSubmissionCall {
             session_id: id.clone(),
             text: text.into(),
             agent: agent.map(|value| value.into()),
         });
-        let events = core::mem::take(&mut self.prompt_events);
-        Ok(MockStream { events, pos: 0 })
+        Ok(self
+            .command_receipt
+            .clone()
+            .unwrap_or_else(|| default_submission_receipt(id)))
     }
 
     async fn reply_permission(&mut self, reply: &PermissionReply) -> Result<()> {
@@ -216,9 +248,21 @@ impl Backend for MockBackend {
         Ok(self.text_matches.clone())
     }
 
-    async fn subscribe(&mut self) -> Result<Self::EventStream> {
-        let events = core::mem::take(&mut self.event_events);
-        Ok(MockStream { events, pos: 0 })
+    async fn subscribe_events(
+        &mut self,
+        _subscription: &EventSubscription,
+    ) -> Result<Self::EventStream> {
+        let events = core::mem::take(&mut self.live_events);
+        Ok(MockStream {
+            events,
+            pos: 0,
+            pending_polls: self.live_event_stream_pending_polls,
+        })
+    }
+
+    async fn sync_history(&mut self, request: &SyncHistoryRequest) -> Result<Vec<BackendEvent>> {
+        self.sync_history_requests.push(request.clone());
+        Ok(self.sync_history_events.clone())
     }
 
     async fn get_config(&mut self) -> Result<Config> {
@@ -268,12 +312,19 @@ impl Backend for MockBackend {
 pub struct MockStream {
     events: Vec<Result<BackendEvent>>,
     pos: usize,
+    pending_polls: usize,
 }
 
 impl Stream for MockStream {
     type Item = Result<BackendEvent>;
 
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.pending_polls > 0 {
+            self.pending_polls -= 1;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
         if self.pos < self.events.len() {
             // Can't take from a Vec, clone instead
             let item = match &self.events[self.pos] {
