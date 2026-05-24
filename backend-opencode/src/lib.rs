@@ -55,6 +55,12 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
     fn make_client(&self) -> HttpClient<'static, T, D> {
         HttpClient::new(self.transport, self.dns)
     }
+
+    async fn health_for_base_url(&mut self, base_url: &str) -> Result<Health> {
+        let url = alloc::format!("{}/global/health", base_url.trim_end_matches('/'));
+        let body = self.send_get_body(Method::GET, &url, None).await?;
+        serde_json::from_slice(&body).map_err(parse_err)
+    }
 }
 
 // --- Error helpers ---
@@ -344,10 +350,22 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 {
     type EventStream = BufferedStream;
 
+    fn server_url(&self) -> Option<&str> {
+        Some(&self.base_url)
+    }
+
+    async fn test_server_url(&mut self, url: &str) -> Result<Health> {
+        self.health_for_base_url(url).await
+    }
+
+    async fn set_server_url(&mut self, url: &str) -> Result<()> {
+        self.base_url = url.trim_end_matches('/').to_owned();
+        Ok(())
+    }
+
     async fn health(&mut self) -> Result<Health> {
-        let url = alloc::format!("{}/global/health", self.base_url);
-        let body = self.send_get_body(Method::GET, &url, None).await?;
-        serde_json::from_slice(&body).map_err(parse_err)
+        let base_url = self.base_url.clone();
+        self.health_for_base_url(&base_url).await
     }
 
     async fn list_sessions(&mut self) -> Result<Vec<Session>> {

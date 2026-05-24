@@ -21,7 +21,8 @@ use crate::command_palette::CommandPaletteModal;
 use crate::event::{Event, Scancode};
 use crate::key_chord::KeyChord;
 use crate::modal::{
-    HelpModal, Modal, ModelPickerModal, PermissionModal, QuestionModal, SessionListModal,
+    HelpModal, Modal, ModelPickerModal, PermissionModal, QuestionModal, ServerConfigModal,
+    SessionListModal,
 };
 use crate::prompt_bar::{InputMode, PromptBar};
 use crate::theme::Theme;
@@ -54,6 +55,7 @@ pub enum ToastVariant {
 const MAX_STORED_TOASTS: usize = 16;
 const MAX_VISIBLE_TOASTS: usize = 5;
 const LIVE_RECONNECT_DELAY_TICKS: u64 = 4;
+const DEFAULT_SERVER_URL: &str = "http://localhost:4096";
 const START_PAGE_LOGO: &str = r#"██████   ██████ ██████  ███    ██ ██████  ██████  ██████  ██████
 ██    ██ ██      ██   ██ ████   ██ ██      ██    ██ ██   ██ ██   ██
 ██    ██ ██      ██████  ██ ██  ██ ██      ██    ██ ██████  ██   ██
@@ -89,6 +91,8 @@ pub enum Action {
     ReplyPermission(String, String, PermissionReplyAction),
     ReplyQuestion(String, String, Vec<Vec<String>>),
     RejectQuestion(String),
+    TestServerUrl(String),
+    ApplyServerUrl(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +108,7 @@ pub enum ModalId {
     Help,
     ModelPicker,
     CommandPalette,
+    ServerConfig,
     PermissionApproval,
     QuestionApproval,
 }
@@ -243,6 +248,7 @@ enum TuiCommand {
     Todos,
     Diagnostics,
     Pty,
+    Server,
     Abort,
     Dispose,
     Upgrade,
@@ -259,6 +265,7 @@ impl TuiCommand {
             "/todos" => Some(Self::Todos),
             "/diagnostics" => Some(Self::Diagnostics),
             "/pty" => Some(Self::Pty),
+            "/server" => Some(Self::Server),
             "/abort" => Some(Self::Abort),
             "/dispose" => Some(Self::Dispose),
             "/upgrade" => Some(Self::Upgrade),
@@ -315,6 +322,12 @@ enum BackendOp {
     OpenModelPicker {
         cached_models: Option<Vec<ocpncord_backend::ModelSummary>>,
     },
+    TestServerUrl {
+        url: String,
+    },
+    ApplyServerUrl {
+        url: String,
+    },
     SelectModel {
         model: String,
     },
@@ -361,6 +374,13 @@ enum BackendOpResult<B: Backend> {
             ocpncord_backend::Config,
             Option<Vec<ocpncord_backend::ModelSummary>>,
         )>,
+    },
+    TestServerUrl {
+        result: ocpncord_backend::Result<ocpncord_backend::Health>,
+    },
+    ApplyServerUrl {
+        url: String,
+        result: ocpncord_backend::Result<ocpncord_backend::Health>,
     },
     SelectModel {
         requested: String,
@@ -423,10 +443,15 @@ pub struct AppState {
     // Optional directory override for creating new sessions.
     session_directory_override: Option<String>,
     current_branch: Option<String>,
+    current_server_url: String,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        Self::new_with_server_url(DEFAULT_SERVER_URL.into())
+    }
+
+    pub fn new_with_server_url(current_server_url: String) -> Self {
         Self {
             active_mode: AppMode::StartPage,
             theme: Theme::default(),
@@ -463,6 +488,7 @@ impl AppState {
             todos: Vec::new(),
             session_directory_override: None,
             current_branch: None,
+            current_server_url,
         }
     }
 
@@ -669,6 +695,33 @@ impl AppState {
     fn queue_startup(&mut self) {
         self.queue_op(BackendOp::LoadAgents);
         self.queue_live_resubscribe();
+    }
+
+    fn reset_for_server_switch(&mut self, url: String) {
+        self.current_server_url = url;
+        self.active_mode = AppMode::StartPage;
+        self.prompt_bar.clear();
+        self.chat_scroll = 0;
+        self.active_session = None;
+        self.draft = None;
+        self.error = None;
+        self.is_streaming = false;
+        self.response_indicator_until_tick = 0;
+        self.chat = ChatState::new();
+        self.active_submission = None;
+        self.queued_submissions.clear();
+        self.sync_known_sequences.clear();
+        self.live_reconnect_at_tick = None;
+        self.pending_ops.clear();
+        self.active_blocking_prompt = None;
+        self.pending_permissions.clear();
+        self.pending_questions.clear();
+        self.agents.clear();
+        self.active_agent = 0;
+        self.model_cache = None;
+        self.side_panel_visible = false;
+        self.side_panel_scroll = 0;
+        self.queue_startup();
     }
 
     pub fn active_mode(&self) -> AppMode {
@@ -1506,6 +1559,15 @@ impl AppState {
                 }
                 true
             }
+            TuiCommand::Server => {
+                if context.clear_prompt {
+                    self.prompt_bar.clear();
+                }
+                self.set_active_modal(Box::new(ServerConfigModal::new(
+                    self.current_server_url.clone(),
+                )));
+                true
+            }
             TuiCommand::Abort => {
                 if let Some(session) = &self.active_session {
                     self.queue_op(BackendOp::AbortSession {
@@ -1598,6 +1660,11 @@ impl AppState {
             }
             Some(Action::OpenModal(ModalId::Help)) => {
                 self.set_active_modal(Box::new(HelpModal::new()));
+            }
+            Some(Action::OpenModal(ModalId::ServerConfig)) => {
+                self.set_active_modal(Box::new(ServerConfigModal::new(
+                    self.current_server_url.clone(),
+                )));
             }
             Some(Action::OpenModal(ModalId::PermissionApproval)) => {
                 self.open_permission_modal_if_idle();
@@ -1731,6 +1798,12 @@ impl AppState {
                     title: title.clone(),
                 });
             }
+            Some(Action::TestServerUrl(ref url)) => {
+                self.queue_op(BackendOp::TestServerUrl { url: url.clone() });
+            }
+            Some(Action::ApplyServerUrl(ref url)) => {
+                self.queue_op(BackendOp::ApplyServerUrl { url: url.clone() });
+            }
             _ => {}
         }
         true
@@ -1851,6 +1924,34 @@ impl AppState {
             Err(e) => modal.set_error(alloc::format!("{}", e)),
         }
         self.set_active_modal(Box::new(modal));
+    }
+
+    fn handle_test_server_url(
+        &mut self,
+        result: ocpncord_backend::Result<ocpncord_backend::Health>,
+    ) {
+        if let Some(modal) = self
+            .active_modal
+            .as_deref_mut()
+            .and_then(|modal| modal.as_server_config_mut())
+        {
+            modal.set_test_result(result);
+        } else if let Err(error) = result {
+            self.error = Some(alloc::format!("{error}"));
+        }
+    }
+
+    fn handle_apply_server_url_error(&mut self, error: ocpncord_backend::BackendError) {
+        let message = alloc::format!("{error}");
+        if let Some(modal) = self
+            .active_modal
+            .as_deref_mut()
+            .and_then(|modal| modal.as_server_config_mut())
+        {
+            modal.set_apply_error(message);
+        } else {
+            self.error = Some(message);
+        }
     }
 
     fn handle_select_model(
@@ -2500,6 +2601,22 @@ async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> Backe
             .await;
             BackendOpResult::OpenModelPicker { result }
         }
+        BackendOp::TestServerUrl { url } => BackendOpResult::TestServerUrl {
+            result: backend.test_server_url(&url).await,
+        },
+        BackendOp::ApplyServerUrl { url } => {
+            let normalized_url = url.trim_end_matches('/').to_string();
+            let result = async {
+                let health = backend.test_server_url(&normalized_url).await?;
+                backend.set_server_url(&normalized_url).await?;
+                Ok(health)
+            }
+            .await;
+            BackendOpResult::ApplyServerUrl {
+                url: normalized_url,
+                result,
+            }
+        }
         BackendOp::SelectModel { model } => {
             let requested = model.clone();
             let result = async {
@@ -2571,8 +2688,12 @@ where
     T: ratatui_core::backend::Backend,
 {
     pub fn new(backend: B, events: E, terminal: ratatui_core::terminal::Terminal<T>) -> Self {
+        let server_url = backend
+            .server_url()
+            .unwrap_or(DEFAULT_SERVER_URL)
+            .to_string();
         Self {
-            state: AppState::new(),
+            state: AppState::new_with_server_url(server_url),
             backend,
             events,
             live_events: None,
@@ -2644,6 +2765,15 @@ where
             BackendOpResult::LoadSession { result } => state.handle_load_session(result),
             BackendOpResult::DeleteSession(result) => state.handle_delete_session(result),
             BackendOpResult::OpenModelPicker { result } => state.handle_open_model_picker(result),
+            BackendOpResult::TestServerUrl { result } => state.handle_test_server_url(result),
+            BackendOpResult::ApplyServerUrl { url, result } => match result {
+                Ok(_) => {
+                    *live_events = None;
+                    state.clear_active_modal();
+                    state.reset_for_server_switch(url);
+                }
+                Err(error) => state.handle_apply_server_url_error(error),
+            },
             BackendOpResult::SelectModel { requested, result } => {
                 state.handle_select_model(requested, result)
             }
@@ -4543,6 +4673,73 @@ mod tests {
         assert!(
             app.state.active_modal().is_some(),
             "/sessions should open the session list modal"
+        );
+    }
+
+    #[test]
+    fn slash_server_opens_server_config_modal() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        for ch in "/server".chars() {
+            run(&mut app, char_key(ch));
+        }
+        run(&mut app, enter_key());
+
+        assert_eq!(
+            app.state.active_modal().map(|modal| modal.title()),
+            Some("Server Connection")
+        );
+    }
+
+    #[test]
+    fn applying_server_url_resets_state_and_reconnects() {
+        let mut backend = MockBackend::default();
+        backend.server_url = "http://old:4096".into();
+        let mut app = new_app(backend);
+        app.state.active_session = Some(make_session("old-session", "Old"));
+        app.state
+            .sync_known_sequences
+            .insert("old-session".into(), 10);
+        app.state
+            .set_active_modal(Box::new(ServerConfigModal::new("http://new:4096".into())));
+
+        app.state
+            .apply_action(Some(Action::ApplyServerUrl("http://new:4096/".into())));
+        futures::executor::block_on(app.drain_backend_ops_for_test());
+
+        assert_eq!(app.backend().server_url, "http://new:4096");
+        assert_eq!(
+            app.backend().set_server_url_calls,
+            vec!["http://new:4096".to_string()]
+        );
+        assert!(app.state.active_modal().is_none());
+        assert!(app.state.active_session.is_none());
+        assert!(app.state.sync_known_sequences.is_empty());
+        assert!(
+            !app.backend().sync_history_requests.is_empty(),
+            "server switch should queue startup reconnect work"
+        );
+    }
+
+    #[test]
+    fn applying_invalid_server_url_keeps_modal_and_existing_backend() {
+        let mut backend = MockBackend::default();
+        backend.server_url = "http://old:4096".into();
+        backend.health_status = None;
+        let mut app = new_app(backend);
+        app.state
+            .set_active_modal(Box::new(ServerConfigModal::new("http://bad:4096".into())));
+
+        app.state
+            .apply_action(Some(Action::ApplyServerUrl("http://bad:4096".into())));
+        futures::executor::block_on(app.drain_backend_ops_for_test());
+
+        assert_eq!(app.backend().server_url, "http://old:4096");
+        assert!(app.backend().set_server_url_calls.is_empty());
+        assert_eq!(
+            app.state.active_modal().map(|modal| modal.title()),
+            Some("Server Connection")
         );
     }
 

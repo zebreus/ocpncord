@@ -18,6 +18,9 @@ pub trait Modal {
     fn as_model_picker_mut(&mut self) -> Option<&mut ModelPickerModal> {
         None
     }
+    fn as_server_config_mut(&mut self) -> Option<&mut ServerConfigModal> {
+        None
+    }
     fn preferred_size(&self, area: Rect) -> (u16, u16) {
         (
             ((area.width as u32 * 3) / 5).clamp(40, area.width as u32) as u16,
@@ -31,9 +34,10 @@ pub trait Modal {
 use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
+use alloc::vec;
 use alloc::vec::Vec;
-use ocpncord_backend::{Config, ModelSummary, Session};
-use ratatui::text::{Line, Text};
+use ocpncord_backend::{Config, Health, ModelSummary, Session};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
     StatefulWidget, Widget, Wrap,
@@ -246,6 +250,201 @@ impl Modal for SessionListModal {
 
     fn title(&self) -> &str {
         "Sessions"
+    }
+}
+
+// --- Server config modal ---
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServerConfigStatus {
+    Idle,
+    Testing,
+    Applying,
+    Success(String),
+    Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerConfigFocus {
+    Url,
+    Test,
+    Apply,
+}
+
+pub struct ServerConfigModal {
+    url: String,
+    status: ServerConfigStatus,
+    focus: ServerConfigFocus,
+}
+
+impl ServerConfigModal {
+    pub fn new(url: String) -> Self {
+        Self {
+            url,
+            status: ServerConfigStatus::Idle,
+            focus: ServerConfigFocus::Url,
+        }
+    }
+
+    pub fn set_testing(&mut self) {
+        self.status = ServerConfigStatus::Testing;
+    }
+
+    pub fn set_applying(&mut self) {
+        self.status = ServerConfigStatus::Applying;
+    }
+
+    pub fn set_test_result(&mut self, result: ocpncord_backend::Result<Health>) {
+        self.status = match result {
+            Ok(health) => ServerConfigStatus::Success(alloc::format!(
+                "Connected: healthy={} version={}",
+                health.healthy,
+                health.version
+            )),
+            Err(error) => ServerConfigStatus::Error(alloc::format!("{error}")),
+        };
+    }
+
+    pub fn set_apply_error(&mut self, error: String) {
+        self.status = ServerConfigStatus::Error(error);
+    }
+
+    #[cfg(test)]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn cycle_focus_forward(&mut self) {
+        self.focus = match self.focus {
+            ServerConfigFocus::Url => ServerConfigFocus::Test,
+            ServerConfigFocus::Test => ServerConfigFocus::Apply,
+            ServerConfigFocus::Apply => ServerConfigFocus::Url,
+        };
+    }
+
+    fn cycle_focus_back(&mut self) {
+        self.focus = match self.focus {
+            ServerConfigFocus::Url => ServerConfigFocus::Apply,
+            ServerConfigFocus::Test => ServerConfigFocus::Url,
+            ServerConfigFocus::Apply => ServerConfigFocus::Test,
+        };
+    }
+
+    fn status_line(&self) -> Line<'_> {
+        match &self.status {
+            ServerConfigStatus::Idle => Line::from("Edit the server URL, then test or apply."),
+            ServerConfigStatus::Testing => Line::from("Testing connection..."),
+            ServerConfigStatus::Applying => Line::from("Applying connection..."),
+            ServerConfigStatus::Success(message) => Line::from(message.as_str()),
+            ServerConfigStatus::Error(message) => Line::from(message.as_str()),
+        }
+    }
+}
+
+impl Modal for ServerConfigModal {
+    fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect) {
+        let mut lines = Vec::new();
+        lines.push(Line::from("Server URL").style(theme.text_dim));
+        let cursor = if self.focus == ServerConfigFocus::Url {
+            " "
+        } else {
+            ""
+        };
+        lines.push(Line::from(alloc::format!("{}{}", self.url, cursor)).style(
+            if self.focus == ServerConfigFocus::Url {
+                theme.input
+            } else {
+                theme.text
+            },
+        ));
+        lines.push(Line::from(""));
+        let test_style = if self.focus == ServerConfigFocus::Test {
+            theme.dialog_button_focused
+        } else {
+            theme.dialog_button
+        };
+        let apply_style = if self.focus == ServerConfigFocus::Apply {
+            theme.dialog_button_focused
+        } else {
+            theme.dialog_button
+        };
+        lines.push(Line::from(vec![
+            Span::styled(" Test ", test_style),
+            Span::raw("  "),
+            Span::styled(" Apply ", apply_style),
+        ]));
+        lines.push(Line::from(""));
+        let status_style = match self.status {
+            ServerConfigStatus::Error(_) => theme.text_error,
+            ServerConfigStatus::Success(_) => theme.toast_success,
+            _ => theme.text_dim,
+        };
+        lines.push(self.status_line().style(status_style));
+        lines.push(Line::from(""));
+        lines.push(
+            Line::from("Tab/Left/Right: move  Enter: activate  Esc: cancel").style(theme.text_dim),
+        );
+
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .render(area, frame.buffer_mut());
+    }
+
+    fn handle_event(&mut self, event: Event) -> Action {
+        match event {
+            Event::Key(ref ke) => match ke.scancode {
+                Scancode::Escape => Action::CloseModal,
+                Scancode::Tab | Scancode::Right => {
+                    self.cycle_focus_forward();
+                    Action::None
+                }
+                Scancode::Left => {
+                    self.cycle_focus_back();
+                    Action::None
+                }
+                Scancode::Backspace if self.focus == ServerConfigFocus::Url => {
+                    self.url.pop();
+                    self.status = ServerConfigStatus::Idle;
+                    Action::None
+                }
+                Scancode::Char(ch) if self.focus == ServerConfigFocus::Url => {
+                    if !ke.modifiers.ctrl && !ke.modifiers.alt && !ke.modifiers.meta {
+                        self.url.push(ch);
+                        self.status = ServerConfigStatus::Idle;
+                    }
+                    Action::None
+                }
+                Scancode::Enter => match self.focus {
+                    ServerConfigFocus::Url | ServerConfigFocus::Apply => {
+                        self.set_applying();
+                        Action::ApplyServerUrl(self.url.clone())
+                    }
+                    ServerConfigFocus::Test => {
+                        self.set_testing();
+                        Action::TestServerUrl(self.url.clone())
+                    }
+                },
+                _ => Action::None,
+            },
+            _ => Action::None,
+        }
+    }
+
+    fn title(&self) -> &str {
+        "Server Connection"
+    }
+
+    fn as_server_config_mut(&mut self) -> Option<&mut ServerConfigModal> {
+        Some(self)
+    }
+
+    fn preferred_size(&self, area: Rect) -> (u16, u16) {
+        let width = if area.width < 50 {
+            area.width
+        } else {
+            ((area.width as u32 * 3) / 5).clamp(50, area.width as u32) as u16
+        };
+        (width, 10_u16.min(area.height))
     }
 }
 
@@ -745,6 +944,7 @@ impl Modal for HelpModal {
             ("  /todos        Toggle todos panel", false),
             ("  /diagnostics  Toggle diagnostics panel", false),
             ("  /pty          Toggle terminal panel", false),
+            ("  /server       Configure server connection", false),
             ("  /abort        Abort current session", false),
             ("  /exit         Quit", false),
             ("", false),
@@ -830,6 +1030,33 @@ mod tests {
     fn modal_trait_title_works() {
         let modal = TestModal;
         assert_eq!(modal.title(), "Test Modal");
+    }
+
+    #[test]
+    fn server_config_modal_edits_url_and_applies() {
+        let mut modal = ServerConfigModal::new("http://localhost:4096".into());
+        modal.handle_event(key(Scancode::Char('/')));
+        modal.handle_event(key(Scancode::Char('v')));
+        assert_eq!(modal.url(), "http://localhost:4096/v");
+        modal.handle_event(key(Scancode::Backspace));
+        assert_eq!(modal.url(), "http://localhost:4096/");
+
+        let action = modal.handle_event(key(Scancode::Enter));
+        assert_eq!(
+            action,
+            Action::ApplyServerUrl("http://localhost:4096/".into())
+        );
+    }
+
+    #[test]
+    fn server_config_modal_test_button_returns_test_action() {
+        let mut modal = ServerConfigModal::new("http://localhost:4096".into());
+        modal.handle_event(key(Scancode::Tab));
+        let action = modal.handle_event(key(Scancode::Enter));
+        assert_eq!(
+            action,
+            Action::TestServerUrl("http://localhost:4096".into())
+        );
     }
 
     fn make_session(id: &str, title: &str) -> Session {

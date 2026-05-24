@@ -18,6 +18,8 @@ pub struct MockBackend {
     pub messages: Vec<MessageSummary>,
     pub message_detail: Option<MessageDetail>,
     pub health_status: Option<Health>,
+    pub server_url: String,
+    pub set_server_url_calls: Vec<String>,
     pub config_info: Option<Config>,
     pub models: Option<Vec<ModelSummary>>,
     pub list_models_calls: usize,
@@ -49,6 +51,8 @@ impl Default for MockBackend {
                 healthy: true,
                 version: "mock".into(),
             }),
+            server_url: "http://localhost:4096".into(),
+            set_server_url_calls: Vec::new(),
             config_info: Some(Config {
                 model: Some("mock/model".into()),
                 username: Some("mock-user".into()),
@@ -120,6 +124,23 @@ fn default_command_submission_receipt(
 
 impl Backend for MockBackend {
     type EventStream = MockStream;
+
+    fn server_url(&self) -> Option<&str> {
+        Some(&self.server_url)
+    }
+
+    async fn test_server_url(&mut self, _url: &str) -> Result<Health> {
+        self.health().await.map_err(|_| BackendError::Connection {
+            message: "server test failed".into(),
+        })
+    }
+
+    async fn set_server_url(&mut self, url: &str) -> Result<()> {
+        self.health().await?;
+        self.server_url = url.trim_end_matches('/').into();
+        self.set_server_url_calls.push(self.server_url.clone());
+        Ok(())
+    }
 
     async fn health(&mut self) -> Result<Health> {
         self.health_status.clone().ok_or(BackendError::Connection {
