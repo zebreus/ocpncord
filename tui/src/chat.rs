@@ -7,9 +7,7 @@ use ratatui::widgets::{
 };
 
 use crate::app::LoadedMessage;
-use crate::event::Event;
 use crate::part_renderer::render_part;
-use crate::screen::{Action, Screen};
 use crate::theme::Theme;
 
 pub struct ChatTranscript<'a> {
@@ -131,41 +129,6 @@ fn wrapped_height(lines: &[Line<'_>], width: u16) -> usize {
         .sum()
 }
 
-pub struct Chat {
-    pub(crate) scroll: u16,
-}
-
-impl Chat {
-    pub fn new() -> Self {
-        Self { scroll: 0 }
-    }
-}
-
-impl Default for Chat {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Screen for Chat {
-    fn render(&self, _frame: &mut ratatui::Frame, _theme: &Theme) {
-        // Chat is rendered via `render_chat` from App::render
-    }
-
-    fn handle_event(&mut self, event: Event) -> Action {
-        match event {
-            Event::Key(key) => match key.scancode {
-                crate::event::Scancode::Up => Action::ScrollUp,
-                crate::event::Scancode::Down => Action::ScrollDown,
-                crate::event::Scancode::PageUp => Action::ScrollPageUp,
-                crate::event::Scancode::PageDown => Action::ScrollPageDown,
-                _ => Action::None,
-            },
-            _ => Action::None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,44 +226,6 @@ mod tests {
         let buf = terminal.backend().buffer();
         let has_text = buf.content().iter().any(|c| c.symbol() == "s");
         assert!(has_text);
-    }
-
-    #[test]
-    fn handle_event_up_down_returns_scroll_actions() {
-        let mut chat = Chat::new();
-        assert_eq!(
-            chat.handle_event(Event::Key(crate::event::KeyEvent {
-                scancode: crate::event::Scancode::Up,
-                modifiers: Default::default(),
-            })),
-            Action::ScrollUp
-        );
-        assert_eq!(
-            chat.handle_event(Event::Key(crate::event::KeyEvent {
-                scancode: crate::event::Scancode::Down,
-                modifiers: Default::default(),
-            })),
-            Action::ScrollDown
-        );
-    }
-
-    #[test]
-    fn handle_event_page_keys_return_page_scroll_actions() {
-        let mut chat = Chat::new();
-        assert_eq!(
-            chat.handle_event(Event::Key(crate::event::KeyEvent {
-                scancode: crate::event::Scancode::PageUp,
-                modifiers: Default::default(),
-            })),
-            Action::ScrollPageUp
-        );
-        assert_eq!(
-            chat.handle_event(Event::Key(crate::event::KeyEvent {
-                scancode: crate::event::Scancode::PageDown,
-                modifiers: Default::default(),
-            })),
-            Action::ScrollPageDown
-        );
     }
 
     #[test]

@@ -4,8 +4,8 @@ use ratatui::layout::Rect;
 use ratatui::text::Text;
 use ratatui::widgets::Widget;
 
+use crate::app::Action;
 use crate::event::{KeyEvent, Scancode};
-use crate::screen::Action;
 use crate::theme::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

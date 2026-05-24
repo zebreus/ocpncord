@@ -1,5 +1,5 @@
+use crate::app::Action;
 use crate::event::{KeyEvent, Modifiers, Scancode};
-use crate::screen::{Action, ModalId, Tab};
 use alloc::string::String;
 
 const LEADER_TIMEOUT_TICKS: u64 = 40;
@@ -65,18 +65,23 @@ impl KeyChord {
         match key.scancode {
             Scancode::Char('q') | Scancode::Char('Q') => Some(Action::Quit),
             Scancode::Char('l') | Scancode::Char('L') => {
-                Some(Action::OpenModal(ModalId::SessionList))
+                Some(Action::ExecuteCommand("/sessions".into()))
             }
             Scancode::Char('m') | Scancode::Char('M') => {
-                Some(Action::OpenModal(ModalId::ModelPicker))
+                Some(Action::ExecuteCommand("/models".into()))
             }
-            Scancode::Char('h') | Scancode::Char('H') => Some(Action::OpenModal(ModalId::Help)),
+            Scancode::Char('h') | Scancode::Char('H') => {
+                Some(Action::ExecuteCommand("/help".into()))
+            }
+            Scancode::Char('n') | Scancode::Char('N') => {
+                Some(Action::ExecuteCommand("/new".into()))
+            }
             Scancode::Char('t') | Scancode::Char('T') => Some(Action::OpenTerminal(String::new())),
             Scancode::Char('d') | Scancode::Char('D') => {
-                Some(Action::ToggleSidePanelTab(Tab::Diagnostics))
+                Some(Action::ExecuteCommand("/diagnostics".into()))
             }
             Scancode::Char('o') | Scancode::Char('O') => {
-                Some(Action::ToggleSidePanelTab(Tab::Todos))
+                Some(Action::ExecuteCommand("/todos".into()))
             }
             _ => None,
         }
@@ -207,7 +212,7 @@ mod tests {
         chord.handle(&ctrl('x'), 0);
         assert_eq!(
             chord.handle(&key('h'), 1),
-            Some(Action::OpenModal(ModalId::Help))
+            Some(Action::ExecuteCommand("/help".into()))
         );
         assert!(chord.leader_tick.is_none());
     }
@@ -218,7 +223,7 @@ mod tests {
         chord.handle(&ctrl('x'), 0);
         assert_eq!(
             chord.handle(&key('d'), 1),
-            Some(Action::ToggleSidePanelTab(Tab::Diagnostics))
+            Some(Action::ExecuteCommand("/diagnostics".into()))
         );
     }
 
@@ -228,7 +233,7 @@ mod tests {
         chord.handle(&ctrl('x'), 0);
         assert_eq!(
             chord.handle(&key('o'), 1),
-            Some(Action::ToggleSidePanelTab(Tab::Todos))
+            Some(Action::ExecuteCommand("/todos".into()))
         );
     }
 
@@ -238,7 +243,17 @@ mod tests {
         chord.handle(&ctrl('x'), 0);
         assert_eq!(
             chord.handle(&key('H'), 1),
-            Some(Action::OpenModal(ModalId::Help))
+            Some(Action::ExecuteCommand("/help".into()))
+        );
+    }
+
+    #[test]
+    fn leader_n_starts_new_session_command() {
+        let mut chord = KeyChord::new();
+        chord.handle(&ctrl('x'), 0);
+        assert_eq!(
+            chord.handle(&key('n'), 1),
+            Some(Action::ExecuteCommand("/new".into()))
         );
     }
 

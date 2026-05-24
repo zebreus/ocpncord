@@ -16,14 +16,11 @@ mod key_chord;
 mod modal;
 mod part_renderer;
 mod prompt_bar;
-mod screen;
-mod start_page;
 mod theme;
 
-pub use app::App;
+pub use app::{Action, App, AppMode, ModalId, Tab};
 pub use command_palette::{default_commands, CommandPaletteModal};
 pub use event::{Event, KeyEvent, Modifiers, Scancode};
 pub use key_chord::KeyChord;
 pub use modal::Modal;
-pub use screen::{Action, ModalId, Screen, ScreenId, Tab};
 pub use theme::Theme;

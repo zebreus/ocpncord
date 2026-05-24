@@ -7,9 +7,9 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{List, ListItem, ListState, StatefulWidget, Widget};
 use ratatui::Frame;
 
+use crate::app::Action;
 use crate::event::{Event, Scancode};
 use crate::modal::Modal;
-use crate::screen::{Action, ModalId, Tab};
 use crate::theme::Theme;
 
 /// A single command entry in the palette.
@@ -28,37 +28,37 @@ pub fn default_commands() -> Vec<PaletteCommand> {
             name: "Help",
             slash_command: "/help",
             keybinding: "Ctrl+X H",
-            action: Action::OpenModal(ModalId::Help),
+            action: Action::ExecuteCommand("/help".into()),
         },
         PaletteCommand {
             name: "New Session",
             slash_command: "/new",
             keybinding: "Ctrl+X N",
-            action: Action::NewSession,
+            action: Action::ExecuteCommand("/new".into()),
         },
         PaletteCommand {
             name: "Sessions",
             slash_command: "/sessions",
             keybinding: "Ctrl+X L",
-            action: Action::OpenModal(ModalId::SessionList),
+            action: Action::ExecuteCommand("/sessions".into()),
         },
         PaletteCommand {
-            name: "Settings",
-            slash_command: "/settings",
+            name: "Models",
+            slash_command: "/models",
             keybinding: "Ctrl+X M",
-            action: Action::OpenSettings,
+            action: Action::ExecuteCommand("/models".into()),
         },
         PaletteCommand {
             name: "Todos",
             slash_command: "/todos",
             keybinding: "",
-            action: Action::ToggleSidePanelTab(Tab::Todos),
+            action: Action::ExecuteCommand("/todos".into()),
         },
         PaletteCommand {
             name: "Diagnostics",
             slash_command: "/diagnostics",
             keybinding: "",
-            action: Action::ToggleSidePanelTab(Tab::Diagnostics),
+            action: Action::ExecuteCommand("/diagnostics".into()),
         },
         PaletteCommand {
             name: "Terminal",
@@ -70,13 +70,7 @@ pub fn default_commands() -> Vec<PaletteCommand> {
             name: "Exit",
             slash_command: "/exit",
             keybinding: "Ctrl+X Q",
-            action: Action::Quit,
-        },
-        PaletteCommand {
-            name: "Toggle Details",
-            slash_command: "/details",
-            keybinding: "",
-            action: Action::ToggleDetails,
+            action: Action::ExecuteCommand("/exit".into()),
         },
         PaletteCommand {
             name: "Cycle Agent",
@@ -265,19 +259,19 @@ mod tests {
                 name: "Help",
                 slash_command: "/help",
                 keybinding: "Ctrl+X H",
-                action: Action::OpenModal(ModalId::Help),
+                action: Action::ExecuteCommand("/help".into()),
             },
             PaletteCommand {
                 name: "New Session",
                 slash_command: "/new",
                 keybinding: "Ctrl+X N",
-                action: Action::NewSession,
+                action: Action::ExecuteCommand("/new".into()),
             },
             PaletteCommand {
                 name: "Exit",
                 slash_command: "/exit",
                 keybinding: "Ctrl+X Q",
-                action: Action::Quit,
+                action: Action::ExecuteCommand("/exit".into()),
             },
         ]
     }
@@ -386,7 +380,7 @@ mod tests {
         palette.handle_event(Event::Key(key_event(Scancode::Down, Modifiers::default())));
         let action =
             palette.handle_event(Event::Key(key_event(Scancode::Enter, Modifiers::default())));
-        assert_eq!(action, Action::Quit);
+        assert_eq!(action, Action::ExecuteCommand("/exit".into()));
     }
 
     #[test]
@@ -411,7 +405,7 @@ mod tests {
         // Enter should return Help's action
         let action =
             palette.handle_event(Event::Key(key_event(Scancode::Enter, Modifiers::default())));
-        assert_eq!(action, Action::OpenModal(ModalId::Help));
+        assert_eq!(action, Action::ExecuteCommand("/help".into()));
     }
 
     #[test]

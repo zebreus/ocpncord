@@ -1,4 +1,4 @@
-Status: ready-for-agent
+Status: finished
 Feature: TUI Implementation
 Created: 2026-05-14
 
@@ -6,7 +6,7 @@ Created: 2026-05-14
 
 ## Problem Statement
 
-ocpncord has a working Backend trait, a fully functional HTTP backend implementation (14/14 integration tests passing), and a platform-agnostic types crate. What it does not have is a usable terminal UI. The TUI crate exists as a stub — an `App` struct that holds a `Screen` enum, a `Screen` trait with `render()/handle_event()`, and platform-agnostic `Event` types. The native binary prints "starting..." and exits.
+ocpncord has a working Backend trait, a fully functional HTTP backend implementation (14/14 integration tests passing), and a platform-agnostic types crate. At the start of this feature, the TUI crate was only a stub — an `App` struct with a shallow full-screen-view seam and platform-agnostic `Event` types. The native binary printed "starting..." and exited.
 
 Without a TUI, the client is unusable. Users cannot see sessions, send prompts, view streaming responses, or interact with the agent in any way. The server protocol works; the client is missing the last mile.
 
@@ -14,7 +14,7 @@ Without a TUI, the client is unusable. Users cannot see sessions, send prompts, 
 
 Build a full terminal UI matching the look, feel, and interaction model of the official opencode TUI (Go/Bubble Tea). The TUI connects to a remote `opencode serve` instance via the existing Backend trait. It runs on desktop (tokio + crossterm) today and can target embedded terminals via the existing `no_std`+`alloc` foundation.
 
-The architecture uses exactly two full-screen views — **StartPage** (launch) and **Chat** (primary interaction) — with all other views as overlay **Modals** (sessions list, help, model picker, command palette, settings). The **PromptBar** input widget supports live detection of `/` slash commands, `!` shell commands, and `@` file references. Agent switching via Tab cycles through primary agents listed from the server, with the active agent name shown in the PromptBar indicator. Streaming responses from `Backend::prompt()` render Parts in real-time as they arrive.
+The architecture uses app-owned modes for the full-screen surfaces — **StartPage** (launch), **Chat** (primary interaction), and **Terminal** — with all other views as overlay **Modals** (sessions list, help, model picker, command palette). The **PromptBar** input widget supports live detection of `/` slash commands, `!` shell commands, and `@` file references. Agent switching via Tab cycles through primary agents listed from the server, with the active agent name shown in the PromptBar indicator. Streaming responses from `Backend::prompt()` render Parts in real-time as they arrive.
 
 ## User Stories
 
@@ -66,7 +66,7 @@ The architecture uses exactly two full-screen views — **StartPage** (launch) a
 29. As a user, I want to type `/new` to start a new session, so that I can begin a fresh conversation.
 30. As a user, I want to type `/exit` to quit the application, so that I can exit gracefully.
 31. As a user, I want to type `/models` to open the model picker modal, so that I can switch models.
-32. As a user, I want to type `/details` to toggle tool execution details on/off, so that I can control how much tool information is shown.
+32. As a user, I want to type `/diagnostics` to open the diagnostics panel, so that I can inspect current errors without leaving the TUI.
 
 ### Keybindings
 
@@ -107,17 +107,17 @@ The architecture uses exactly two full-screen views — **StartPage** (launch) a
 
 ## Implementation Decisions
 
-### Architecture: Screens vs Modals
+### Architecture: App Modes vs Modals
 
-There are exactly two full-screen views: **StartPage** (shown on launch) and **Chat** (primary interaction). All other views are overlay **Modals** drawn on top of the current screen. The base screen renders first, then any active modal is rendered on top with a dimmed overlay background using `ratatui_core::widgets::Clear`.
+Full-screen surfaces are app-owned **modes**, not separate Screen adapters. The current modes are **StartPage** (shown on launch), **Chat** (primary interaction), and **Terminal**. All other views are overlay **Modals** drawn on top of the current mode. The base mode renders first, then any active modal is rendered on top with a dimmed overlay background using `ratatui_core::widgets::Clear`.
 
-The `Screen` trait provides `render(&self, frame, theme)` and `handle_event(&mut self, event) -> Action`. The `Modal` trait mirrors this but is rendered as an overlay. `App` holds an `Option<Box<dyn Modal>>` for the active modal.
+`App` owns the top-level mode render match, mode-local layout, PromptBar placement, status line, and mode transitions. StartPage rendering is inlined in `App`; `chat.rs` remains a focused transcript-rendering module for Chat message content. The `Modal` trait handles overlay dialogs, and `App` holds an `Option<Box<dyn Modal>>` for the active modal.
 
 ### State Management
 
 `App<B: Backend>` holds:
 
-- **active_screen**: enum `StartPage | Chat`
+- **active_mode**: enum `StartPage | Chat | Terminal`
 - **active_modal**: `Option<Box<dyn Modal>>`
 - **active_session**: `Option<Session>`
 - **messages**: `Vec<LoadedMessage>` — local copy of message+parts for the active session
@@ -190,7 +190,7 @@ The detection is character-level and updates the PromptBar's visual style accord
 
 When `Backend::prompt()` returns a `PromptStream`, the stream is stored in `App.stream`. On each `Event::Backend(BackendEvent::Part { part, delta })`, the `part` is appended to `App.partial_parts`. On `BackendEvent::Done`, the partial parts are committed into a final `LoadedMessage` and appended to `App.messages`, and the stream is set to `None`.
 
-The Chat screen's render loop reads `App.messages` (complete) and renders the assistant's last message's parts from `App.partial_parts` if a stream is active. This ensures in-place updates to tool state transitions.
+The Chat mode render path in `App` reads `App.messages` (complete) and passes `App.partial_parts` into `chat.rs::render_chat()` if a stream is active. This keeps top-level mode layout in `App` while keeping transcript rendering encapsulated in `chat.rs`, and it ensures in-place updates to tool state transitions.
 
 ### Agent Selection
 
@@ -202,19 +202,18 @@ No mandatory session picker step. When the user sends the first message and `act
 
 ### Theme System
 
-The `Theme` is a plain struct with named `Style` fields covering all UI surfaces. A `Default` impl provides a TokyoNight-inspired dark palette. `Screen::render()` and modals receive `&Theme`. Later, themes can be loaded from `tui.json` — the struct shape already supports it.
+The `Theme` is a plain struct with named `Style` fields covering all UI surfaces. A `Default` impl provides a TokyoNight-inspired dark palette. App-owned render helpers and modals receive `&Theme`. Later, themes can be loaded from `tui.json` — the struct shape already supports it.
 
 ### Modals
 
-Five modals for MVP:
+Four modals for MVP:
 
-| Modal | Trigger | Content |
-|---|---|---|
-| Session list | `/sessions`, `Ctrl+X L` | Scrollable list of sessions + select/delete |
-| Help | `/help`, `Ctrl+X H` | Command reference + keybindings |
-| Model picker | `/models`, `Ctrl+X M` | List of models from server |
-| Command palette | `Ctrl+P` | Searchable command list |
-| Settings | `/settings` (future) | TUI preferences |
+| Modal           | Trigger                 | Content                                     |
+| --------------- | ----------------------- | ------------------------------------------- |
+| Session list    | `/sessions`, `Ctrl+X L` | Scrollable list of sessions + select/delete |
+| Help            | `/help`, `Ctrl+X H`     | Command reference + keybindings             |
+| Model picker    | `/models`, `Ctrl+X M`   | List of models from server                  |
+| Command palette | `Ctrl+P`                | Searchable command list                     |
 
 Modals render as a centred rectangle over a dimmed terminal. The `Modal` trait:
 
@@ -226,7 +225,7 @@ pub trait Modal {
 }
 ```
 
-`App::render()` always renders the base screen first, then if `active_modal` is `Some`, clears a centred area and renders the modal.
+`App::render()` always renders the active mode first, then if `active_modal` is `Some`, clears a centred area and renders the modal.
 
 ### PartRenderer Module
 
@@ -250,19 +249,21 @@ The single `Action` enum used everywhere:
 pub enum Action {
     None,
     Quit,
-    SwitchScreen(ScreenId),
     OpenModal(ModalId),
     CloseModal,
     CycleAgent,
+    ExecuteCommand(String),
     Interrupt,
     SendMessage,
     OpenPalette,
-    /// Actions that only the Chat screen handles
     ScrollUp,
     ScrollDown,
-    ToggleDetails,
+    ScrollPageUp,
+    ScrollPageDown,
 }
 ```
+
+Slash input, command palette entries, key-chord commands, and `BackendEvent::TuiCommandExecute` all route through a single app-owned TUI command dispatcher. Typed slash commands clear the PromptBar where appropriate; action-triggered commands preserve drafts and use toggle semantics for panels.
 
 ## Testing Decisions
 
@@ -300,19 +301,18 @@ pub enum Action {
 - **`/share` / `/unshare`** — Requires the share API; defer.
 - **`/export`** — Export to Markdown; defer.
 - **`/editor`** — Opens `$EDITOR`; defer.
-- **`/thinking` toggle** — Already covered as `ToggleDetails` in MVP.
-- **`/connect`** — API key setup; defer to settings modal or separate flow.
+- **`/thinking` toggle** — Deferred until there is dedicated state for detail visibility.
+- **`/connect`** — API key setup; defer to a future setup flow.
 - **`/init`** — AGENTS.md creation; defer.
 - **Drag-and-drop image attachment** — Terminal-level feature; defer.
 - **Custom slash commands from `.opencode/commands/`** — Defer.
 - **Embedded/mousefood target** — The `no_std` foundation is set up, but the TUI is built and tested only on desktop (crossterm). Embedded support is deferred.
-- **Settings modal** — Deferred from MVP (no settings to configure yet). The modal trait and overlay system can be extended later.
+- **Settings modal** — Deferred from MVP (no settings to configure yet). The modal system can be extended later.
 - **`/` open command list** — Typing `/` alone to see available commands; defer.
 
 ## Further Notes
 
-- The `Screen` trait's `render()` already accepts `&Theme` — this was added as part of the theme module implementation. The `ScreenId::SessionList` variant should be removed (sessions are now a modal) and replaced with `ScreenId::StartPage`.
 - The `Event::Backend(BackendEvent)` variant needs to be added to `tui/src/event.rs`. The `BackendEvent` type is available via the `ocpncord_backend` crate (re-exported in `tui`).
 - The `native/src/main.rs` binary is the only non-`no_std` crate. It owns the crossterm terminal setup, the event translation layer (crossterm → `tui::Event::Key`), and the tokio event loop. All widget logic lives in `tui/`.
-- The existing `Action` enum only has `None`, `Quit`, `Navigate(ScreenId)`. It needs the full set of semantic actions listed above.
-- Implementation order recommendation: (1) Event variants + Action enum, (2) KeyChord, (3) PromptBar, (4) PartRenderer, (5) StartPage, (6) Chat + message list, (7) Modal trait + session list modal, (8) Wire App + event loop in native.
+- The app-owned full-screen state is `AppMode`, not a separate Screen trait. Keep top-level mode layout in `App` and keep focused rendering helpers such as `PromptBar` and `chat.rs` behind small interfaces.
+- Implementation order recommendation: (1) Event variants + Action enum, (2) KeyChord, (3) PromptBar, (4) PartRenderer, (5) App-owned StartPage/Chat mode layout, (6) `chat.rs` transcript rendering, (7) Modal trait + session list modal, (8) Wire App + event loop in native.

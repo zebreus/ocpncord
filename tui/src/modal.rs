@@ -1,8 +1,8 @@
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
+use crate::app::{Action, PermissionReplyAction};
 use crate::event::{Event, Scancode};
-use crate::screen::Action;
 use crate::theme::Theme;
 use alloc::collections::BTreeMap;
 use core::cell::Cell;
@@ -726,20 +726,19 @@ impl Modal for HelpModal {
             ("  /help         Show this help", false),
             ("  /sessions     List sessions", false),
             ("  /new          New session", false),
-            ("  /settings     Settings / model picker", false),
+            ("  /models       Model picker", false),
             ("  /todos        Toggle todos panel", false),
             ("  /diagnostics  Toggle diagnostics panel", false),
             ("  /pty          Toggle terminal panel", false),
             ("  /abort        Abort current session", false),
             ("  /exit         Quit", false),
-            ("  /details      Toggle tool details", false),
             ("", false),
             ("Keybindings", true),
             ("  Ctrl+X H      Help", false),
             ("  Ctrl+X Q      Quit", false),
             ("  Ctrl+X N      New session", false),
             ("  Ctrl+X L      Sessions", false),
-            ("  Ctrl+X M      Settings", false),
+            ("  Ctrl+X M      Models", false),
             ("  Ctrl+X T      Terminal", false),
             ("  Ctrl+X D      Diagnostics", false),
             ("  Ctrl+X O      Todos", false),
@@ -1319,18 +1318,13 @@ mod tests {
             screen
         );
         assert!(
-            screen.contains("/settings"),
-            "Should show /settings. Screen: {}",
+            screen.contains("/models"),
+            "Should show /models. Screen: {}",
             screen
         );
         assert!(
             screen.contains("/exit"),
             "Should show /exit. Screen: {}",
-            screen
-        );
-        assert!(
-            screen.contains("/details"),
-            "Should show /details. Screen: {}",
             screen
         );
 
@@ -1505,7 +1499,7 @@ mod tests {
 
         assert!(matches!(
             action,
-            Action::ReplyPermission(session_id, request_id, crate::screen::PermissionReplyAction::Reject)
+            Action::ReplyPermission(session_id, request_id, PermissionReplyAction::Reject)
                 if session_id == "session-1" && request_id == "permission-1"
         ));
     }
@@ -1780,9 +1774,9 @@ impl Modal for PermissionModal {
                 }
                 Scancode::Enter => {
                     let reply = match self.selected {
-                        0 => crate::screen::PermissionReplyAction::Once,
-                        1 => crate::screen::PermissionReplyAction::Always,
-                        _ => crate::screen::PermissionReplyAction::Reject,
+                        0 => PermissionReplyAction::Once,
+                        1 => PermissionReplyAction::Always,
+                        _ => PermissionReplyAction::Reject,
                     };
                     Action::ReplyPermission(
                         self.request.session_id.clone(),
@@ -1793,7 +1787,7 @@ impl Modal for PermissionModal {
                 Scancode::Escape => Action::ReplyPermission(
                     self.request.session_id.clone(),
                     self.request.id.clone(),
-                    crate::screen::PermissionReplyAction::Reject,
+                    PermissionReplyAction::Reject,
                 ),
                 _ => Action::None,
             },

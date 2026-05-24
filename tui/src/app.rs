@@ -12,7 +12,7 @@ use core::task::Poll;
 use futures_core::Stream;
 use ocpncord_backend::{Backend, BackendEvent};
 
-use crate::chat::{render_chat, Chat, ChatTranscript};
+use crate::chat::{render_chat, ChatTranscript};
 use crate::command_palette::CommandPaletteModal;
 use crate::event::{Event, Scancode};
 use crate::key_chord::KeyChord;
@@ -20,10 +20,8 @@ use crate::modal::{
     HelpModal, Modal, ModelPickerModal, PermissionModal, QuestionModal, SessionListModal,
 };
 use crate::prompt_bar::{InputMode, PromptBar};
-use crate::screen::{Action, ModalId, PermissionReplyAction, ScreenId, Tab};
-use crate::start_page::StartPage;
 use crate::theme::Theme;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -51,6 +49,73 @@ pub enum ToastVariant {
 
 const MAX_STORED_TOASTS: usize = 16;
 const MAX_VISIBLE_TOASTS: usize = 5;
+const START_PAGE_LOGO: &str = r#"██████   ██████ ██████  ███    ██ ██████  ██████  ██████  ██████
+██    ██ ██      ██   ██ ████   ██ ██      ██    ██ ██   ██ ██   ██
+██    ██ ██      ██████  ██ ██  ██ ██      ██    ██ ██████  ██   ██
+██    ██ ██      ██      ██  ██ ██ ██      ██    ██ ██   ██ ██   ██
+██████   ██████ ██      ██   ████  ██████  ██████  ██   ██ ██████"#;
+const START_PAGE_TIP: &str = "Tip: Ctrl+X H for help, Ctrl+X Q to quit";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    None,
+    Quit,
+    OpenModal(ModalId),
+    CloseModal,
+    CycleAgent,
+    ExecuteCommand(String),
+    Interrupt,
+    SendMessage,
+    OpenPalette,
+    ScrollUp,
+    ScrollDown,
+    ScrollPageUp,
+    ScrollPageDown,
+    SelectModel(String),
+    LoadSession(String),
+    DeleteSession(String),
+    RenameSession(String, String),
+    AbortSession(String),
+    OpenTerminal(String),
+    CloseTerminal,
+    ToggleSidePanel,
+    ToggleSidePanelTab(Tab),
+    SidePanelSelectTab(Tab),
+    ReplyPermission(String, String, PermissionReplyAction),
+    ReplyQuestion(String, String, Vec<Vec<String>>),
+    RejectQuestion(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppMode {
+    StartPage,
+    Chat,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalId {
+    SessionList,
+    Help,
+    ModelPicker,
+    CommandPalette,
+    PermissionApproval,
+    QuestionApproval,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Diagnostics,
+    Todos,
+    Pane,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionReplyAction {
+    Once,
+    Always,
+    Reject,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ActiveBlockingPrompt {
@@ -265,6 +330,62 @@ enum CreateSessionPurpose {
     NewChat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiCommand {
+    Models,
+    NewSession,
+    Sessions,
+    Help,
+    Todos,
+    Diagnostics,
+    Pty,
+    Abort,
+    Dispose,
+    Upgrade,
+    Exit,
+}
+
+impl TuiCommand {
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim() {
+            "/models" | "/config" => Some(Self::Models),
+            "/new" => Some(Self::NewSession),
+            "/sessions" => Some(Self::Sessions),
+            "/help" => Some(Self::Help),
+            "/todos" => Some(Self::Todos),
+            "/diagnostics" => Some(Self::Diagnostics),
+            "/pty" => Some(Self::Pty),
+            "/abort" => Some(Self::Abort),
+            "/dispose" => Some(Self::Dispose),
+            "/upgrade" => Some(Self::Upgrade),
+            "/exit" => Some(Self::Exit),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TuiCommandContext {
+    clear_prompt: bool,
+    toggle_panels: bool,
+}
+
+impl TuiCommandContext {
+    fn typed() -> Self {
+        Self {
+            clear_prompt: true,
+            toggle_panels: false,
+        }
+    }
+
+    fn action() -> Self {
+        Self {
+            clear_prompt: false,
+            toggle_panels: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum BackendOp {
     LoadAgents,
@@ -359,12 +480,12 @@ enum BackendOpResult<B: Backend> {
 
 /// Top-level app state.
 pub struct AppState {
-    active_screen: ScreenId,
+    active_mode: AppMode,
     theme: Theme,
     key_chord: KeyChord,
     tick: u64,
     prompt_bar: PromptBar,
-    chat: Chat,
+    chat_scroll: u16,
     active_session: Option<ocpncord_backend::Session>,
     draft: Option<String>,
     error: Option<String>,
@@ -396,10 +517,10 @@ pub struct AppState {
     toasts: alloc::collections::VecDeque<Toast>,
     // Side panel state
     side_panel_visible: bool,
-    side_panel_tab: crate::screen::Tab,
+    side_panel_tab: Tab,
     side_panel_scroll: u16,
     // Track the screen before switching to Terminal for toggle back
-    screen_before_terminal: ScreenId,
+    mode_before_terminal: AppMode,
     terminal_view_height: Cell<u16>,
     // LSP diagnostics cache: file_path -> diagnostics
     lsp_diagnostics: alloc::collections::BTreeMap<String, Vec<LspDiagnostic>>,
@@ -413,12 +534,12 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         Self {
-            active_screen: ScreenId::StartPage,
+            active_mode: AppMode::StartPage,
             theme: Theme::default(),
             key_chord: KeyChord::new(),
             tick: 0,
             prompt_bar: PromptBar::new(),
-            chat: Chat::new(),
+            chat_scroll: 0,
             active_session: None,
             draft: None,
             error: None,
@@ -445,9 +566,9 @@ impl AppState {
             pending_questions: alloc::collections::VecDeque::new(),
             toasts: alloc::collections::VecDeque::new(),
             side_panel_visible: false,
-            side_panel_tab: crate::screen::Tab::Diagnostics,
+            side_panel_tab: Tab::Diagnostics,
             side_panel_scroll: 0,
-            screen_before_terminal: ScreenId::StartPage,
+            mode_before_terminal: AppMode::StartPage,
             terminal_view_height: Cell::new(10),
             lsp_diagnostics: alloc::collections::BTreeMap::new(),
             todos: Vec::new(),
@@ -557,8 +678,8 @@ impl AppState {
         self.queue_op(BackendOp::Subscribe);
     }
 
-    pub fn active_screen(&self) -> ScreenId {
-        self.active_screen
+    pub fn active_mode(&self) -> AppMode {
+        self.active_mode
     }
 
     pub fn theme(&self) -> &Theme {
@@ -732,7 +853,7 @@ impl AppState {
     fn start_submission(&mut self, submission: Submission, message: LoadedMessage) {
         self.messages.push(message);
         self.draft = Some(submission.text.clone());
-        self.active_screen = ScreenId::Chat;
+        self.active_mode = AppMode::Chat;
         self.is_streaming = true;
         self.mark_response_active();
         self.partial_parts.clear();
@@ -904,7 +1025,7 @@ impl AppState {
                     return true;
                 }
 
-                if self.active_screen == ScreenId::Terminal {
+                if self.active_mode == AppMode::Terminal {
                     let action = match key.scancode {
                         Scancode::Up => Some(Action::ScrollUp),
                         Scancode::Down => Some(Action::ScrollDown),
@@ -918,8 +1039,8 @@ impl AppState {
                     return true;
                 }
 
-                if self.active_screen == ScreenId::Chat
-                    || (self.side_panel_visible && self.side_panel_tab == crate::screen::Tab::Pane)
+                if self.active_mode == AppMode::Chat
+                    || (self.side_panel_visible && self.side_panel_tab == Tab::Pane)
                 {
                     let action = match key.scancode {
                         Scancode::Up => Some(Action::ScrollUp),
@@ -990,7 +1111,7 @@ impl AppState {
                             .map(|s| s.id != session.id)
                             .unwrap_or(true);
                         self.active_session = Some(session);
-                        self.active_screen = ScreenId::Chat;
+                        self.active_mode = AppMode::Chat;
                         if is_new {
                             self.messages.clear();
                         }
@@ -1006,7 +1127,7 @@ impl AppState {
                     ocpncord_backend::BackendEvent::SessionDeleted { .. } => {
                         self.active_session = None;
                         self.messages.clear();
-                        self.active_screen = ScreenId::StartPage;
+                        self.active_mode = AppMode::StartPage;
                     }
                     ocpncord_backend::BackendEvent::SessionIdle { .. } => {}
                     ocpncord_backend::BackendEvent::SessionError { error, .. } => {
@@ -1105,12 +1226,12 @@ impl AppState {
                     }
                     ocpncord_backend::BackendEvent::PtyCreated { info } => {
                         self.terminal.set_from_pty(&info);
-                        self.side_panel_tab = crate::screen::Tab::Pane;
-                        self.active_screen = ScreenId::Terminal;
+                        self.side_panel_tab = Tab::Pane;
+                        self.active_mode = AppMode::Terminal;
                     }
                     ocpncord_backend::BackendEvent::PtyUpdated { .. } => {}
                     ocpncord_backend::BackendEvent::PtyDeleted { .. } => {
-                        self.active_screen = ScreenId::Chat;
+                        self.active_mode = AppMode::Chat;
                     }
                     ocpncord_backend::BackendEvent::PtyExited { exit_code, .. } => {
                         self.terminal.status = ocpncord_backend::PtyStatus::Exited;
@@ -1128,7 +1249,7 @@ impl AppState {
                         });
                     }
                     ocpncord_backend::BackendEvent::LspDiagnostics { path: _, .. } => {
-                        self.side_panel_tab = crate::screen::Tab::Diagnostics;
+                        self.side_panel_tab = Tab::Diagnostics;
                         self.side_panel_visible = true;
                     }
                     ocpncord_backend::BackendEvent::LspUpdated => {}
@@ -1190,7 +1311,11 @@ impl AppState {
                         self.prompt_bar.append_text(text);
                     }
                     ocpncord_backend::BackendEvent::TuiCommandExecute { ref command } => {
-                        self.handle_slash_command_inner(command);
+                        if let Some(should_continue) =
+                            self.handle_tui_command_text(command, TuiCommandContext::typed())
+                        {
+                            return should_continue;
+                        }
                     }
                     ocpncord_backend::BackendEvent::TuiToastShow {
                         message,
@@ -1290,13 +1415,33 @@ impl AppState {
     }
 
     fn handle_slash_command(&mut self, text: &str) -> bool {
-        match text {
-            "/models" | "/settings" | "/config" => {
-                self.prompt_bar.clear();
+        if let Some(should_continue) =
+            self.handle_tui_command_text(text, TuiCommandContext::typed())
+        {
+            should_continue
+        } else {
+            self.handle_unknown_slash_command(text)
+        }
+    }
+
+    fn handle_tui_command_text(&mut self, text: &str, context: TuiCommandContext) -> Option<bool> {
+        TuiCommand::parse(text).map(|command| self.execute_tui_command(command, context))
+    }
+
+    fn execute_tui_command(&mut self, command: TuiCommand, context: TuiCommandContext) -> bool {
+        match command {
+            TuiCommand::Models => {
+                if context.clear_prompt {
+                    self.prompt_bar.clear();
+                }
                 self.open_model_picker();
                 true
             }
-            "/new" => {
+            TuiCommand::NewSession => {
+                if context.clear_prompt {
+                    self.prompt_bar.clear();
+                }
+                self.clear_active_modal();
                 self.queue_op(BackendOp::CreateSession {
                     title: "Chat".into(),
                     cwd: self.current_workspace.clone().unwrap_or_default(),
@@ -1304,36 +1449,73 @@ impl AppState {
                 });
                 true
             }
-            "/sessions" => {
-                self.prompt_bar.clear();
-                self.active_modal = Some(Box::new(SessionListModal::new()));
+            TuiCommand::Sessions => {
+                if context.clear_prompt {
+                    self.prompt_bar.clear();
+                }
+                self.set_active_modal(Box::new(SessionListModal::new()));
                 self.queue_op(BackendOp::ListSessions);
                 true
             }
-            "/help" => {
-                self.prompt_bar.clear();
-                self.active_modal = Some(Box::new(HelpModal::new()));
+            TuiCommand::Help => {
+                if context.clear_prompt {
+                    self.prompt_bar.clear();
+                }
+                self.set_active_modal(Box::new(HelpModal::new()));
                 true
             }
-            "/todos" => {
-                self.prompt_bar.clear();
-                self.side_panel_visible = true;
-                self.side_panel_tab = Tab::Todos;
+            TuiCommand::Todos => {
+                if context.clear_prompt {
+                    self.prompt_bar.clear();
+                }
+                self.clear_active_modal();
+                if context.toggle_panels
+                    && self.side_panel_visible
+                    && self.side_panel_tab == Tab::Todos
+                {
+                    self.side_panel_visible = false;
+                } else {
+                    self.side_panel_visible = true;
+                    self.side_panel_tab = Tab::Todos;
+                    self.side_panel_scroll = 0;
+                }
                 true
             }
-            "/diagnostics" => {
-                self.prompt_bar.clear();
-                self.side_panel_visible = true;
-                self.side_panel_tab = Tab::Diagnostics;
+            TuiCommand::Diagnostics => {
+                if context.clear_prompt {
+                    self.prompt_bar.clear();
+                }
+                self.clear_active_modal();
+                if context.toggle_panels
+                    && self.side_panel_visible
+                    && self.side_panel_tab == Tab::Diagnostics
+                {
+                    self.side_panel_visible = false;
+                } else {
+                    self.side_panel_visible = true;
+                    self.side_panel_tab = Tab::Diagnostics;
+                    self.side_panel_scroll = 0;
+                }
                 true
             }
-            "/pty" => {
-                self.prompt_bar.clear();
-                self.side_panel_visible = true;
-                self.side_panel_tab = Tab::Pane;
+            TuiCommand::Pty => {
+                if context.clear_prompt {
+                    self.prompt_bar.clear();
+                }
+                self.clear_active_modal();
+                if context.toggle_panels
+                    && self.side_panel_visible
+                    && self.side_panel_tab == Tab::Pane
+                {
+                    self.side_panel_visible = false;
+                } else {
+                    self.side_panel_visible = true;
+                    self.side_panel_tab = Tab::Pane;
+                    self.side_panel_scroll = 0;
+                }
                 true
             }
-            "/abort" => {
+            TuiCommand::Abort => {
                 if let Some(session) = &self.active_session {
                     self.queue_op(BackendOp::AbortSession {
                         session_id: session.id.clone(),
@@ -1341,16 +1523,15 @@ impl AppState {
                 }
                 true
             }
-            "/dispose" => {
+            TuiCommand::Dispose => {
                 self.queue_op(BackendOp::Dispose);
                 true
             }
-            "/upgrade" => {
+            TuiCommand::Upgrade => {
                 self.queue_op(BackendOp::Upgrade);
                 true
             }
-            "/exit" => false,
-            _ => self.handle_unknown_slash_command(text),
+            TuiCommand::Exit => false,
         }
     }
 
@@ -1402,36 +1583,17 @@ impl AppState {
         });
     }
 
-    fn handle_slash_command_inner(&mut self, text: &str) {
-        match text {
-            "/sessions" => {
-                self.prompt_bar.clear();
-                self.active_modal = Some(Box::new(SessionListModal::new()));
-                self.queue_op(BackendOp::ListSessions);
-            }
-            "/models" | "/settings" | "/config" => {
-                self.prompt_bar.clear();
-                self.open_model_picker();
-            }
-            "/new" => {
-                self.queue_op(BackendOp::CreateSession {
-                    title: "Chat".into(),
-                    cwd: String::new(),
-                    purpose: CreateSessionPurpose::NewChat,
-                });
-            }
-            "/help" => {
-                self.prompt_bar.clear();
-                self.active_modal = Some(Box::new(HelpModal::new()));
-            }
-            _ => {}
-        }
-    }
-
     fn apply_action(&mut self, action: Option<Action>) -> bool {
         match action {
             Some(Action::Quit) => return false,
-            Some(Action::SwitchScreen(id)) => self.active_screen = id,
+            Some(Action::CycleAgent) => self.cycle_agent(),
+            Some(Action::ExecuteCommand(ref command)) => {
+                if let Some(should_continue) =
+                    self.handle_tui_command_text(command, TuiCommandContext::action())
+                {
+                    return should_continue;
+                }
+            }
             Some(Action::CloseModal) => {
                 self.clear_active_modal();
                 self.open_next_blocking_modal_if_idle();
@@ -1449,9 +1611,6 @@ impl AppState {
             }
             Some(Action::OpenModal(ModalId::Help)) => {
                 self.set_active_modal(Box::new(HelpModal::new()));
-            }
-            Some(Action::OpenModal(ModalId::Settings)) => {
-                self.open_model_picker();
             }
             Some(Action::OpenModal(ModalId::PermissionApproval)) => {
                 self.open_permission_modal_if_idle();
@@ -1478,14 +1637,14 @@ impl AppState {
                 if self.scroll_targets_terminal() {
                     self.scroll_terminal_up(1);
                 } else {
-                    self.chat.scroll = self.chat.scroll.saturating_add(1);
+                    self.chat_scroll = self.chat_scroll.saturating_add(1);
                 }
             }
             Some(Action::ScrollDown) => {
                 if self.scroll_targets_terminal() {
                     self.scroll_terminal_down(1);
                 } else {
-                    self.chat.scroll = self.chat.scroll.saturating_sub(1);
+                    self.chat_scroll = self.chat_scroll.saturating_sub(1);
                 }
             }
             Some(Action::ScrollPageUp) => {
@@ -1493,7 +1652,7 @@ impl AppState {
                 if self.scroll_targets_terminal() {
                     self.scroll_terminal_up(amount);
                 } else {
-                    self.chat.scroll = self.chat.scroll.saturating_add(amount);
+                    self.chat_scroll = self.chat_scroll.saturating_add(amount);
                 }
             }
             Some(Action::ScrollPageDown) => {
@@ -1501,7 +1660,7 @@ impl AppState {
                 if self.scroll_targets_terminal() {
                     self.scroll_terminal_down(amount);
                 } else {
-                    self.chat.scroll = self.chat.scroll.saturating_sub(amount);
+                    self.chat_scroll = self.chat_scroll.saturating_sub(amount);
                 }
             }
             Some(Action::ToggleSidePanel) => {
@@ -1521,18 +1680,15 @@ impl AppState {
                 self.side_panel_scroll = 0;
             }
             Some(Action::OpenTerminal(_pty_id)) => {
-                if self.active_screen == ScreenId::Terminal {
-                    self.active_screen = self.screen_before_terminal;
+                if self.active_mode == AppMode::Terminal {
+                    self.active_mode = self.mode_before_terminal;
                 } else {
-                    self.screen_before_terminal = self.active_screen;
-                    self.active_screen = ScreenId::Terminal;
+                    self.mode_before_terminal = self.active_mode;
+                    self.active_mode = AppMode::Terminal;
                 }
             }
             Some(Action::CloseTerminal) => {
-                self.active_screen = ScreenId::Chat;
-            }
-            Some(Action::OpenSettings) => {
-                self.open_model_picker();
+                self.active_mode = AppMode::Chat;
             }
             Some(Action::ReplyPermission(ref session_id, ref request_id, reply_action)) => {
                 let (reply_value, message) = match reply_action {
@@ -1587,11 +1743,6 @@ impl AppState {
                 self.queue_op(BackendOp::RenameSession {
                     session_id: id.clone(),
                     title: title.clone(),
-                });
-            }
-            Some(Action::SwitchToChat(ref id)) => {
-                self.queue_op(BackendOp::LoadSession {
-                    session_id: id.clone(),
                 });
             }
             _ => {}
@@ -1652,7 +1803,7 @@ impl AppState {
                         self.draft = None;
                         self.messages.clear();
                         self.active_modal = None;
-                        self.active_screen = ScreenId::Chat;
+                        self.active_mode = AppMode::Chat;
                     }
                 }
             }
@@ -1697,7 +1848,7 @@ impl AppState {
         match result {
             Ok((session, messages)) => {
                 self.active_session = Some(session);
-                self.active_screen = ScreenId::Chat;
+                self.active_mode = AppMode::Chat;
                 self.messages = messages;
                 self.clear_active_modal();
                 self.open_next_blocking_modal_if_idle();
@@ -1842,8 +1993,8 @@ impl AppState {
     }
 
     fn scroll_targets_terminal(&self) -> bool {
-        self.active_screen == ScreenId::Terminal
-            || (self.side_panel_visible && self.side_panel_tab == crate::screen::Tab::Pane)
+        self.active_mode == AppMode::Terminal
+            || (self.side_panel_visible && self.side_panel_tab == Tab::Pane)
     }
 
     fn max_terminal_scroll(&self) -> u16 {
@@ -1987,6 +2138,25 @@ impl AppState {
         })
     }
 
+    fn render_start_page_logo(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let logo_height = START_PAGE_LOGO.lines().count() as u16;
+        let tip_height = 1u16;
+        let total_content_height = logo_height + tip_height;
+        let start_y = area.height.saturating_sub(total_content_height) / 2;
+
+        let logo_area = Rect::new(area.x, start_y, area.width, logo_height);
+        Text::from(START_PAGE_LOGO)
+            .style(self.theme.logo)
+            .alignment(Alignment::Center)
+            .render(logo_area, frame.buffer_mut());
+
+        let tip_area = Rect::new(area.x, start_y + logo_height, area.width, tip_height);
+        Text::from(START_PAGE_TIP)
+            .style(self.theme.text_dim)
+            .alignment(Alignment::Center)
+            .render(tip_area, frame.buffer_mut());
+    }
+
     pub fn render(&self, frame: &mut ratatui::Frame) {
         let area = frame.area();
         let panel_width = if self.side_panel_visible {
@@ -2010,9 +2180,9 @@ impl AppState {
         };
         let main_area = chunks[0];
 
-        match self.active_screen {
-            ScreenId::StartPage => {
-                StartPage.render_in(frame, &self.theme, main_area);
+        match self.active_mode {
+            AppMode::StartPage => {
+                self.render_start_page_logo(frame, main_area);
                 let rows = Layout::new(
                     Direction::Vertical,
                     [
@@ -2042,7 +2212,7 @@ impl AppState {
                 let status_area = Rect::new(prompt_area.x, status_row.y, prompt_area.width, 1);
                 self.render_status_line(frame, status_area);
             }
-            ScreenId::Chat => {
+            AppMode::Chat => {
                 let rows = Layout::new(
                     Direction::Vertical,
                     [
@@ -2062,7 +2232,7 @@ impl AppState {
                         queued_messages: &self.queued_messages,
                         is_streaming: self.is_streaming,
                     },
-                    self.chat.scroll,
+                    self.chat_scroll,
                 );
                 self.prompt_bar.render(
                     rows[1],
@@ -2074,7 +2244,7 @@ impl AppState {
                 );
                 self.render_status_line(frame, rows[2]);
             }
-            ScreenId::Terminal => {
+            AppMode::Terminal => {
                 self.render_terminal(frame, main_area);
             }
         }
@@ -3020,7 +3190,7 @@ mod tests {
     fn starts_on_start_page() {
         let backend = MockBackend::default();
         let app = new_app(backend);
-        assert_eq!(app.state.active_screen(), ScreenId::StartPage);
+        assert_eq!(app.state.active_mode(), AppMode::StartPage);
     }
 
     #[test]
@@ -4101,8 +4271,8 @@ mod tests {
         );
         assert!(running);
         assert_eq!(
-            app.state.active_screen(),
-            ScreenId::StartPage,
+            app.state.active_mode(),
+            AppMode::StartPage,
             "should stay on StartPage on error"
         );
         assert!(
@@ -4115,7 +4285,7 @@ mod tests {
     fn typing_enter_creates_session_and_switches_to_chat() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
-        assert_eq!(app.state.active_screen(), ScreenId::StartPage);
+        assert_eq!(app.state.active_mode(), AppMode::StartPage);
 
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
@@ -4132,7 +4302,7 @@ mod tests {
             1,
             "a session should have been created"
         );
-        assert_eq!(app.state.active_screen(), ScreenId::Chat);
+        assert_eq!(app.state.active_mode(), AppMode::Chat);
         assert_eq!(app.state.draft(), Some("hi"));
     }
 
@@ -4150,7 +4320,7 @@ mod tests {
         );
         assert!(running);
 
-        assert_eq!(app.state.active_screen(), ScreenId::StartPage);
+        assert_eq!(app.state.active_mode(), AppMode::StartPage);
         assert_eq!(app.backend().sessions.len(), 0);
     }
 
@@ -4322,8 +4492,8 @@ mod tests {
         run(&mut app, enter_key());
 
         assert_eq!(
-            app.state.active_screen(),
-            ScreenId::Chat,
+            app.state.active_mode(),
+            AppMode::Chat,
             "unknown command should transition to chat"
         );
         assert!(
@@ -4340,7 +4510,7 @@ mod tests {
         run(&mut app, char_key('h'));
         run(&mut app, char_key('i'));
         run(&mut app, enter_key());
-        assert_eq!(app.state.active_screen(), ScreenId::Chat);
+        assert_eq!(app.state.active_mode(), AppMode::Chat);
 
         // Complete the stream so input is accepted again
         run(
@@ -4356,7 +4526,7 @@ mod tests {
         run(&mut app, char_key('w'));
         run(&mut app, enter_key());
 
-        assert_eq!(app.state.active_screen(), ScreenId::Chat);
+        assert_eq!(app.state.active_mode(), AppMode::Chat);
         assert_eq!(
             app.backend().sessions.len(),
             session_count_before + 1,
@@ -4725,14 +4895,14 @@ mod tests {
     fn ctrl_x_t_toggles_terminal_screen() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
-        assert_eq!(app.state.active_screen(), ScreenId::StartPage);
+        assert_eq!(app.state.active_mode(), AppMode::StartPage);
 
         // Ctrl+X T on StartPage → Terminal
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('t'));
         assert_eq!(
-            app.state.active_screen(),
-            ScreenId::Terminal,
+            app.state.active_mode(),
+            AppMode::Terminal,
             "ctrl+x t should switch to terminal"
         );
 
@@ -4740,8 +4910,8 @@ mod tests {
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('t'));
         assert_eq!(
-            app.state.active_screen(),
-            ScreenId::StartPage,
+            app.state.active_mode(),
+            AppMode::StartPage,
             "ctrl+x t again should return to start page"
         );
     }
@@ -4753,7 +4923,7 @@ mod tests {
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('t'));
-        assert_eq!(app.state.active_screen(), ScreenId::Terminal);
+        assert_eq!(app.state.active_mode(), AppMode::Terminal);
 
         run(&mut app, char_key('a'));
         run(&mut app, char_key('b'));
@@ -4778,7 +4948,7 @@ mod tests {
 
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('t'));
-        assert_eq!(app.state.active_screen(), ScreenId::Terminal);
+        assert_eq!(app.state.active_mode(), AppMode::Terminal);
 
         let test_backend = TestBackend::new(40, 6);
         let mut terminal = Terminal::new(test_backend).unwrap();
@@ -4856,7 +5026,7 @@ mod tests {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
         app.state.side_panel_visible = true;
-        app.state.side_panel_tab = crate::screen::Tab::Diagnostics;
+        app.state.side_panel_tab = Tab::Diagnostics;
         app.state.lsp_diagnostics.insert(
             "src/main.rs".into(),
             vec![LspDiagnostic {
@@ -4883,7 +5053,7 @@ mod tests {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
         app.state.side_panel_visible = true;
-        app.state.side_panel_tab = crate::screen::Tab::Todos;
+        app.state.side_panel_tab = Tab::Todos;
         app.state.todos = vec![
             ocpncord_backend::Todo {
                 content: "done task".into(),
@@ -4924,7 +5094,7 @@ mod tests {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
         app.state.side_panel_visible = true;
-        app.state.side_panel_tab = crate::screen::Tab::Pane;
+        app.state.side_panel_tab = Tab::Pane;
         app.state.terminal.pty_id = Some("pty-1".into());
         app.state.terminal.command = "sh".into();
         for idx in 0..10 {
@@ -5013,7 +5183,7 @@ mod tests {
         // Switch to terminal
         run(&mut app, ctrl('x'));
         run(&mut app, char_key('t'));
-        assert_eq!(app.state.active_screen(), ScreenId::Terminal);
+        assert_eq!(app.state.active_mode(), AppMode::Terminal);
 
         // Render and verify helpful message
         let test_backend = TestBackend::new(80, 24);
