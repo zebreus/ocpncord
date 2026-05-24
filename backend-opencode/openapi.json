@@ -9362,201 +9362,60 @@
           "workspace": { "type": "string" },
           "payload": {
             "anyOf": [
-              { "$ref": "#/components/schemas/EventServerInstanceDisposed" },
-              { "$ref": "#/components/schemas/EventPermissionAsked" },
-              { "$ref": "#/components/schemas/EventPermissionReplied" },
-              { "$ref": "#/components/schemas/EventLspClientDiagnostics" },
-              { "$ref": "#/components/schemas/EventLspUpdated" },
-              { "$ref": "#/components/schemas/EventMessagePartDelta" },
-              { "$ref": "#/components/schemas/EventSessionDiff" },
-              { "$ref": "#/components/schemas/EventSessionError" },
-              { "$ref": "#/components/schemas/Event.tui.prompt.append" },
-              { "$ref": "#/components/schemas/Event.tui.command.execute" },
-              { "$ref": "#/components/schemas/Event.tui.toast.show" },
-              { "$ref": "#/components/schemas/Event.tui.session.select" },
-              { "$ref": "#/components/schemas/EventMcpToolsChanged" },
-              { "$ref": "#/components/schemas/EventMcpBrowserOpenFailed" },
-              { "$ref": "#/components/schemas/EventCommandExecuted" },
-              { "$ref": "#/components/schemas/EventProjectUpdated" },
-              { "$ref": "#/components/schemas/EventWorktreeReady" },
-              { "$ref": "#/components/schemas/EventWorktreeFailed" },
-              { "$ref": "#/components/schemas/EventFileEdited" },
-              { "$ref": "#/components/schemas/EventFileWatcherUpdated" },
-              { "$ref": "#/components/schemas/EventVcsBranchUpdated" },
-              { "$ref": "#/components/schemas/EventInstallationUpdated" },
-              {
-                "$ref": "#/components/schemas/EventInstallationUpdate-available"
-              },
-              { "$ref": "#/components/schemas/EventPtyCreated" },
-              { "$ref": "#/components/schemas/EventPtyUpdated" },
-              { "$ref": "#/components/schemas/EventPtyExited" },
-              { "$ref": "#/components/schemas/EventPtyDeleted" },
-              { "$ref": "#/components/schemas/EventQuestionAsked" },
-              { "$ref": "#/components/schemas/EventQuestionReplied" },
-              { "$ref": "#/components/schemas/EventQuestionRejected" },
-              { "$ref": "#/components/schemas/EventSessionStatus" },
-              { "$ref": "#/components/schemas/EventSessionIdle" },
-              { "$ref": "#/components/schemas/EventSessionCompacted" },
-              { "$ref": "#/components/schemas/EventTodoUpdated" },
-              { "$ref": "#/components/schemas/EventWorkspaceReady" },
-              { "$ref": "#/components/schemas/EventWorkspaceFailed" },
-              { "$ref": "#/components/schemas/EventWorkspaceStatus" },
-              { "$ref": "#/components/schemas/EventMessageUpdated" },
-              { "$ref": "#/components/schemas/EventMessageRemoved" },
-              { "$ref": "#/components/schemas/EventMessagePartUpdated" },
-              { "$ref": "#/components/schemas/EventMessagePartRemoved" },
-              { "$ref": "#/components/schemas/EventSessionCreated" },
-              { "$ref": "#/components/schemas/EventSessionUpdated" },
-              { "$ref": "#/components/schemas/EventSessionDeleted" },
-              { "$ref": "#/components/schemas/EventSessionNextAgentSwitched" },
-              { "$ref": "#/components/schemas/EventSessionNextModelSwitched" },
-              { "$ref": "#/components/schemas/EventSessionNextPrompted" },
-              { "$ref": "#/components/schemas/EventSessionNextSynthetic" },
-              { "$ref": "#/components/schemas/EventSessionNextShellStarted" },
-              { "$ref": "#/components/schemas/EventSessionNextShellEnded" },
-              { "$ref": "#/components/schemas/EventSessionNextStepStarted" },
-              { "$ref": "#/components/schemas/EventSessionNextStepEnded" },
-              { "$ref": "#/components/schemas/EventSessionNextStepFailed" },
-              { "$ref": "#/components/schemas/EventSessionNextTextStarted" },
-              { "$ref": "#/components/schemas/EventSessionNextTextDelta" },
-              { "$ref": "#/components/schemas/EventSessionNextTextEnded" },
-              {
-                "$ref": "#/components/schemas/EventSessionNextReasoningStarted"
-              },
-              { "$ref": "#/components/schemas/EventSessionNextReasoningDelta" },
-              { "$ref": "#/components/schemas/EventSessionNextReasoningEnded" },
-              {
-                "$ref": "#/components/schemas/EventSessionNextToolInputStarted"
-              },
-              { "$ref": "#/components/schemas/EventSessionNextToolInputDelta" },
-              { "$ref": "#/components/schemas/EventSessionNextToolInputEnded" },
-              { "$ref": "#/components/schemas/EventSessionNextToolCalled" },
-              { "$ref": "#/components/schemas/EventSessionNextToolProgress" },
-              { "$ref": "#/components/schemas/EventSessionNextToolSuccess" },
-              { "$ref": "#/components/schemas/EventSessionNextToolFailed" },
-              { "$ref": "#/components/schemas/EventSessionNextRetried" },
-              {
-                "$ref": "#/components/schemas/EventSessionNextCompactionStarted"
-              },
-              {
-                "$ref": "#/components/schemas/EventSessionNextCompactionDelta"
-              },
-              {
-                "$ref": "#/components/schemas/EventSessionNextCompactionEnded"
-              },
-              { "$ref": "#/components/schemas/EventServerConnected" },
-              { "$ref": "#/components/schemas/EventGlobalDisposed" },
-              { "$ref": "#/components/schemas/EventModels-devRefreshed" },
-              { "$ref": "#/components/schemas/EventAccountAdded" },
-              { "$ref": "#/components/schemas/EventAccountRemoved" },
-              { "$ref": "#/components/schemas/EventAccountSwitched" },
-              { "$ref": "#/components/schemas/EventCatalogModelUpdated" },
-              { "$ref": "#/components/schemas/EventSessionNextAgentSwitched" },
-              { "$ref": "#/components/schemas/EventSessionNextModelSwitched" },
-              { "$ref": "#/components/schemas/EventSessionNextPrompted" },
-              { "$ref": "#/components/schemas/EventSessionNextSynthetic" },
-              { "$ref": "#/components/schemas/EventSessionNextShellStarted" },
-              { "$ref": "#/components/schemas/EventSessionNextShellEnded" },
-              { "$ref": "#/components/schemas/EventSessionNextStepStarted" },
-              { "$ref": "#/components/schemas/EventSessionNextStepEnded" },
-              { "$ref": "#/components/schemas/EventSessionNextStepFailed" },
-              { "$ref": "#/components/schemas/EventSessionNextTextStarted" },
-              { "$ref": "#/components/schemas/EventSessionNextTextDelta" },
-              { "$ref": "#/components/schemas/EventSessionNextTextEnded" },
-              {
-                "$ref": "#/components/schemas/EventSessionNextReasoningStarted"
-              },
-              { "$ref": "#/components/schemas/EventSessionNextReasoningDelta" },
-              { "$ref": "#/components/schemas/EventSessionNextReasoningEnded" },
-              {
-                "$ref": "#/components/schemas/EventSessionNextToolInputStarted"
-              },
-              { "$ref": "#/components/schemas/EventSessionNextToolInputDelta" },
-              { "$ref": "#/components/schemas/EventSessionNextToolInputEnded" },
-              { "$ref": "#/components/schemas/EventSessionNextToolCalled" },
-              { "$ref": "#/components/schemas/EventSessionNextToolProgress" },
-              { "$ref": "#/components/schemas/EventSessionNextToolSuccess" },
-              { "$ref": "#/components/schemas/EventSessionNextToolFailed" },
-              { "$ref": "#/components/schemas/EventSessionNextRetried" },
-              {
-                "$ref": "#/components/schemas/EventSessionNextCompactionStarted"
-              },
-              {
-                "$ref": "#/components/schemas/EventSessionNextCompactionDelta"
-              },
-              {
-                "$ref": "#/components/schemas/EventSessionNextCompactionEnded"
-              },
-              { "$ref": "#/components/schemas/SyncEventMessageUpdated" },
-              { "$ref": "#/components/schemas/SyncEventMessageRemoved" },
-              { "$ref": "#/components/schemas/SyncEventMessagePartUpdated" },
-              { "$ref": "#/components/schemas/SyncEventMessagePartRemoved" },
-              { "$ref": "#/components/schemas/SyncEventSessionCreated" },
-              { "$ref": "#/components/schemas/SyncEventSessionUpdated" },
-              { "$ref": "#/components/schemas/SyncEventSessionDeleted" },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextAgentSwitched"
-              },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextModelSwitched"
-              },
-              { "$ref": "#/components/schemas/SyncEventSessionNextPrompted" },
-              { "$ref": "#/components/schemas/SyncEventSessionNextSynthetic" },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextShellStarted"
-              },
-              { "$ref": "#/components/schemas/SyncEventSessionNextShellEnded" },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextStepStarted"
-              },
-              { "$ref": "#/components/schemas/SyncEventSessionNextStepEnded" },
-              { "$ref": "#/components/schemas/SyncEventSessionNextStepFailed" },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextTextStarted"
-              },
-              { "$ref": "#/components/schemas/SyncEventSessionNextTextDelta" },
-              { "$ref": "#/components/schemas/SyncEventSessionNextTextEnded" },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextReasoningStarted"
-              },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextReasoningDelta"
-              },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextReasoningEnded"
-              },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextToolInputStarted"
-              },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextToolInputDelta"
-              },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextToolInputEnded"
-              },
-              { "$ref": "#/components/schemas/SyncEventSessionNextToolCalled" },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextToolProgress"
-              },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextToolSuccess"
-              },
-              { "$ref": "#/components/schemas/SyncEventSessionNextToolFailed" },
-              { "$ref": "#/components/schemas/SyncEventSessionNextRetried" },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextCompactionStarted"
-              },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextCompactionDelta"
-              },
-              {
-                "$ref": "#/components/schemas/SyncEventSessionNextCompactionEnded"
-              }
+              { "$ref": "#/components/schemas/Event" },
+              { "$ref": "#/components/schemas/SyncEnvelope" }
             ]
           }
         },
-        "required": ["directory", "payload"],
+        "required": ["payload"],
         "additionalProperties": false
+      },
+      "SyncEnvelope": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string", "enum": ["sync"] },
+          "syncEvent": { "$ref": "#/components/schemas/SyncEventRecord" },
+          "id": { "type": "string" }
+        },
+        "required": ["type", "syncEvent", "id"],
+        "additionalProperties": false
+      },
+      "SyncEventRecord": {
+        "anyOf": [
+          { "$ref": "#/components/schemas/SyncEventMessageUpdated" },
+          { "$ref": "#/components/schemas/SyncEventMessageRemoved" },
+          { "$ref": "#/components/schemas/SyncEventMessagePartUpdated" },
+          { "$ref": "#/components/schemas/SyncEventMessagePartRemoved" },
+          { "$ref": "#/components/schemas/SyncEventSessionCreated" },
+          { "$ref": "#/components/schemas/SyncEventSessionUpdated" },
+          { "$ref": "#/components/schemas/SyncEventSessionDeleted" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextAgentSwitched" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextModelSwitched" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextPrompted" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextSynthetic" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextShellStarted" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextShellEnded" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextStepStarted" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextStepEnded" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextStepFailed" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextTextStarted" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextTextDelta" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextTextEnded" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextReasoningStarted" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextReasoningDelta" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextReasoningEnded" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextToolInputStarted" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextToolInputDelta" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextToolInputEnded" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextToolCalled" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextToolProgress" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextToolSuccess" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextToolFailed" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextRetried" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextCompactionStarted" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextCompactionDelta" },
+          { "$ref": "#/components/schemas/SyncEventSessionNextCompactionEnded" }
+        ]
       },
       "LogLevel": {
         "type": "string",
@@ -11382,11 +11241,10 @@
       "SyncEventMessageUpdated": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["message.updated.1"] },
+          "type": { "type": "string", "enum": ["message.updated.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11397,17 +11255,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventMessageRemoved": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["message.removed.1"] },
+          "type": { "type": "string", "enum": ["message.removed.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11418,17 +11275,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventMessagePartUpdated": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["message.part.updated.1"] },
+          "type": { "type": "string", "enum": ["message.part.updated.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11440,17 +11296,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventMessagePartRemoved": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["message.part.removed.1"] },
+          "type": { "type": "string", "enum": ["message.part.removed.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11462,17 +11317,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionCreated": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.created.1"] },
+          "type": { "type": "string", "enum": ["session.created.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11483,17 +11337,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionUpdated": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.updated.1"] },
+          "type": { "type": "string", "enum": ["session.updated.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11669,17 +11522,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionDeleted": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.deleted.1"] },
+          "type": { "type": "string", "enum": ["session.deleted.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11690,20 +11542,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextAgentSwitched": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": {
-            "type": "string",
-            "enum": ["session.next.agent.switched.1"]
-          },
+          "type": { "type": "string", "enum": ["session.next.agent.switched.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11715,20 +11563,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextModelSwitched": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": {
-            "type": "string",
-            "enum": ["session.next.model.switched.1"]
-          },
+          "type": { "type": "string", "enum": ["session.next.model.switched.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11749,17 +11593,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextPrompted": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.next.prompted.1"] },
+          "type": { "type": "string", "enum": ["session.next.prompted.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11771,17 +11614,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextSynthetic": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.next.synthetic.1"] },
+          "type": { "type": "string", "enum": ["session.next.synthetic.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11793,20 +11635,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextShellStarted": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": {
-            "type": "string",
-            "enum": ["session.next.shell.started.1"]
-          },
+          "type": { "type": "string", "enum": ["session.next.shell.started.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11819,17 +11657,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextShellEnded": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.next.shell.ended.1"] },
+          "type": { "type": "string", "enum": ["session.next.shell.ended.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11842,17 +11679,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextStepStarted": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.next.step.started.1"] },
+          "type": { "type": "string", "enum": ["session.next.step.started.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11875,17 +11711,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextStepEnded": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.next.step.ended.1"] },
+          "type": { "type": "string", "enum": ["session.next.step.ended.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11918,17 +11753,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextStepFailed": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.next.step.failed.1"] },
+          "type": { "type": "string", "enum": ["session.next.step.failed.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11940,17 +11774,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextTextStarted": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.next.text.started.1"] },
+          "type": { "type": "string", "enum": ["session.next.text.started.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11961,17 +11794,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextTextDelta": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.next.text.delta.1"] },
+          "type": { "type": "string", "enum": ["session.next.text.delta.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -11983,17 +11815,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextTextEnded": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.next.text.ended.1"] },
+          "type": { "type": "string", "enum": ["session.next.text.ended.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12005,20 +11836,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextReasoningStarted": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": {
-            "type": "string",
-            "enum": ["session.next.reasoning.started.1"]
-          },
+          "type": { "type": "string", "enum": ["session.next.reasoning.started.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12030,20 +11857,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextReasoningDelta": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": {
-            "type": "string",
-            "enum": ["session.next.reasoning.delta.1"]
-          },
+          "type": { "type": "string", "enum": ["session.next.reasoning.delta.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12056,20 +11879,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextReasoningEnded": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": {
-            "type": "string",
-            "enum": ["session.next.reasoning.ended.1"]
-          },
+          "type": { "type": "string", "enum": ["session.next.reasoning.ended.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12082,20 +11901,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextToolInputStarted": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": {
-            "type": "string",
-            "enum": ["session.next.tool.input.started.1"]
-          },
+          "type": { "type": "string", "enum": ["session.next.tool.input.started.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12108,20 +11923,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextToolInputDelta": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": {
-            "type": "string",
-            "enum": ["session.next.tool.input.delta.1"]
-          },
+          "type": { "type": "string", "enum": ["session.next.tool.input.delta.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12134,20 +11945,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextToolInputEnded": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": {
-            "type": "string",
-            "enum": ["session.next.tool.input.ended.1"]
-          },
+          "type": { "type": "string", "enum": ["session.next.tool.input.ended.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12160,17 +11967,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextToolCalled": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.next.tool.called.1"] },
+          "type": { "type": "string", "enum": ["session.next.tool.called.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12200,20 +12006,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextToolProgress": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": {
-            "type": "string",
-            "enum": ["session.next.tool.progress.1"]
-          },
+          "type": { "type": "string", "enum": ["session.next.tool.progress.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12241,17 +12043,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextToolSuccess": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.next.tool.success.1"] },
+          "type": { "type": "string", "enum": ["session.next.tool.success.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12289,17 +12090,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextToolFailed": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.next.tool.failed.1"] },
+          "type": { "type": "string", "enum": ["session.next.tool.failed.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12327,17 +12127,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextRetried": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": { "type": "string", "enum": ["session.next.retried.1"] },
+          "type": { "type": "string", "enum": ["session.next.retried.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12350,20 +12149,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextCompactionStarted": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": {
-            "type": "string",
-            "enum": ["session.next.compaction.started.1"]
-          },
+          "type": { "type": "string", "enum": ["session.next.compaction.started.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12375,20 +12170,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextCompactionDelta": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": {
-            "type": "string",
-            "enum": ["session.next.compaction.delta.1"]
-          },
+          "type": { "type": "string", "enum": ["session.next.compaction.delta.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12400,20 +12191,16 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "SyncEventSessionNextCompactionEnded": {
         "type": "object",
         "properties": {
-          "type": { "type": "string", "enum": ["sync"] },
-          "name": {
-            "type": "string",
-            "enum": ["session.next.compaction.ended.1"]
-          },
+          "type": { "type": "string", "enum": ["session.next.compaction.ended.1"] },
           "id": { "type": "string" },
           "seq": { "type": "number" },
-          "aggregateID": { "type": "string", "enum": ["sessionID"] },
+          "aggregateID": { "type": "string", "pattern": "^ses" },
           "data": {
             "type": "object",
             "properties": {
@@ -12426,7 +12213,7 @@
             "additionalProperties": false
           }
         },
-        "required": ["type", "name", "id", "seq", "aggregateID", "data"],
+        "required": ["type", "id", "seq", "aggregateID", "data"],
         "additionalProperties": false
       },
       "EventServerInstanceDisposed": {
