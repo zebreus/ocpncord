@@ -18,6 +18,7 @@ mod prompt_bar;
 mod theme;
 
 pub use app::{Action, App, AppMode, ModalId, Tab};
+pub use chat::{PartDisplayMode, PartKind};
 pub use command_palette::{default_commands, CommandPaletteModal};
 pub use event::{Event, KeyEvent, Modifiers, Scancode};
 pub use key_chord::KeyChord;

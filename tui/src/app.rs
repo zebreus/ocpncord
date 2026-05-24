@@ -14,8 +14,8 @@ use futures_core::Stream;
 use ocpncord_backend::{Backend, BackendEvent, EventEnvelope, EventScope};
 
 use crate::chat::{
-    loaded_messages_from_details, render_chat, user_loaded_message, ChatState, ChatTranscript,
-    LoadedMessage,
+    loaded_messages_from_details, render_chat, user_loaded_message, ChatDisplayPolicy, ChatState,
+    ChatTranscript, LoadedMessage, PartDisplayMode, PartKind,
 };
 use crate::command_palette::CommandPaletteModal;
 use crate::event::{Event, Scancode};
@@ -88,6 +88,7 @@ pub enum Action {
     ToggleSidePanel,
     ToggleSidePanelTab(Tab),
     SidePanelSelectTab(Tab),
+    SetDisplayMode(PartKind, PartDisplayMode),
     ReplyPermission(String, String, PermissionReplyAction),
     ReplyQuestion(String, String, Vec<Vec<String>>),
     RejectQuestion(String),
@@ -109,6 +110,7 @@ pub enum ModalId {
     ModelPicker,
     CommandPalette,
     ServerConfig,
+    DisplayConfig,
     PermissionApproval,
     QuestionApproval,
 }
@@ -249,6 +251,7 @@ enum TuiCommand {
     Diagnostics,
     Pty,
     Server,
+    Display,
     Abort,
     Dispose,
     Upgrade,
@@ -266,6 +269,7 @@ impl TuiCommand {
             "/diagnostics" => Some(Self::Diagnostics),
             "/pty" => Some(Self::Pty),
             "/server" => Some(Self::Server),
+            "/display" => Some(Self::Display),
             "/abort" => Some(Self::Abort),
             "/dispose" => Some(Self::Dispose),
             "/upgrade" => Some(Self::Upgrade),
@@ -444,6 +448,7 @@ pub struct AppState {
     session_directory_override: Option<String>,
     current_branch: Option<String>,
     current_server_url: String,
+    display_policy: ChatDisplayPolicy,
 }
 
 impl AppState {
@@ -489,6 +494,7 @@ impl AppState {
             session_directory_override: None,
             current_branch: None,
             current_server_url,
+            display_policy: ChatDisplayPolicy::default(),
         }
     }
 
@@ -1184,6 +1190,7 @@ impl AppState {
                     } => self.apply_message_removed(session_id, message_id),
                     ocpncord_backend::BackendEvent::MessagePartUpdated {
                         session_id,
+                        part_id,
                         ref part,
                         ..
                     } => {
@@ -1191,7 +1198,7 @@ impl AppState {
                             == Some(session_id.as_str())
                         {
                             self.mark_response_active();
-                            self.chat.merge_stream_part(part.clone());
+                            self.chat.merge_stream_part(Some(part_id), part.clone());
                         }
                     }
                     ocpncord_backend::BackendEvent::MessagePartDelta {
@@ -1568,6 +1575,15 @@ impl AppState {
                 )));
                 true
             }
+            TuiCommand::Display => {
+                if context.clear_prompt {
+                    self.prompt_bar.clear();
+                }
+                self.set_active_modal(Box::new(crate::modal::DisplayConfigModal::new(
+                    self.display_policy,
+                )));
+                true
+            }
             TuiCommand::Abort => {
                 if let Some(session) = &self.active_session {
                     self.queue_op(BackendOp::AbortSession {
@@ -1666,6 +1682,11 @@ impl AppState {
                     self.current_server_url.clone(),
                 )));
             }
+            Some(Action::OpenModal(ModalId::DisplayConfig)) => {
+                self.set_active_modal(Box::new(crate::modal::DisplayConfigModal::new(
+                    self.display_policy,
+                )));
+            }
             Some(Action::OpenModal(ModalId::PermissionApproval)) => {
                 self.open_permission_modal_if_idle();
             }
@@ -1732,6 +1753,16 @@ impl AppState {
             Some(Action::SidePanelSelectTab(tab)) => {
                 self.side_panel_tab = tab;
                 self.side_panel_scroll = 0;
+            }
+            Some(Action::SetDisplayMode(kind, mode)) => {
+                self.display_policy.set_mode(kind, mode);
+                if let Some(modal) = self
+                    .active_modal
+                    .as_deref_mut()
+                    .and_then(|modal| modal.as_display_config_mut())
+                {
+                    modal.set_policy(self.display_policy);
+                }
             }
             Some(Action::OpenTerminal(_pty_id)) => {
                 if self.active_mode == AppMode::Terminal {
@@ -2225,6 +2256,7 @@ impl AppState {
                         active_parts: self.chat.partial_parts(),
                         queued_messages: self.chat.queued_messages(),
                         is_streaming: self.is_streaming,
+                        display_policy: &self.display_policy,
                     },
                     self.chat_scroll,
                 );
@@ -4690,6 +4722,50 @@ mod tests {
             app.state.active_modal().map(|modal| modal.title()),
             Some("Server Connection")
         );
+    }
+
+    #[test]
+    fn slash_display_opens_display_config_modal() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        for ch in "/display".chars() {
+            run(&mut app, char_key(ch));
+        }
+        run(&mut app, enter_key());
+
+        assert_eq!(
+            app.state.active_modal().map(|modal| modal.title()),
+            Some("Display")
+        );
+    }
+
+    #[test]
+    fn display_policy_changes_current_rendering() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+        app.state.active_mode = AppMode::Chat;
+        app.state.chat.push_message(LoadedMessage {
+            id: Some("msg-file".into()),
+            session_id: Some("session".into()),
+            role: ocpncord_backend::MessageRole::Assistant,
+            parts: vec![ocpncord_backend::Part::File(ocpncord_backend::FilePart {
+                identity: Default::default(),
+                mime: "text/plain".into(),
+                url: "file:///tmp/report.txt".into(),
+                filename: Some("report.txt".into()),
+            })],
+        });
+
+        app.state.apply_action(Some(Action::SetDisplayMode(
+            PartKind::File,
+            PartDisplayMode::Hidden,
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(!screen.contains("report.txt"), "screen: {screen}");
     }
 
     #[test]

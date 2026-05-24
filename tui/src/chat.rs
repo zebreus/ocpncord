@@ -23,6 +23,149 @@ pub(crate) struct LoadedMessage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartDisplayMode {
+    Full,
+    Summary,
+    Hidden,
+}
+
+impl PartDisplayMode {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Full => Self::Summary,
+            Self::Summary => Self::Hidden,
+            Self::Hidden => Self::Full,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Full => "Full",
+            Self::Summary => "Summary",
+            Self::Hidden => "Hidden",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartKind {
+    Text,
+    Reasoning,
+    Tool,
+    Step,
+    File,
+    Snapshot,
+    Patch,
+    Agent,
+    Subtask,
+    Retry,
+    Compaction,
+}
+
+impl PartKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Text => "Text",
+            Self::Reasoning => "Reasoning",
+            Self::Tool => "Tools",
+            Self::Step => "Steps",
+            Self::File => "Files",
+            Self::Snapshot => "Snapshots",
+            Self::Patch => "Patches",
+            Self::Agent => "Agents",
+            Self::Subtask => "Subtasks",
+            Self::Retry => "Retries",
+            Self::Compaction => "Compactions",
+        }
+    }
+}
+
+pub(crate) const PART_KIND_ORDER: [PartKind; 11] = [
+    PartKind::Text,
+    PartKind::Reasoning,
+    PartKind::Tool,
+    PartKind::Step,
+    PartKind::File,
+    PartKind::Snapshot,
+    PartKind::Patch,
+    PartKind::Agent,
+    PartKind::Subtask,
+    PartKind::Retry,
+    PartKind::Compaction,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChatDisplayPolicy {
+    text: PartDisplayMode,
+    reasoning: PartDisplayMode,
+    tool: PartDisplayMode,
+    step: PartDisplayMode,
+    file: PartDisplayMode,
+    snapshot: PartDisplayMode,
+    patch: PartDisplayMode,
+    agent: PartDisplayMode,
+    subtask: PartDisplayMode,
+    retry: PartDisplayMode,
+    compaction: PartDisplayMode,
+}
+
+impl ChatDisplayPolicy {
+    pub(crate) fn mode_for_kind(&self, kind: PartKind) -> PartDisplayMode {
+        match kind {
+            PartKind::Text => self.text,
+            PartKind::Reasoning => self.reasoning,
+            PartKind::Tool => self.tool,
+            PartKind::Step => self.step,
+            PartKind::File => self.file,
+            PartKind::Snapshot => self.snapshot,
+            PartKind::Patch => self.patch,
+            PartKind::Agent => self.agent,
+            PartKind::Subtask => self.subtask,
+            PartKind::Retry => self.retry,
+            PartKind::Compaction => self.compaction,
+        }
+    }
+
+    pub(crate) fn set_mode(&mut self, kind: PartKind, mode: PartDisplayMode) {
+        match kind {
+            PartKind::Text => self.text = mode,
+            PartKind::Reasoning => self.reasoning = mode,
+            PartKind::Tool => self.tool = mode,
+            PartKind::Step => self.step = mode,
+            PartKind::File => self.file = mode,
+            PartKind::Snapshot => self.snapshot = mode,
+            PartKind::Patch => self.patch = mode,
+            PartKind::Agent => self.agent = mode,
+            PartKind::Subtask => self.subtask = mode,
+            PartKind::Retry => self.retry = mode,
+            PartKind::Compaction => self.compaction = mode,
+        }
+    }
+
+    pub(crate) fn mode_for_part(&self, part: &ocpncord_backend::Part) -> PartDisplayMode {
+        self.mode_for_kind(part_kind(part))
+    }
+}
+
+impl Default for ChatDisplayPolicy {
+    fn default() -> Self {
+        Self {
+            text: PartDisplayMode::Full,
+            reasoning: PartDisplayMode::Full,
+            tool: PartDisplayMode::Full,
+            step: PartDisplayMode::Hidden,
+            file: PartDisplayMode::Full,
+            snapshot: PartDisplayMode::Full,
+            patch: PartDisplayMode::Full,
+            agent: PartDisplayMode::Full,
+            subtask: PartDisplayMode::Full,
+            retry: PartDisplayMode::Full,
+            compaction: PartDisplayMode::Full,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamTextKind {
     Text,
     Reasoning,
@@ -140,9 +283,36 @@ impl ChatState {
             .retain(|message| message.id.as_deref() != Some(message_id));
     }
 
-    pub(crate) fn merge_stream_part(&mut self, part: ocpncord_backend::Part) -> Option<usize> {
+    pub(crate) fn merge_stream_part(
+        &mut self,
+        part_id: Option<String>,
+        part: ocpncord_backend::Part,
+    ) -> Option<usize> {
         if self.is_echoed_user_text(&part) {
             return None;
+        }
+
+        let keyed_part_id = part_id.or_else(|| part_identity_id(&part).map(ToOwned::to_owned));
+        if let Some(part_id) = keyed_part_id.as_ref() {
+            if let Some(index) = self
+                .partial_part_indices
+                .get(part_id)
+                .copied()
+                .filter(|index| *index < self.partial_parts.len())
+            {
+                if let Some(kind) = stream_text_kind(&part) {
+                    let incoming_text = stream_text(&part).unwrap_or_default();
+                    if !incoming_text.is_empty() {
+                        self.partial_texts
+                            .insert(part_id.clone(), incoming_text.clone());
+                        set_stream_text(&mut self.partial_parts[index], incoming_text, kind);
+                    }
+                    self.latest_text_part_index = Some(index);
+                } else {
+                    self.partial_parts[index] = part;
+                }
+                return Some(index);
+            }
         }
 
         if let Some(index) = self
@@ -152,6 +322,18 @@ impl ChatState {
         {
             if stream_text_kind(&part).is_some() {
                 self.latest_text_part_index = Some(index);
+            }
+            return Some(index);
+        }
+
+        if let Some(index) = self
+            .partial_parts
+            .iter()
+            .rposition(|existing| parts_describe_same_entity(existing, &part))
+        {
+            self.partial_parts[index] = part;
+            if let Some(part_id) = keyed_part_id {
+                self.partial_part_indices.insert(part_id, index);
             }
             return Some(index);
         }
@@ -180,6 +362,9 @@ impl ChatState {
 
         self.partial_parts.push(part);
         let index = self.partial_parts.len() - 1;
+        if let Some(part_id) = keyed_part_id {
+            self.partial_part_indices.insert(part_id, index);
+        }
         if stream_text_kind(&self.partial_parts[index]).is_some() {
             self.latest_text_part_index = Some(index);
         }
@@ -359,6 +544,82 @@ fn parts_equivalent(left: &ocpncord_backend::Part, right: &ocpncord_backend::Par
     }
 }
 
+fn parts_describe_same_entity(
+    left: &ocpncord_backend::Part,
+    right: &ocpncord_backend::Part,
+) -> bool {
+    match (left, right) {
+        (ocpncord_backend::Part::Tool(left), ocpncord_backend::Part::Tool(right)) => {
+            left.tool == right.tool
+        }
+        (ocpncord_backend::Part::StepStart(left), ocpncord_backend::Part::StepStart(right)) => {
+            left.session_id == right.session_id && left.snapshot == right.snapshot
+        }
+        (ocpncord_backend::Part::StepFinish(left), ocpncord_backend::Part::StepFinish(right)) => {
+            left.session_id == right.session_id
+                && left.snapshot == right.snapshot
+                && left.reason == right.reason
+        }
+        (ocpncord_backend::Part::File(left), ocpncord_backend::Part::File(right)) => {
+            left.url == right.url
+        }
+        (ocpncord_backend::Part::Snapshot(left), ocpncord_backend::Part::Snapshot(right)) => {
+            left.snapshot == right.snapshot
+        }
+        (ocpncord_backend::Part::Patch(left), ocpncord_backend::Part::Patch(right)) => {
+            left.hash == right.hash
+        }
+        (ocpncord_backend::Part::Agent(left), ocpncord_backend::Part::Agent(right)) => {
+            left.name == right.name
+        }
+        (ocpncord_backend::Part::Subtask(left), ocpncord_backend::Part::Subtask(right)) => {
+            left.agent == right.agent && left.description == right.description
+        }
+        (ocpncord_backend::Part::Retry(left), ocpncord_backend::Part::Retry(right)) => {
+            left.attempt == right.attempt
+        }
+        (ocpncord_backend::Part::Compaction(left), ocpncord_backend::Part::Compaction(right)) => {
+            left.auto == right.auto && left.overflow == right.overflow
+        }
+        _ => false,
+    }
+}
+
+fn part_identity_id(part: &ocpncord_backend::Part) -> Option<&str> {
+    match part {
+        ocpncord_backend::Part::Text(part) => part.identity.id.as_deref(),
+        ocpncord_backend::Part::Reasoning(part) => part.identity.id.as_deref(),
+        ocpncord_backend::Part::Tool(part) => part.identity.id.as_deref(),
+        ocpncord_backend::Part::StepStart(part) => part.identity.id.as_deref(),
+        ocpncord_backend::Part::StepFinish(part) => part.identity.id.as_deref(),
+        ocpncord_backend::Part::File(part) => part.identity.id.as_deref(),
+        ocpncord_backend::Part::Snapshot(part) => part.identity.id.as_deref(),
+        ocpncord_backend::Part::Patch(part) => part.identity.id.as_deref(),
+        ocpncord_backend::Part::Agent(part) => part.identity.id.as_deref(),
+        ocpncord_backend::Part::Subtask(part) => part.identity.id.as_deref(),
+        ocpncord_backend::Part::Retry(part) => part.identity.id.as_deref(),
+        ocpncord_backend::Part::Compaction(part) => part.identity.id.as_deref(),
+    }
+}
+
+fn part_kind(part: &ocpncord_backend::Part) -> PartKind {
+    match part {
+        ocpncord_backend::Part::Text(_) => PartKind::Text,
+        ocpncord_backend::Part::Reasoning(_) => PartKind::Reasoning,
+        ocpncord_backend::Part::Tool(_) => PartKind::Tool,
+        ocpncord_backend::Part::StepStart(_) | ocpncord_backend::Part::StepFinish(_) => {
+            PartKind::Step
+        }
+        ocpncord_backend::Part::File(_) => PartKind::File,
+        ocpncord_backend::Part::Snapshot(_) => PartKind::Snapshot,
+        ocpncord_backend::Part::Patch(_) => PartKind::Patch,
+        ocpncord_backend::Part::Agent(_) => PartKind::Agent,
+        ocpncord_backend::Part::Subtask(_) => PartKind::Subtask,
+        ocpncord_backend::Part::Retry(_) => PartKind::Retry,
+        ocpncord_backend::Part::Compaction(_) => PartKind::Compaction,
+    }
+}
+
 fn tool_states_equivalent(
     left: &ocpncord_backend::ToolState,
     right: &ocpncord_backend::ToolState,
@@ -410,6 +671,14 @@ fn stream_text_kind(part: &ocpncord_backend::Part) -> Option<StreamTextKind> {
     }
 }
 
+fn stream_text(part: &ocpncord_backend::Part) -> Option<String> {
+    match part {
+        ocpncord_backend::Part::Text(text) => Some(text.text.clone()),
+        ocpncord_backend::Part::Reasoning(reasoning) => Some(reasoning.text.clone()),
+        _ => None,
+    }
+}
+
 fn set_stream_text(part: &mut ocpncord_backend::Part, text: String, kind: StreamTextKind) {
     *part = match kind {
         StreamTextKind::Text => ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
@@ -430,6 +699,7 @@ pub(crate) struct ChatTranscript<'a> {
     pub active_parts: &'a [ocpncord_backend::Part],
     pub queued_messages: &'a [LoadedMessage],
     pub is_streaming: bool,
+    pub display_policy: &'a ChatDisplayPolicy,
 }
 
 /// Renders the Chat message area using the provided data.
@@ -456,15 +726,19 @@ pub(crate) fn render_chat(
 
     let mut lines: Vec<Line<'_>> = Vec::new();
     for msg in transcript.messages {
-        render_message(&mut lines, msg, theme);
+        render_message(&mut lines, msg, theme, transcript.display_policy);
     }
 
     for part in transcript.active_parts {
-        lines.extend(render_part(part, theme, true));
+        lines.extend(render_part_with_policy(
+            part,
+            theme,
+            transcript.display_policy,
+        ));
     }
 
     for msg in transcript.queued_messages {
-        render_queued_message(&mut lines, msg, theme);
+        render_queued_message(&mut lines, msg, theme, transcript.display_policy);
     }
 
     let full_width_height = wrapped_height(&lines, msg_area.width);
@@ -495,25 +769,38 @@ pub(crate) fn render_chat(
     }
 }
 
-fn render_message<'a>(lines: &mut Vec<Line<'a>>, msg: &'a LoadedMessage, theme: &'a Theme) {
+fn render_message<'a>(
+    lines: &mut Vec<Line<'a>>,
+    msg: &'a LoadedMessage,
+    theme: &'a Theme,
+    policy: &'a ChatDisplayPolicy,
+) {
     match msg.role {
-        ocpncord_backend::MessageRole::User => render_user_message(lines, msg, theme, false),
+        ocpncord_backend::MessageRole::User => {
+            render_user_message(lines, msg, theme, policy, false)
+        }
         ocpncord_backend::MessageRole::Assistant => {
             for part in &msg.parts {
-                lines.extend(render_part(part, theme, true));
+                lines.extend(render_part_with_policy(part, theme, policy));
             }
         }
     }
 }
 
-fn render_queued_message<'a>(lines: &mut Vec<Line<'a>>, msg: &'a LoadedMessage, theme: &'a Theme) {
-    render_user_message(lines, msg, theme, true);
+fn render_queued_message<'a>(
+    lines: &mut Vec<Line<'a>>,
+    msg: &'a LoadedMessage,
+    theme: &'a Theme,
+    policy: &'a ChatDisplayPolicy,
+) {
+    render_user_message(lines, msg, theme, policy, true);
 }
 
 fn render_user_message<'a>(
     lines: &mut Vec<Line<'a>>,
     msg: &'a LoadedMessage,
     theme: &'a Theme,
+    policy: &'a ChatDisplayPolicy,
     queued: bool,
 ) {
     for part in &msg.parts {
@@ -528,69 +815,142 @@ fn render_user_message<'a>(
                     );
                 }
             }
-            _ => lines.extend(render_part(part, theme, true)),
+            _ => lines.extend(render_part_with_policy(part, theme, policy)),
         }
     }
 }
 
+#[cfg(test)]
 fn render_part<'a>(
     part: &'a ocpncord_backend::Part,
     theme: &'a Theme,
     show_details: bool,
 ) -> Vec<Line<'a>> {
+    let mode = if show_details {
+        ChatDisplayPolicy::default().mode_for_part(part)
+    } else {
+        PartDisplayMode::Summary
+    };
+    render_part_with_mode(part, theme, mode)
+}
+
+fn render_part_with_policy<'a>(
+    part: &'a ocpncord_backend::Part,
+    theme: &'a Theme,
+    policy: &'a ChatDisplayPolicy,
+) -> Vec<Line<'a>> {
+    render_part_with_mode(part, theme, policy.mode_for_part(part))
+}
+
+fn render_part_with_mode<'a>(
+    part: &'a ocpncord_backend::Part,
+    theme: &'a Theme,
+    mode: PartDisplayMode,
+) -> Vec<Line<'a>> {
+    if mode == PartDisplayMode::Hidden {
+        return Vec::new();
+    }
+
     match part {
         ocpncord_backend::Part::Text(tp) => styled_lines(tp.text.as_str(), theme.part_text),
         ocpncord_backend::Part::Reasoning(rp) => {
-            if show_details {
+            if mode == PartDisplayMode::Full {
                 reasoning_lines(rp.text.as_str(), theme.part_reasoning)
             } else {
                 vec![Line::from("reasoning hidden").style(theme.text_dim)]
             }
         }
-        ocpncord_backend::Part::Tool(tp) => {
-            let (icon, style) = match &tp.state {
-                ocpncord_backend::ToolState::Pending { .. } => ("...", theme.part_tool_idle),
-                ocpncord_backend::ToolState::Running { .. } => (">>>", theme.part_tool_running),
-                ocpncord_backend::ToolState::Completed { .. } => ("[ok]", theme.part_tool_done),
-                ocpncord_backend::ToolState::Error { .. } => ("[!!]", theme.part_tool_error),
-            };
-            if show_details {
-                let summary = match &tp.state {
-                    ocpncord_backend::ToolState::Completed { output, .. } => {
-                        alloc::format!("{icon} {} - done: {output}", tp.tool)
-                    }
-                    ocpncord_backend::ToolState::Error { error, .. } => {
-                        alloc::format!("{icon} {} - error: {error}", tp.tool)
-                    }
-                    _ => alloc::format!("{icon} {}", tp.tool),
-                };
-                styled_lines_owned(summary, style)
+        ocpncord_backend::Part::Tool(tp) => tool_lines(tp, theme, mode),
+        ocpncord_backend::Part::StepStart(sp) => {
+            if mode == PartDisplayMode::Summary {
+                vec![Line::from("[step] started").style(theme.part_step_divider)]
             } else {
-                vec![Line::from(alloc::format!("{icon} {}", tp.tool)).style(style)]
+                let mut lines = vec![Line::from("[step] started").style(theme.part_step_divider)];
+                push_optional_line(
+                    &mut lines,
+                    "snapshot",
+                    sp.snapshot.as_deref(),
+                    theme.text_dim,
+                );
+                push_optional_line(
+                    &mut lines,
+                    "session",
+                    sp.session_id.as_deref(),
+                    theme.text_dim,
+                );
+                lines
             }
         }
-        ocpncord_backend::Part::StepStart(_) | ocpncord_backend::Part::StepFinish(_) => Vec::new(),
+        ocpncord_backend::Part::StepFinish(sp) => {
+            if mode == PartDisplayMode::Summary {
+                vec![Line::from("[step] finished").style(theme.part_step_divider)]
+            } else {
+                let mut lines = vec![Line::from("[step] finished").style(theme.part_step_divider)];
+                push_optional_line(&mut lines, "reason", sp.reason.as_deref(), theme.text_dim);
+                push_optional_line(
+                    &mut lines,
+                    "snapshot",
+                    sp.snapshot.as_deref(),
+                    theme.text_dim,
+                );
+                push_optional_line(
+                    &mut lines,
+                    "session",
+                    sp.session_id.as_deref(),
+                    theme.text_dim,
+                );
+                lines
+            }
+        }
         ocpncord_backend::Part::File(fp) => {
             let label = fp.filename.as_deref().unwrap_or(&fp.url);
-            vec![Line::from(alloc::format!("[file] {label}")).style(theme.part_text)]
+            if mode == PartDisplayMode::Summary {
+                vec![Line::from(alloc::format!("[file] {label}")).style(theme.part_file)]
+            } else {
+                vec![
+                    Line::from(alloc::format!("[file] {label}")).style(theme.part_file),
+                    Line::from(alloc::format!("  url: {}", fp.url)).style(theme.text_dim),
+                    Line::from(alloc::format!("  mime: {}", fp.mime)).style(theme.text_dim),
+                ]
+            }
         }
         ocpncord_backend::Part::Snapshot(sp) => {
-            vec![Line::from(alloc::format!("[snapshot] {}", sp.snapshot)).style(theme.text_dim)]
+            vec![Line::from(alloc::format!("[snapshot] {}", sp.snapshot)).style(theme.part_snapshot)]
         }
         ocpncord_backend::Part::Patch(pp) => {
-            vec![
-                Line::from(alloc::format!("[patch] {} files", pp.files.len()))
-                    .style(theme.text_dim),
-            ]
+            let mut lines = vec![Line::from(alloc::format!(
+                "[patch] {} files {}",
+                pp.files.len(),
+                pp.hash
+            ))
+            .style(theme.part_patch)];
+            if mode == PartDisplayMode::Full {
+                for file in &pp.files {
+                    lines.push(Line::from(alloc::format!("  {file}")).style(theme.text_dim));
+                }
+            }
+            lines
         }
         ocpncord_backend::Part::Agent(ap) => {
-            vec![Line::from(alloc::format!("[agent] {}", ap.name)).style(theme.text_dim)]
+            vec![Line::from(alloc::format!("[agent] {}", ap.name)).style(theme.part_agent)]
         }
         ocpncord_backend::Part::Subtask(st) => {
-            vec![Line::from(alloc::format!("[subtask] {}", st.description)).style(theme.text_dim)]
+            if mode == PartDisplayMode::Summary {
+                vec![Line::from(alloc::format!("[subtask] {}", st.description))
+                    .style(theme.part_subtask)]
+            } else {
+                let mut lines = vec![Line::from(alloc::format!(
+                    "[subtask] {} ({})",
+                    st.description,
+                    st.agent
+                ))
+                .style(theme.part_subtask)];
+                push_text_block(&mut lines, "prompt", st.prompt.as_str(), theme.text_dim);
+                lines
+            }
         }
         ocpncord_backend::Part::Retry(rp) => {
-            vec![Line::from(alloc::format!("[retry #{}]", rp.attempt)).style(theme.text_dim)]
+            vec![Line::from(alloc::format!("[retry #{}]", rp.attempt)).style(theme.part_retry)]
         }
         ocpncord_backend::Part::Compaction(cp) => {
             let label = if cp.overflow == Some(true) {
@@ -598,8 +958,146 @@ fn render_part<'a>(
             } else {
                 "compaction"
             };
-            vec![Line::from(label).style(theme.text_dim)]
+            if mode == PartDisplayMode::Summary {
+                vec![Line::from(label).style(theme.part_compaction)]
+            } else {
+                vec![Line::from(alloc::format!("{label}: auto={}", cp.auto))
+                    .style(theme.part_compaction)]
+            }
         }
+    }
+}
+
+fn tool_lines<'a>(
+    part: &'a ocpncord_backend::ToolPart,
+    theme: &'a Theme,
+    mode: PartDisplayMode,
+) -> Vec<Line<'a>> {
+    let (icon, status, style) = match &part.state {
+        ocpncord_backend::ToolState::Pending { .. } => ("...", "pending", theme.part_tool_idle),
+        ocpncord_backend::ToolState::Running { .. } => (">>>", "running", theme.part_tool_running),
+        ocpncord_backend::ToolState::Completed { .. } => ("[ok]", "done", theme.part_tool_done),
+        ocpncord_backend::ToolState::Error { .. } => ("[!!]", "error", theme.part_tool_error),
+    };
+
+    if mode == PartDisplayMode::Summary {
+        let label = match &part.state {
+            ocpncord_backend::ToolState::Completed { title, .. } => {
+                alloc::format!("{icon} {} - {status}: {title}", part.tool)
+            }
+            ocpncord_backend::ToolState::Running { title, .. } => title
+                .as_ref()
+                .map(|title| alloc::format!("{icon} {} - {status}: {title}", part.tool))
+                .unwrap_or_else(|| alloc::format!("{icon} {} - {status}", part.tool)),
+            _ => alloc::format!("{icon} {} - {status}", part.tool),
+        };
+        return vec![Line::from(label).style(style)];
+    }
+
+    let mut lines =
+        vec![Line::from(alloc::format!("{icon} {} - {status}", part.tool)).style(style)];
+    match &part.state {
+        ocpncord_backend::ToolState::Pending { input, raw } => {
+            push_map_lines(&mut lines, "input", input, theme.text_dim);
+            push_optional_line(&mut lines, "raw", nonempty(raw), theme.text_dim);
+        }
+        ocpncord_backend::ToolState::Running {
+            input,
+            title,
+            metadata,
+            ..
+        } => {
+            push_optional_line(&mut lines, "title", title.as_deref(), theme.text_dim);
+            push_map_lines(&mut lines, "input", input, theme.text_dim);
+            if let Some(metadata) = metadata {
+                push_map_lines(&mut lines, "metadata", metadata, theme.text_dim);
+            }
+        }
+        ocpncord_backend::ToolState::Completed {
+            input,
+            output,
+            title,
+            metadata,
+            attachments,
+            ..
+        } => {
+            push_optional_line(&mut lines, "title", nonempty(title), theme.text_dim);
+            push_map_lines(&mut lines, "input", input, theme.text_dim);
+            push_map_lines(&mut lines, "metadata", metadata, theme.text_dim);
+            push_text_block(&mut lines, "output", output.as_str(), style);
+            for attachment in attachments {
+                let label = attachment.filename.as_deref().unwrap_or(&attachment.url);
+                lines.push(
+                    Line::from(alloc::format!(
+                        "  attachment: {label} ({})",
+                        attachment.mime
+                    ))
+                    .style(theme.text_dim),
+                );
+                lines.push(
+                    Line::from(alloc::format!("    {}", attachment.url)).style(theme.text_dim),
+                );
+            }
+        }
+        ocpncord_backend::ToolState::Error {
+            input,
+            error,
+            metadata,
+            ..
+        } => {
+            push_map_lines(&mut lines, "input", input, theme.text_dim);
+            if let Some(metadata) = metadata {
+                push_map_lines(&mut lines, "metadata", metadata, theme.text_dim);
+            }
+            push_text_block(&mut lines, "error", error.as_str(), style);
+        }
+    }
+    lines
+}
+
+fn nonempty(value: &str) -> Option<&str> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn push_optional_line(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    value: Option<&str>,
+    style: Style,
+) {
+    if let Some(value) = value {
+        if !value.is_empty() {
+            lines.push(Line::from(alloc::format!("  {label}: {value}")).style(style));
+        }
+    }
+}
+
+fn push_map_lines(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    values: &BTreeMap<String, String>,
+    style: Style,
+) {
+    if values.is_empty() {
+        return;
+    }
+    lines.push(Line::from(alloc::format!("  {label}:")).style(style));
+    for (key, value) in values {
+        lines.push(Line::from(alloc::format!("    {key}: {value}")).style(style));
+    }
+}
+
+fn push_text_block(lines: &mut Vec<Line<'static>>, label: &str, text: &str, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    lines.push(Line::from(alloc::format!("  {label}:")).style(style));
+    for line in text.split('\n') {
+        lines.push(Line::from(alloc::format!("    {line}")).style(style));
     }
 }
 
@@ -607,17 +1105,6 @@ fn styled_lines(text: &str, style: Style) -> Vec<Line<'_>> {
     let mut lines = Vec::new();
     for line in text.split('\n') {
         lines.push(Line::from(line).style(style));
-    }
-    if lines.is_empty() {
-        lines.push(Line::from("").style(style));
-    }
-    lines
-}
-
-fn styled_lines_owned(text: alloc::string::String, style: Style) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for line in text.split('\n') {
-        lines.push(Line::from(alloc::string::String::from(line)).style(style));
     }
     if lines.is_empty() {
         lines.push(Line::from("").style(style));
@@ -676,6 +1163,7 @@ mod tests {
                         active_parts: &[],
                         queued_messages: &[],
                         is_streaming: false,
+                        display_policy: &ChatDisplayPolicy::default(),
                     },
                     0,
                 );
@@ -713,6 +1201,7 @@ mod tests {
                         active_parts: &[],
                         queued_messages: &[],
                         is_streaming: false,
+                        display_policy: &ChatDisplayPolicy::default(),
                     },
                     0,
                 );
@@ -745,6 +1234,7 @@ mod tests {
                         active_parts: &partial,
                         queued_messages: &[],
                         is_streaming: true,
+                        display_policy: &ChatDisplayPolicy::default(),
                     },
                     0,
                 );
@@ -860,12 +1350,14 @@ mod tests {
     #[test]
     fn tool_completed_shows_output() {
         let theme = Theme::default();
+        let mut input = alloc::collections::BTreeMap::new();
+        input.insert("command".into(), "git status --short".into());
         let part = Part::Tool(ToolPart {
             identity: Default::default(),
             tool: "grep".into(),
             state: ToolState::Completed {
-                input: alloc::collections::BTreeMap::new(),
-                output: "found 3 matches".into(),
+                input,
+                output: "found 3 matches\nsrc/lib.rs".into(),
                 title: "grep".into(),
                 metadata: alloc::collections::BTreeMap::new(),
                 time: ocpncord_backend::ToolTimeCompleted { start: 0, end: 1 },
@@ -873,26 +1365,247 @@ mod tests {
             },
         });
         let lines = render_part(&part, &theme, true);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].to_string().contains("found 3 matches"));
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("git status --short"), "{rendered}");
+        assert!(rendered.contains("found 3 matches"), "{rendered}");
+        assert!(rendered.contains("src/lib.rs"), "{rendered}");
     }
 
     #[test]
     fn tool_error_shows_error_message() {
         let theme = Theme::default();
+        let mut input = alloc::collections::BTreeMap::new();
+        input.insert("file".into(), "src/main.rs".into());
         let part = Part::Tool(ToolPart {
             identity: Default::default(),
             tool: "curl".into(),
             state: ToolState::Error {
-                input: alloc::collections::BTreeMap::new(),
+                input,
                 error: "timeout".into(),
                 metadata: None,
                 time: ocpncord_backend::ToolTimeCompleted { start: 0, end: 1 },
             },
         });
         let lines = render_part(&part, &theme, true);
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("src/main.rs"), "{rendered}");
+        assert!(rendered.contains("timeout"), "{rendered}");
+    }
+
+    #[test]
+    fn tool_summary_hides_full_output() {
+        let theme = Theme::default();
+        let part = Part::Tool(ToolPart {
+            identity: Default::default(),
+            tool: "bash".into(),
+            state: ToolState::Completed {
+                input: alloc::collections::BTreeMap::new(),
+                output: "line one\nline two".into(),
+                title: "git diff --stat".into(),
+                metadata: alloc::collections::BTreeMap::new(),
+                time: ocpncord_backend::ToolTimeCompleted { start: 0, end: 1 },
+                attachments: Vec::new(),
+            },
+        });
+        let lines = render_part_with_mode(&part, &theme, PartDisplayMode::Summary);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].to_string().contains("timeout"));
+        assert!(lines[0].to_string().contains("git diff --stat"));
+        assert!(!lines[0].to_string().contains("line one"));
+    }
+
+    #[test]
+    fn display_policy_can_hide_files() {
+        let theme = Theme::default();
+        let mut policy = ChatDisplayPolicy::default();
+        policy.set_mode(PartKind::File, PartDisplayMode::Hidden);
+        let part = Part::File(FilePart {
+            identity: Default::default(),
+            mime: "text/plain".into(),
+            url: "file:///tmp/report.txt".into(),
+            filename: Some("report.txt".into()),
+        });
+        assert!(render_part_with_policy(&part, &theme, &policy).is_empty());
+    }
+
+    #[test]
+    fn stream_tool_updates_with_same_part_id_replace_previous_state() {
+        let mut state = ChatState::new();
+        let mut input = alloc::collections::BTreeMap::new();
+        input.insert("command".into(), "git status --short".into());
+
+        state.merge_stream_part(
+            Some("tool-1".into()),
+            Part::Tool(ToolPart {
+                identity: Default::default(),
+                tool: "bash".into(),
+                state: ToolState::Pending {
+                    input: input.clone(),
+                    raw: "git status --short".into(),
+                },
+            }),
+        );
+        state.merge_stream_part(
+            Some("tool-1".into()),
+            Part::Tool(ToolPart {
+                identity: Default::default(),
+                tool: "bash".into(),
+                state: ToolState::Completed {
+                    input,
+                    output: " M tui/src/chat.rs".into(),
+                    title: "git status --short".into(),
+                    metadata: alloc::collections::BTreeMap::new(),
+                    time: ocpncord_backend::ToolTimeCompleted { start: 0, end: 1 },
+                    attachments: Vec::new(),
+                },
+            }),
+        );
+
+        assert_eq!(state.partial_parts().len(), 1);
+        match &state.partial_parts()[0] {
+            Part::Tool(tool) => match &tool.state {
+                ToolState::Completed { output, .. } => {
+                    assert!(output.contains("tui/src/chat.rs"));
+                }
+                other => panic!("expected completed tool, got {other:?}"),
+            },
+            other => panic!("expected tool part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_completed_tool_update_does_not_duplicate_output() {
+        let mut state = ChatState::new();
+        let tool = Part::Tool(ToolPart {
+            identity: Default::default(),
+            tool: "bash".into(),
+            state: ToolState::Completed {
+                input: alloc::collections::BTreeMap::new(),
+                output: "done".into(),
+                title: "echo done".into(),
+                metadata: alloc::collections::BTreeMap::new(),
+                time: ocpncord_backend::ToolTimeCompleted { start: 0, end: 1 },
+                attachments: Vec::new(),
+            },
+        });
+
+        state.merge_stream_part(Some("tool-1".into()), tool.clone());
+        state.merge_stream_part(Some("tool-1".into()), tool);
+
+        assert_eq!(state.partial_parts().len(), 1);
+    }
+
+    #[test]
+    fn unkeyed_file_updates_with_same_url_replace_previous_state() {
+        let mut state = ChatState::new();
+        state.merge_stream_part(
+            None,
+            Part::File(FilePart {
+                identity: Default::default(),
+                mime: "text/plain".into(),
+                url: "file:///tmp/report.txt".into(),
+                filename: Some("old.txt".into()),
+            }),
+        );
+        state.merge_stream_part(
+            None,
+            Part::File(FilePart {
+                identity: Default::default(),
+                mime: "text/markdown".into(),
+                url: "file:///tmp/report.txt".into(),
+                filename: Some("report.md".into()),
+            }),
+        );
+
+        assert_eq!(state.partial_parts().len(), 1);
+        match &state.partial_parts()[0] {
+            Part::File(file) => {
+                assert_eq!(file.filename.as_deref(), Some("report.md"));
+                assert_eq!(file.mime, "text/markdown");
+            }
+            other => panic!("expected file part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unkeyed_patch_updates_with_same_hash_replace_previous_state() {
+        let mut state = ChatState::new();
+        state.merge_stream_part(
+            None,
+            Part::Patch(PatchPart {
+                identity: Default::default(),
+                hash: "abc123".into(),
+                files: vec!["src/lib.rs".into()],
+            }),
+        );
+        state.merge_stream_part(
+            None,
+            Part::Patch(PatchPart {
+                identity: Default::default(),
+                hash: "abc123".into(),
+                files: vec!["src/lib.rs".into(), "src/app.rs".into()],
+            }),
+        );
+
+        assert_eq!(state.partial_parts().len(), 1);
+        match &state.partial_parts()[0] {
+            Part::Patch(patch) => assert_eq!(patch.files.len(), 2),
+            other => panic!("expected patch part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unkeyed_subtask_updates_with_same_agent_and_description_replace_previous_state() {
+        let mut state = ChatState::new();
+        state.merge_stream_part(
+            None,
+            Part::Subtask(SubtaskPart {
+                identity: Default::default(),
+                prompt: "first prompt".into(),
+                description: "review renderer".into(),
+                agent: "build".into(),
+            }),
+        );
+        state.merge_stream_part(
+            None,
+            Part::Subtask(SubtaskPart {
+                identity: Default::default(),
+                prompt: "updated prompt".into(),
+                description: "review renderer".into(),
+                agent: "build".into(),
+            }),
+        );
+
+        assert_eq!(state.partial_parts().len(), 1);
+        match &state.partial_parts()[0] {
+            Part::Subtask(subtask) => assert_eq!(subtask.prompt, "updated prompt"),
+            other => panic!("expected subtask part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_keyed_text_update_does_not_clear_accumulated_delta() {
+        let mut state = ChatState::new();
+        state.merge_stream_delta("text-1".into(), "hello".into());
+        state.merge_stream_part(
+            Some("text-1".into()),
+            Part::Text(TextPart {
+                identity: Default::default(),
+                text: String::new(),
+            }),
+        );
+
+        match &state.partial_parts()[0] {
+            Part::Text(text) => assert_eq!(text.text, "hello"),
+            other => panic!("expected text part, got {other:?}"),
+        }
     }
 
     #[test]

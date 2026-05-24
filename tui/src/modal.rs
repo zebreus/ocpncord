@@ -2,6 +2,7 @@ use ratatui::layout::Rect;
 use ratatui::Frame;
 
 use crate::app::{Action, PermissionReplyAction};
+use crate::chat::{ChatDisplayPolicy, PART_KIND_ORDER};
 use crate::event::{Event, Scancode};
 use crate::theme::Theme;
 use alloc::collections::BTreeMap;
@@ -19,6 +20,9 @@ pub trait Modal {
         None
     }
     fn as_server_config_mut(&mut self) -> Option<&mut ServerConfigModal> {
+        None
+    }
+    fn as_display_config_mut(&mut self) -> Option<&mut DisplayConfigModal> {
         None
     }
     fn preferred_size(&self, area: Rect) -> (u16, u16) {
@@ -445,6 +449,107 @@ impl Modal for ServerConfigModal {
             ((area.width as u32 * 3) / 5).clamp(50, area.width as u32) as u16
         };
         (width, 10_u16.min(area.height))
+    }
+}
+
+// --- Display config modal ---
+
+pub struct DisplayConfigModal {
+    policy: ChatDisplayPolicy,
+    selected: usize,
+}
+
+impl DisplayConfigModal {
+    pub(crate) fn new(policy: ChatDisplayPolicy) -> Self {
+        Self {
+            policy,
+            selected: 0,
+        }
+    }
+
+    pub(crate) fn set_policy(&mut self, policy: ChatDisplayPolicy) {
+        self.policy = policy;
+    }
+
+    fn selected_kind(&self) -> crate::chat::PartKind {
+        PART_KIND_ORDER[self.selected.min(PART_KIND_ORDER.len().saturating_sub(1))]
+    }
+
+    fn selected_next_action(&self) -> Action {
+        let kind = self.selected_kind();
+        Action::SetDisplayMode(kind, self.policy.mode_for_kind(kind).next())
+    }
+}
+
+impl Modal for DisplayConfigModal {
+    fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect) {
+        let rows: Vec<ListItem<'_>> = PART_KIND_ORDER
+            .iter()
+            .map(|kind| {
+                let mode = self.policy.mode_for_kind(*kind);
+                ListItem::new(Line::from(alloc::format!(
+                    "{:<12} {}",
+                    kind.label(),
+                    mode.label()
+                )))
+            })
+            .collect();
+        let mut state = ListState::default().with_selected(Some(self.selected));
+        StatefulWidget::render(
+            List::new(rows)
+                .style(theme.text)
+                .highlight_style(theme.selection)
+                .highlight_symbol("> "),
+            area,
+            frame.buffer_mut(),
+            &mut state,
+        );
+
+        if area.height > 0 {
+            let help_y = area.y + area.height.saturating_sub(1);
+            Line::from("Up/Down: select  Enter/Space: cycle  Esc: close")
+                .style(theme.text_dim)
+                .render(Rect::new(area.x, help_y, area.width, 1), frame.buffer_mut());
+        }
+    }
+
+    fn handle_event(&mut self, event: Event) -> Action {
+        match event {
+            Event::Key(ref ke) => match ke.scancode {
+                Scancode::Escape => Action::CloseModal,
+                Scancode::Up => {
+                    self.selected = self.selected.saturating_sub(1);
+                    Action::None
+                }
+                Scancode::Down => {
+                    self.selected = self
+                        .selected
+                        .saturating_add(1)
+                        .min(PART_KIND_ORDER.len().saturating_sub(1));
+                    Action::None
+                }
+                Scancode::Enter | Scancode::Char(' ') => self.selected_next_action(),
+                _ => Action::None,
+            },
+            _ => Action::None,
+        }
+    }
+
+    fn title(&self) -> &str {
+        "Display"
+    }
+
+    fn as_display_config_mut(&mut self) -> Option<&mut DisplayConfigModal> {
+        Some(self)
+    }
+
+    fn preferred_size(&self, area: Rect) -> (u16, u16) {
+        let width = if area.width < 36 {
+            area.width
+        } else {
+            ((area.width as u32 * 2) / 5).clamp(36, area.width as u32) as u16
+        };
+        (width, 15.min(area.height))
     }
 }
 
@@ -945,6 +1050,7 @@ impl Modal for HelpModal {
             ("  /diagnostics  Toggle diagnostics panel", false),
             ("  /pty          Toggle terminal panel", false),
             ("  /server       Configure server connection", false),
+            ("  /display      Configure transcript detail", false),
             ("  /abort        Abort current session", false),
             ("  /exit         Quit", false),
             ("", false),
@@ -961,7 +1067,6 @@ impl Modal for HelpModal {
             ("  Tab           Cycle agent forward", false),
             ("  Shift+Tab     Cycle agent backward", false),
             ("  Escape        Close modal / interrupt", false),
-            ("", false),
             ("Input Prefixes", true),
             ("  /             Command mode", false),
             ("  !             Shell mode", false),
@@ -1056,6 +1161,19 @@ mod tests {
         assert_eq!(
             action,
             Action::TestServerUrl("http://localhost:4096".into())
+        );
+    }
+
+    #[test]
+    fn display_config_modal_cycles_selected_part_mode() {
+        let mut modal = DisplayConfigModal::new(ChatDisplayPolicy::default());
+        let action = modal.handle_event(key(Scancode::Enter));
+        assert_eq!(
+            action,
+            Action::SetDisplayMode(
+                crate::chat::PartKind::Text,
+                crate::chat::PartDisplayMode::Summary
+            )
         );
     }
 
