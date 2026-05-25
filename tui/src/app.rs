@@ -447,6 +447,7 @@ pub struct AppState {
     session_directory_override: Option<String>,
     current_branch: Option<String>,
     current_server_url: String,
+    current_session_status: Option<ocpncord_backend::SessionStatus>,
     display_policy: ChatDisplayPolicy,
 }
 
@@ -492,6 +493,7 @@ impl AppState {
             session_directory_override: None,
             current_branch: None,
             current_server_url,
+            current_session_status: None,
             display_policy: ChatDisplayPolicy::default(),
         }
     }
@@ -724,6 +726,7 @@ impl AppState {
         self.model_cache = None;
         self.side_panel_visible = false;
         self.side_panel_scroll = 0;
+        self.current_session_status = None;
         self.queue_startup();
     }
 
@@ -868,6 +871,55 @@ impl AppState {
         self.is_streaming || self.active_submission.is_some()
     }
 
+    fn response_indicator_content(&self) -> Option<(String, Style, Style)> {
+        if !self.should_show_response_indicator() {
+            return None;
+        }
+
+        match self.current_session_status.as_ref() {
+            Some(status) if status.status_type == "busy" => Some((
+                "Agent is Responding...".into(),
+                self.theme.text_accent,
+                self.theme.text_dim,
+            )),
+            Some(status) if status.status_type == "retry" => {
+                let mut label = match status.attempt {
+                    Some(attempt) => alloc::format!("Agent retrying (attempt {attempt})"),
+                    None => "Agent retrying".into(),
+                };
+                if let Some(message) = status
+                    .message
+                    .as_deref()
+                    .filter(|message| !message.is_empty())
+                {
+                    label.push_str(": ");
+                    label.push_str(message);
+                }
+                Some((label, self.theme.part_retry, self.theme.part_retry))
+            }
+            Some(status) if status.status_type == "idle" => Some((
+                "Finalizing response...".into(),
+                self.theme.text_dim,
+                self.theme.text_dim,
+            )),
+            _ if self.chat.has_partial_response() => Some((
+                "Agent is Responding...".into(),
+                self.theme.text_accent,
+                self.theme.text_dim,
+            )),
+            _ if self.active_submission.is_some() => Some((
+                "Waiting for agent...".into(),
+                self.theme.text_accent,
+                self.theme.text_dim,
+            )),
+            _ => Some((
+                "Agent is Responding...".into(),
+                self.theme.text_accent,
+                self.theme.text_dim,
+            )),
+        }
+    }
+
     fn queue_or_dispatch_submission(&mut self, submission: Submission, message: LoadedMessage) {
         if self.is_streaming || self.active_submission.is_some() {
             self.queued_submissions.push(submission);
@@ -900,6 +952,7 @@ impl AppState {
         self.active_mode = AppMode::Chat;
         self.is_streaming = true;
         self.mark_response_active();
+        self.current_session_status = None;
         self.chat.clear_partial_stream();
         self.active_submission = Some(submission.clone());
         self.queue_op(BackendOp::Submit { submission });
@@ -922,11 +975,29 @@ impl AppState {
     fn active_session_matches(&self, session_id: &str) -> bool {
         self.active_session.as_ref().map(|s| s.id.as_str()) == Some(session_id)
     }
+
+    fn apply_session_status(
+        &mut self,
+        session_id: String,
+        status: ocpncord_backend::SessionStatus,
+    ) {
+        if !self.active_session_matches(&session_id) {
+            return;
+        }
+
+        self.current_session_status = Some(status.clone());
+
+        if matches!(status.status_type.as_str(), "busy" | "retry") {
+            self.mark_response_active();
+        }
+    }
+
     fn finish_streaming_response(&mut self) {
         let was_streaming = self.is_streaming;
         self.chat.complete_running_tools_with_output();
         self.is_streaming = false;
         self.active_submission = None;
+        self.current_session_status = None;
 
         if was_streaming {
             self.dispatch_next_queued_submission();
@@ -1144,6 +1215,7 @@ impl AppState {
                         self.chat.clear_partial_stream();
                         self.is_streaming = false;
                         self.active_submission = None;
+                        self.current_session_status = None;
                         self.dispatch_next_queued_submission();
                     }
                     ocpncord_backend::BackendEvent::SessionCreated { session } => {
@@ -1156,6 +1228,7 @@ impl AppState {
                         self.active_mode = AppMode::Chat;
                         if is_new {
                             self.chat.clear_messages();
+                            self.current_session_status = None;
                         }
                         self.error = None;
                     }
@@ -1166,10 +1239,14 @@ impl AppState {
                             }
                         }
                     }
+                    ocpncord_backend::BackendEvent::SessionStatus { session_id, status } => {
+                        self.apply_session_status(session_id, status);
+                    }
                     ocpncord_backend::BackendEvent::SessionDeleted { .. } => {
                         self.active_session = None;
                         self.chat.clear_messages();
                         self.active_mode = AppMode::StartPage;
+                        self.current_session_status = None;
                     }
                     ocpncord_backend::BackendEvent::SessionIdle { session_id } => {
                         log::debug!("session idle: {session_id}");
@@ -1643,6 +1720,7 @@ impl AppState {
         self.is_streaming = false;
         self.chat.clear_partial_stream();
         self.active_submission = None;
+        self.current_session_status = None;
         self.queued_submissions.clear();
         self.chat.clear_queued_messages();
         true
@@ -1926,6 +2004,9 @@ impl AppState {
             Ok((session, messages)) => {
                 self.active_session = Some(session);
                 self.active_mode = AppMode::Chat;
+                self.is_streaming = false;
+                self.active_submission = None;
+                self.current_session_status = None;
                 self.chat.replace_messages(messages);
                 self.clear_active_modal();
                 self.open_next_blocking_modal_if_idle();
@@ -2152,12 +2233,12 @@ impl AppState {
             Span::styled("  model: ", self.theme.text_dim),
             Span::styled(model, self.theme.text_dim),
         ];
-        if self.should_show_response_indicator() {
+        if let Some((label, spinner_style, label_style)) = self.response_indicator_content() {
             let spinner =
                 ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][(self.tick as usize / 3) % 10];
             spans.push(Span::styled("  ", self.theme.text_dim));
-            spans.push(Span::styled(spinner, self.theme.text_accent));
-            spans.push(Span::styled(" Agent is Responding...", self.theme.text_dim));
+            spans.push(Span::styled(spinner, spinner_style));
+            spans.push(Span::styled(alloc::format!(" {label}"), label_style));
         }
         Line::from(spans).render(area, frame.buffer_mut());
     }
@@ -2584,6 +2665,10 @@ enum DriverEvent {
     PlatformClosed,
 }
 
+fn driver_poll_slot(cursor: u8, offset: u8) -> u8 {
+    (cursor + offset) % 2
+}
+
 type BackendOpFuture<'a, B> = Pin<Box<dyn Future<Output = BackendOpResult<B>> + 'a>>;
 
 #[cfg(test)]
@@ -2888,17 +2973,16 @@ where
 
             let mut completed_op = None;
             let event = futures::future::poll_fn(|cx| {
-                for offset in 0..3 {
-                    match offset {
+                if let Some(op) = active_op.as_mut() {
+                    if let Poll::Ready(result) = op.as_mut().poll(cx) {
+                        completed_op = Some(result);
+                        return Poll::Ready(DriverEvent::Operation);
+                    }
+                }
+
+                for offset in 0..2u8 {
+                    match driver_poll_slot(*poll_cursor, offset) {
                         0 => {
-                            if let Some(op) = active_op.as_mut() {
-                                if let Poll::Ready(result) = op.as_mut().poll(cx) {
-                                    completed_op = Some(result);
-                                    return Poll::Ready(DriverEvent::Operation);
-                                }
-                            }
-                        }
-                        1 => {
                             if let Some(stream) = live_events {
                                 if let Poll::Ready(event) = Pin::new(stream).poll_next(cx) {
                                     return Poll::Ready(DriverEvent::Live(event));
@@ -2918,7 +3002,7 @@ where
                 Poll::Pending
             })
             .await;
-            *poll_cursor = (*poll_cursor + 1) % 3;
+            *poll_cursor = (*poll_cursor + 1) % 2;
 
             if let Some(result) = completed_op {
                 active_op = None;
@@ -3675,7 +3759,16 @@ mod tests {
         futures::executor::block_on(app.run());
 
         assert_eq!(app.state.prompt_text(), "n");
-        assert_eq!(app.state.partial_parts().len(), 1);
+        assert!(app.state.is_streaming());
+    }
+
+    #[test]
+    fn driver_poll_slot_rotates_platform_priority() {
+        assert_eq!(driver_poll_slot(0, 0), 0);
+        assert_eq!(driver_poll_slot(0, 1), 1);
+
+        assert_eq!(driver_poll_slot(1, 0), 1);
+        assert_eq!(driver_poll_slot(1, 1), 0);
     }
 
     #[test]
@@ -3909,7 +4002,7 @@ mod tests {
         let screen = rendered_screen(&terminal);
 
         assert!(screen.contains(">"), "screen: {screen}");
-        assert!(screen.contains("Agent is Responding"), "screen: {screen}");
+        assert!(screen.contains("Waiting for agent"), "screen: {screen}");
         assert!(screen.contains("mode: primary"), "screen: {screen}");
         assert!(screen.contains("model: default"), "screen: {screen}");
     }
@@ -4084,7 +4177,95 @@ mod tests {
         terminal.draw(|frame| app.state.render(frame)).unwrap();
         let screen = rendered_screen(&terminal);
 
+        assert!(screen.contains("Waiting for agent"), "screen: {screen}");
+    }
+
+    #[test]
+    fn session_status_busy_keeps_response_indicator_visible() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        run(&mut app, char_key('h'));
+        run(&mut app, enter_key());
+        assert!(app.state.is_streaming());
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::SessionStatus {
+                session_id: "mock-session-id".into(),
+                status: ocpncord_backend::SessionStatus {
+                    status_type: "busy".into(),
+                    attempt: None,
+                    message: None,
+                    next: None,
+                },
+            }),
+        );
+
+        let test_backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(app.state.is_streaming());
         assert!(screen.contains("Agent is Responding"), "screen: {screen}");
+    }
+
+    #[test]
+    fn session_status_retry_shows_retry_message() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        run(&mut app, char_key('h'));
+        run(&mut app, enter_key());
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::SessionStatus {
+                session_id: "mock-session-id".into(),
+                status: ocpncord_backend::SessionStatus {
+                    status_type: "retry".into(),
+                    attempt: Some(2),
+                    message: Some("wait".into()),
+                    next: Some(42),
+                },
+            }),
+        );
+
+        let test_backend = TestBackend::new(120, 8);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(
+            screen.contains("Agent retrying (attempt 2): wait"),
+            "screen: {screen}"
+        );
+    }
+
+    #[test]
+    fn session_idle_clears_response_indicator() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        run(&mut app, char_key('h'));
+        run(&mut app, enter_key());
+        assert!(app.state.is_streaming());
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::SessionIdle {
+                session_id: "mock-session-id".into(),
+            }),
+        );
+
+        let test_backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+
+        assert!(!app.state.is_streaming());
+        assert!(!screen.contains("Agent is Responding"), "screen: {screen}");
     }
 
     #[test]

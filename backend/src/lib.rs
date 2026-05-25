@@ -31,6 +31,10 @@ pub enum BackendEvent {
     SessionUpdated {
         session: Session,
     },
+    SessionStatus {
+        session_id: SessionId,
+        status: SessionStatus,
+    },
     SessionIdle {
         session_id: SessionId,
     },
@@ -208,6 +212,9 @@ impl fmt::Display for BackendEvent {
             Self::SessionCreated { session } => write!(f, "session.created: {}", session.id),
             Self::SessionDeleted { session_id } => write!(f, "session.deleted: {session_id}"),
             Self::SessionUpdated { session } => write!(f, "session.updated: {}", session.id),
+            Self::SessionStatus { session_id, status } => {
+                write!(f, "session.status: {session_id}: {}", status.status_type)
+            }
             Self::SessionIdle { session_id } => write!(f, "session.idle: {session_id}"),
             Self::SessionError { session_id, error } => {
                 write!(f, "session.error: {session_id}: {error:?}")

@@ -327,8 +327,12 @@ fn parse_backend_event_value(value: &serde_json::Value) -> Option<Result<EventEn
         }
         "session.status" => {
             let session_id = props.get("sessionID").and_then(|v| v.as_str())?;
-            Some(Ok(BackendEvent::SessionIdle {
+            let status = props
+                .get("status")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())?;
+            Some(Ok(BackendEvent::SessionStatus {
                 session_id: session_id.to_owned(),
+                status,
             }))
         }
         "server.connected" => Some(Ok(BackendEvent::ServerConnected)),
@@ -1025,10 +1029,53 @@ mod tests {
         let events = BufferedStream::parse_sse(sse.as_bytes());
         assert_eq!(events.len(), 1);
         match event_at(&events, 0) {
-            BackendEvent::SessionIdle { session_id } => {
+            BackendEvent::SessionStatus { session_id, status } => {
                 assert_eq!(session_id, "ses123");
+                assert_eq!(status.status_type, "idle");
             }
-            _ => panic!("expected session.idle"),
+            _ => panic!("expected session.status"),
+        }
+    }
+
+    #[test]
+    fn parse_session_status_busy() {
+        let data = wrap_sse_data(
+            "session.status",
+            "{\"sessionID\":\"ses123\",\"status\":{\"type\":\"busy\"}}",
+        );
+        let sse = format!("event: session.status\ndata: {data}\n\n");
+        let events = BufferedStream::parse_sse(sse.as_bytes());
+        assert_eq!(events.len(), 1);
+        match event_at(&events, 0) {
+            BackendEvent::SessionStatus { session_id, status } => {
+                assert_eq!(session_id, "ses123");
+                assert_eq!(status.status_type, "busy");
+                assert_eq!(status.attempt, None);
+                assert_eq!(status.message.as_deref(), None);
+                assert_eq!(status.next, None);
+            }
+            _ => panic!("expected session.status"),
+        }
+    }
+
+    #[test]
+    fn parse_session_status_retry() {
+        let data = wrap_sse_data(
+            "session.status",
+            "{\"sessionID\":\"ses123\",\"status\":{\"type\":\"retry\",\"attempt\":2,\"message\":\"backing off\",\"next\":42}}",
+        );
+        let sse = format!("event: session.status\ndata: {data}\n\n");
+        let events = BufferedStream::parse_sse(sse.as_bytes());
+        assert_eq!(events.len(), 1);
+        match event_at(&events, 0) {
+            BackendEvent::SessionStatus { session_id, status } => {
+                assert_eq!(session_id, "ses123");
+                assert_eq!(status.status_type, "retry");
+                assert_eq!(status.attempt, Some(2));
+                assert_eq!(status.message.as_deref(), Some("backing off"));
+                assert_eq!(status.next, Some(42));
+            }
+            _ => panic!("expected session.status"),
         }
     }
 
