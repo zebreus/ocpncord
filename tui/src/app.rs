@@ -11,7 +11,7 @@ use core::pin::Pin;
 use core::task::Poll;
 
 use futures_core::Stream;
-use ocpncord_backend::{Backend, BackendError, BackendEvent, EventEnvelope, EventScope};
+use ocpncord_backend::{Backend, BackendError, EventEnvelope, EventScope};
 
 use crate::chat::{
     loaded_messages_from_details, render_chat, user_loaded_message, ChatDisplayPolicy, ChatState,
@@ -56,7 +56,8 @@ const MAX_STORED_TOASTS: usize = 16;
 const MAX_VISIBLE_TOASTS: usize = 5;
 const LIVE_RECONNECT_DELAY_TICKS: u64 = 4;
 const CONNECTION_LIVE_FRESHNESS_TICKS: u64 = 100;
-const CONNECTION_HEALTH_POLL_INTERVAL_TICKS: u64 = 40;
+const CONNECTION_HEALTH_POLL_INTERVAL_TICKS: u64 = 100;
+const CONNECTION_HEALTH_SLOW_PROBE_VISIBILITY_TICKS: u64 = 10;
 const DEFAULT_SERVER_URL: &str = "http://localhost:4096";
 const START_PAGE_LOGO: &str = r#"██████   ██████ ██████  ███    ██ ██████  ██████  ██████  ██████
 ██    ██ ██      ██   ██ ████   ██ ██      ██    ██ ██   ██ ██   ██
@@ -108,6 +109,7 @@ struct ConnectionState {
     last_successful_health_tick: Option<u64>,
     saw_non_successful_health_since_live: bool,
     health_check_in_flight: bool,
+    health_check_started_at_tick: Option<u64>,
     next_health_check_at_tick: u64,
 }
 
@@ -123,6 +125,7 @@ impl ConnectionState {
             last_successful_health_tick: None,
             saw_non_successful_health_since_live: false,
             health_check_in_flight: false,
+            health_check_started_at_tick: None,
             next_health_check_at_tick: CONNECTION_HEALTH_POLL_INTERVAL_TICKS,
         }
     }
@@ -136,6 +139,7 @@ impl ConnectionState {
         self.last_health_probe_state = None;
         self.last_successful_health_tick = None;
         self.saw_non_successful_health_since_live = false;
+        self.next_health_check_at_tick = tick.saturating_add(CONNECTION_HEALTH_POLL_INTERVAL_TICKS);
     }
 
     fn note_live_failure(&mut self, reason: String) {
@@ -164,12 +168,14 @@ impl ConnectionState {
         !self.health_check_in_flight && tick >= self.next_health_check_at_tick
     }
 
-    fn mark_health_check_started(&mut self) {
+    fn mark_health_check_started(&mut self, tick: u64) {
         self.health_check_in_flight = true;
+        self.health_check_started_at_tick = Some(tick);
     }
 
     fn record_health_success(&mut self, tick: u64) {
         self.health_check_in_flight = false;
+        self.health_check_started_at_tick = None;
         self.last_health_failure = None;
         self.last_health_probe_state = Some(HealthProbeState::Healthy);
         self.last_successful_health_tick = Some(tick);
@@ -178,6 +184,7 @@ impl ConnectionState {
 
     fn record_health_failure(&mut self, tick: u64, reason: String) {
         self.health_check_in_flight = false;
+        self.health_check_started_at_tick = None;
         self.last_health_failure = Some(reason.clone());
         self.last_health_probe_state = Some(HealthProbeState::Failed(reason));
         self.saw_non_successful_health_since_live = true;
@@ -186,6 +193,7 @@ impl ConnectionState {
 
     fn record_health_degraded(&mut self, tick: u64, reason: String) {
         self.health_check_in_flight = false;
+        self.health_check_started_at_tick = None;
         self.last_health_failure = None;
         self.last_health_probe_state = Some(HealthProbeState::Degraded(reason));
         self.saw_non_successful_health_since_live = true;
@@ -194,6 +202,7 @@ impl ConnectionState {
 
     fn record_health_non_success(&mut self, tick: u64, reason: String) {
         self.health_check_in_flight = false;
+        self.health_check_started_at_tick = None;
         self.last_health_failure = None;
         self.last_health_probe_state = Some(HealthProbeState::Inconclusive(reason));
         self.saw_non_successful_health_since_live = true;
@@ -218,7 +227,15 @@ impl ConnectionState {
             .unwrap_or(false)
     }
 
-    fn display(&self, tick: u64, idle_allowed: bool) -> ConnectionStatusDisplay {
+    fn should_surface_verifying(&self, tick: u64) -> bool {
+        self.health_check_started_at_tick
+            .map(|started_at| {
+                tick.saturating_sub(started_at) >= CONNECTION_HEALTH_SLOW_PROBE_VISIBILITY_TICKS
+            })
+            .unwrap_or(false)
+    }
+
+    fn display(&self, tick: u64) -> ConnectionStatusDisplay {
         if let Some(reason) = &self.live_failure {
             return ConnectionStatusDisplay::new(
                 ConnectionTier::Red,
@@ -247,15 +264,7 @@ impl ConnectionState {
             );
         }
 
-        if self.health_check_in_flight {
-            return ConnectionStatusDisplay::new(
-                ConnectionTier::Yellow,
-                "verifying",
-                "Checking whether the server is still reachable".into(),
-            );
-        }
-
-        if idle_allowed && self.has_clean_health_since_last_live() {
+        if self.has_clean_health_since_last_live() {
             return ConnectionStatusDisplay::new(
                 ConnectionTier::Green,
                 "idle",
@@ -268,6 +277,14 @@ impl ConnectionState {
                 ConnectionTier::Yellow,
                 "degraded",
                 format!("Server reachable but unhealthy: {reason}"),
+            );
+        }
+
+        if self.health_check_in_flight && self.should_surface_verifying(tick) {
+            return ConnectionStatusDisplay::new(
+                ConnectionTier::Yellow,
+                "verifying",
+                "Checking whether the server is still reachable".into(),
             );
         }
 
@@ -938,7 +955,7 @@ impl AppState {
 
     fn queue_connection_health_check(&mut self) {
         if self.connection.health_check_due(self.tick) {
-            self.connection.mark_health_check_started();
+            self.connection.mark_health_check_started(self.tick);
             self.queue_op(BackendOp::Health);
         }
     }
@@ -1083,13 +1100,8 @@ impl AppState {
         self.active_session.as_ref()
     }
 
-    fn idle_connection_allowed(&self) -> bool {
-        !self.should_show_response_indicator()
-    }
-
     pub fn connection_status_display(&self) -> ConnectionStatusDisplay {
-        self.connection
-            .display(self.tick, self.idle_connection_allowed())
+        self.connection.display(self.tick)
     }
 
     fn sync_connection_surfaces(&mut self) {
@@ -1100,6 +1112,10 @@ impl AppState {
             .and_then(|modal| modal.as_server_config_mut())
         {
             modal.set_connection_status(status.clone());
+        }
+
+        if status.summary == "verifying" {
+            return;
         }
 
         if status.tier != self.last_connection_tier {
@@ -3465,6 +3481,7 @@ mod tests {
     use super::*;
     use crate::event::{KeyEvent, Modifiers, Scancode};
     use ocpncord_backend::mock::{MockBackend, MockSubmissionCall};
+    use ocpncord_backend::BackendEvent;
     use ocpncord_backend::{BackendError, Result as BackendResult};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -4466,6 +4483,106 @@ mod tests {
     }
 
     #[test]
+    fn idle_stays_idle_while_background_health_check_is_in_flight() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        app.state
+            .handle_connection_health_result(Ok(ocpncord_backend::Health {
+                healthy: true,
+                version: "mock".into(),
+            }));
+        assert_eq!(app.state.connection_status_display().summary, "idle");
+
+        app.state
+            .connection
+            .mark_health_check_started(app.state.tick);
+        app.state.tick += CONNECTION_HEALTH_SLOW_PROBE_VISIBILITY_TICKS;
+
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Green
+        );
+        assert_eq!(app.state.connection_status_display().summary, "idle");
+    }
+
+    #[test]
+    fn degraded_stays_degraded_while_background_health_check_is_in_flight() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        app.state
+            .handle_connection_health_result(Ok(ocpncord_backend::Health {
+                healthy: false,
+                version: "mock".into(),
+            }));
+        assert_eq!(app.state.connection_status_display().summary, "degraded");
+
+        app.state
+            .connection
+            .mark_health_check_started(app.state.tick);
+        app.state.tick += CONNECTION_HEALTH_SLOW_PROBE_VISIBILITY_TICKS;
+
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Yellow
+        );
+        assert_eq!(app.state.connection_status_display().summary, "degraded");
+    }
+
+    #[test]
+    fn unconfirmed_connection_becomes_verifying_only_after_slow_threshold() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        assert_eq!(app.state.connection_status_display().summary, "unconfirmed");
+
+        app.state
+            .connection
+            .mark_health_check_started(app.state.tick);
+
+        assert_eq!(app.state.connection_status_display().summary, "unconfirmed");
+
+        app.state.tick += CONNECTION_HEALTH_SLOW_PROBE_VISIBILITY_TICKS - 1;
+        assert_eq!(app.state.connection_status_display().summary, "unconfirmed");
+
+        app.state.tick += 1;
+        assert_eq!(app.state.connection_status_display().summary, "verifying");
+    }
+
+    #[test]
+    fn verifying_does_not_emit_toast_or_change_last_connection_tier() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        let initial_toast_count = app.state.toasts.len();
+        assert_eq!(app.state.last_connection_tier, ConnectionTier::Yellow);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        app.state
+            .connection
+            .mark_health_check_started(app.state.tick);
+        app.state.tick += CONNECTION_HEALTH_SLOW_PROBE_VISIBILITY_TICKS;
+
+        assert_eq!(app.state.connection_status_display().summary, "verifying");
+        app.state.sync_connection_surfaces();
+
+        assert_eq!(app.state.toasts.len(), initial_toast_count + 1);
+        assert_eq!(app.state.last_connection_tier, ConnectionTier::Green);
+    }
+
+    #[test]
     fn stale_connection_needs_only_successful_health_checks_since_last_live_event() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
@@ -4507,7 +4624,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_connection_is_suppressed_while_response_is_active() {
+    fn idle_connection_stays_green_while_response_is_active() {
         let backend = MockBackend::default();
         let mut app = new_app(backend);
 
@@ -4525,7 +4642,11 @@ mod tests {
         run(&mut app, enter_key());
 
         assert!(app.state.should_show_response_indicator());
-        assert_eq!(app.state.connection_status_display().summary, "unconfirmed");
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Green
+        );
+        assert_eq!(app.state.connection_status_display().summary, "idle");
     }
 
     #[test]
@@ -4579,10 +4700,11 @@ mod tests {
 
         app.state
             .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
-        app.state.tick = CONNECTION_HEALTH_POLL_INTERVAL_TICKS;
-        app.backend_mut().health_status = None;
-
-        run(&mut app, Event::Tick);
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS;
+        app.state
+            .handle_connection_health_result(Err(BackendError::Connection {
+                message: "server unavailable".into(),
+            }));
 
         assert_eq!(
             app.state.connection_status_display().tier,
