@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
-use crate::app::{Action, PermissionReplyAction};
+use crate::app::{Action, ConnectionStatusDisplay, ConnectionTier, PermissionReplyAction};
 use crate::chat::{ChatDisplayPolicy, PART_KIND_ORDER};
 use crate::event::{Event, Scancode};
 use crate::theme::Theme;
@@ -313,6 +313,7 @@ pub struct ServerConfigModal {
     url: String,
     status: ServerConfigStatus,
     focus: ServerConfigFocus,
+    active_connection: ConnectionStatusDisplay,
 }
 
 impl ServerConfigModal {
@@ -321,7 +322,16 @@ impl ServerConfigModal {
             url,
             status: ServerConfigStatus::Idle,
             focus: ServerConfigFocus::Url,
+            active_connection: ConnectionStatusDisplay {
+                tier: ConnectionTier::Yellow,
+                summary: "connecting".into(),
+                detail: "Waiting for the first live event from the active server".into(),
+            },
         }
+    }
+
+    pub fn set_connection_status(&mut self, status: ConnectionStatusDisplay) {
+        self.active_connection = status;
     }
 
     pub fn set_testing(&mut self) {
@@ -352,6 +362,11 @@ impl ServerConfigModal {
         &self.url
     }
 
+    #[cfg(test)]
+    pub fn active_connection_summary(&self) -> &str {
+        &self.active_connection.summary
+    }
+
     fn cycle_focus_forward(&mut self) {
         self.focus = match self.focus {
             ServerConfigFocus::Url => ServerConfigFocus::Test,
@@ -376,6 +391,13 @@ impl ServerConfigModal {
             ServerConfigStatus::Success(message) => Line::from(message.as_str()),
             ServerConfigStatus::Error(message) => Line::from(message.as_str()),
         }
+    }
+
+    fn active_connection_line(&self) -> Line<'_> {
+        Line::from(alloc::format!(
+            "Active server: {}",
+            self.active_connection.summary
+        ))
     }
 }
 
@@ -412,6 +434,12 @@ impl Modal for ServerConfigModal {
             Span::styled(" Apply ", apply_style),
         ]));
         lines.push(Line::from(""));
+        let connection_style = match self.active_connection.tier {
+            ConnectionTier::Green => theme.toast_success,
+            ConnectionTier::Yellow => theme.toast_warning,
+            ConnectionTier::Red => theme.text_error,
+        };
+        lines.push(self.active_connection_line().style(connection_style));
         let status_style = match self.status {
             ServerConfigStatus::Error(_) => theme.text_error,
             ServerConfigStatus::Success(_) => theme.toast_success,
@@ -480,7 +508,7 @@ impl Modal for ServerConfigModal {
         } else {
             ((area.width as u32 * 3) / 5).clamp(56, area.width as u32) as u16
         };
-        (width, 10_u16.min(area.height))
+        (width, 11_u16.min(area.height))
     }
 }
 

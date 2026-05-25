@@ -11,7 +11,7 @@ use core::pin::Pin;
 use core::task::Poll;
 
 use futures_core::Stream;
-use ocpncord_backend::{Backend, BackendEvent, EventEnvelope, EventScope};
+use ocpncord_backend::{Backend, BackendError, BackendEvent, EventEnvelope, EventScope};
 
 use crate::chat::{
     loaded_messages_from_details, render_chat, user_loaded_message, ChatDisplayPolicy, ChatState,
@@ -55,6 +55,8 @@ pub enum ToastVariant {
 const MAX_STORED_TOASTS: usize = 16;
 const MAX_VISIBLE_TOASTS: usize = 5;
 const LIVE_RECONNECT_DELAY_TICKS: u64 = 4;
+const CONNECTION_LIVE_FRESHNESS_TICKS: u64 = 100;
+const CONNECTION_HEALTH_POLL_INTERVAL_TICKS: u64 = 40;
 const DEFAULT_SERVER_URL: &str = "http://localhost:4096";
 const START_PAGE_LOGO: &str = r#"██████   ██████ ██████  ███    ██ ██████  ██████  ██████  ██████
 ██    ██ ██      ██   ██ ████   ██ ██      ██    ██ ██   ██ ██   ██
@@ -62,6 +64,242 @@ const START_PAGE_LOGO: &str = r#"██████   ██████ ██�
 ██    ██ ██      ██      ██  ██ ██ ██      ██    ██ ██   ██ ██   ██
 ██████   ██████ ██      ██   ████  ██████  ██████  ██   ██ ██████"#;
 const START_PAGE_TIP: &str = "Tip: Ctrl+X H for help, Ctrl+X Q to quit";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionTier {
+    Green,
+    Yellow,
+    Red,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionStatusDisplay {
+    pub tier: ConnectionTier,
+    pub summary: String,
+    pub detail: String,
+}
+
+impl ConnectionStatusDisplay {
+    fn new(tier: ConnectionTier, summary: &str, detail: String) -> Self {
+        Self {
+            tier,
+            summary: summary.into(),
+            detail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HealthProbeState {
+    Healthy,
+    Degraded(String),
+    Inconclusive(String),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectionState {
+    last_live_event_tick: Option<u64>,
+    live_failure: Option<String>,
+    reconnect_at_tick: Option<u64>,
+    subscribe_pending: bool,
+    last_health_failure: Option<String>,
+    last_health_probe_state: Option<HealthProbeState>,
+    last_successful_health_tick: Option<u64>,
+    saw_non_successful_health_since_live: bool,
+    health_check_in_flight: bool,
+    next_health_check_at_tick: u64,
+}
+
+impl ConnectionState {
+    fn new() -> Self {
+        Self {
+            last_live_event_tick: None,
+            live_failure: None,
+            reconnect_at_tick: None,
+            subscribe_pending: false,
+            last_health_failure: None,
+            last_health_probe_state: None,
+            last_successful_health_tick: None,
+            saw_non_successful_health_since_live: false,
+            health_check_in_flight: false,
+            next_health_check_at_tick: CONNECTION_HEALTH_POLL_INTERVAL_TICKS,
+        }
+    }
+
+    fn note_live_event(&mut self, tick: u64) {
+        self.last_live_event_tick = Some(tick);
+        self.live_failure = None;
+        self.reconnect_at_tick = None;
+        self.subscribe_pending = false;
+        self.last_health_failure = None;
+        self.last_health_probe_state = None;
+        self.last_successful_health_tick = None;
+        self.saw_non_successful_health_since_live = false;
+    }
+
+    fn note_live_failure(&mut self, reason: String) {
+        self.live_failure = Some(reason);
+    }
+
+    fn schedule_reconnect_from(&mut self, tick: u64) {
+        if self.reconnect_at_tick.is_none() {
+            self.reconnect_at_tick = Some(tick.saturating_add(LIVE_RECONNECT_DELAY_TICKS));
+        }
+    }
+
+    fn clear_reconnect(&mut self) {
+        self.reconnect_at_tick = None;
+    }
+
+    fn mark_subscribe_pending(&mut self) {
+        self.subscribe_pending = true;
+    }
+
+    fn finish_subscribe_attempt(&mut self) {
+        self.subscribe_pending = false;
+    }
+
+    fn health_check_due(&self, tick: u64) -> bool {
+        !self.health_check_in_flight && tick >= self.next_health_check_at_tick
+    }
+
+    fn mark_health_check_started(&mut self) {
+        self.health_check_in_flight = true;
+    }
+
+    fn record_health_success(&mut self, tick: u64) {
+        self.health_check_in_flight = false;
+        self.last_health_failure = None;
+        self.last_health_probe_state = Some(HealthProbeState::Healthy);
+        self.last_successful_health_tick = Some(tick);
+        self.next_health_check_at_tick = tick.saturating_add(CONNECTION_HEALTH_POLL_INTERVAL_TICKS);
+    }
+
+    fn record_health_failure(&mut self, tick: u64, reason: String) {
+        self.health_check_in_flight = false;
+        self.last_health_failure = Some(reason.clone());
+        self.last_health_probe_state = Some(HealthProbeState::Failed(reason));
+        self.saw_non_successful_health_since_live = true;
+        self.next_health_check_at_tick = tick.saturating_add(CONNECTION_HEALTH_POLL_INTERVAL_TICKS);
+    }
+
+    fn record_health_degraded(&mut self, tick: u64, reason: String) {
+        self.health_check_in_flight = false;
+        self.last_health_failure = None;
+        self.last_health_probe_state = Some(HealthProbeState::Degraded(reason));
+        self.saw_non_successful_health_since_live = true;
+        self.next_health_check_at_tick = tick.saturating_add(CONNECTION_HEALTH_POLL_INTERVAL_TICKS);
+    }
+
+    fn record_health_non_success(&mut self, tick: u64, reason: String) {
+        self.health_check_in_flight = false;
+        self.last_health_failure = None;
+        self.last_health_probe_state = Some(HealthProbeState::Inconclusive(reason));
+        self.saw_non_successful_health_since_live = true;
+        self.next_health_check_at_tick = tick.saturating_add(CONNECTION_HEALTH_POLL_INTERVAL_TICKS);
+    }
+
+    fn has_clean_health_since_last_live(&self) -> bool {
+        self.last_live_event_tick.is_some()
+            && self.last_successful_health_tick.is_some()
+            && !self.saw_non_successful_health_since_live
+    }
+
+    fn reconnect_due(&self, tick: u64) -> bool {
+        self.reconnect_at_tick
+            .map(|reconnect_at| tick >= reconnect_at)
+            .unwrap_or(false)
+    }
+
+    fn is_live_recent(&self, tick: u64) -> bool {
+        self.last_live_event_tick
+            .map(|last_tick| tick.saturating_sub(last_tick) <= CONNECTION_LIVE_FRESHNESS_TICKS)
+            .unwrap_or(false)
+    }
+
+    fn display(&self, tick: u64, idle_allowed: bool) -> ConnectionStatusDisplay {
+        if let Some(reason) = &self.live_failure {
+            return ConnectionStatusDisplay::new(
+                ConnectionTier::Red,
+                "offline",
+                if self.reconnect_at_tick.is_some() || self.subscribe_pending {
+                    format!("Connection lost. Retrying: {reason}")
+                } else {
+                    format!("Connection lost: {reason}")
+                },
+            );
+        }
+
+        if self.is_live_recent(tick) {
+            return ConnectionStatusDisplay::new(
+                ConnectionTier::Green,
+                "live",
+                "Live stream confirmed recently".into(),
+            );
+        }
+
+        if let Some(reason) = &self.last_health_failure {
+            return ConnectionStatusDisplay::new(
+                ConnectionTier::Red,
+                "offline",
+                format!("Server unreachable: {reason}"),
+            );
+        }
+
+        if self.health_check_in_flight {
+            return ConnectionStatusDisplay::new(
+                ConnectionTier::Yellow,
+                "verifying",
+                "Checking whether the server is still reachable".into(),
+            );
+        }
+
+        if idle_allowed && self.has_clean_health_since_last_live() {
+            return ConnectionStatusDisplay::new(
+                ConnectionTier::Green,
+                "idle",
+                "Server reachable; waiting for the next live event".into(),
+            );
+        }
+
+        if let Some(HealthProbeState::Degraded(reason)) = &self.last_health_probe_state {
+            return ConnectionStatusDisplay::new(
+                ConnectionTier::Yellow,
+                "degraded",
+                format!("Server reachable but unhealthy: {reason}"),
+            );
+        }
+
+        if self.last_live_event_tick.is_some() {
+            return ConnectionStatusDisplay::new(
+                ConnectionTier::Yellow,
+                "unconfirmed",
+                self.last_health_probe_state.as_ref().map_or_else(
+                    || "No recent live events. The stream may be stalled".into(),
+                    |state| match state {
+                        HealthProbeState::Inconclusive(reason)
+                        | HealthProbeState::Failed(reason) => format!(
+                            "No recent live events. Health checks since then were not all successful: {reason}"
+                        ),
+                        HealthProbeState::Healthy => {
+                            "No recent live events. The stream may be stalled".into()
+                        }
+                        HealthProbeState::Degraded(reason) => {
+                            format!("Server reachable but unhealthy: {reason}")
+                        }
+                    },
+                ),
+            );
+        }
+
+        ConnectionStatusDisplay::new(
+            ConnectionTier::Yellow,
+            "connecting",
+            "Waiting for the first live event from the server".into(),
+        )
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -304,6 +542,7 @@ impl TuiCommandContext {
 #[derive(Debug, Clone)]
 enum BackendOp {
     LoadAgents,
+    Health,
     Subscribe,
     SyncHistory {
         request: ocpncord_backend::SyncHistoryRequest,
@@ -358,6 +597,7 @@ enum BackendOp {
 
 enum BackendOpResult<B: Backend> {
     Agents(ocpncord_backend::Result<Vec<ocpncord_backend::Agent>>),
+    Health(ocpncord_backend::Result<ocpncord_backend::Health>),
     Subscribe(ocpncord_backend::Result<B::EventStream>),
     SyncHistory(ocpncord_backend::Result<ocpncord_backend::SyncHistoryBatch>),
     CreateSession {
@@ -418,7 +658,8 @@ pub struct AppState {
     active_submission: Option<Submission>,
     queued_submissions: Vec<Submission>,
     sync_known_sequences: BTreeMap<String, u64>,
-    live_reconnect_at_tick: Option<u64>,
+    connection: ConnectionState,
+    last_connection_tier: ConnectionTier,
     pending_ops: alloc::collections::VecDeque<BackendOp>,
     active_modal: Option<Box<dyn Modal>>,
     active_blocking_prompt: Option<ActiveBlockingPrompt>,
@@ -472,7 +713,8 @@ impl AppState {
             active_submission: None,
             queued_submissions: Vec::new(),
             sync_known_sequences: BTreeMap::new(),
-            live_reconnect_at_tick: None,
+            connection: ConnectionState::new(),
+            last_connection_tier: ConnectionTier::Yellow,
             pending_ops: alloc::collections::VecDeque::new(),
             active_modal: None,
             active_blocking_prompt: None,
@@ -499,6 +741,10 @@ impl AppState {
     }
 
     pub fn set_active_modal(&mut self, modal: Box<dyn Modal>) {
+        let mut modal = modal;
+        if let Some(server_config) = modal.as_server_config_mut() {
+            server_config.set_connection_status(self.connection_status_display());
+        }
         self.active_modal = Some(modal);
         self.active_blocking_prompt = None;
     }
@@ -623,22 +869,82 @@ impl AppState {
     }
 
     fn queue_live_resubscribe(&mut self) {
-        self.live_reconnect_at_tick = None;
+        self.connection.mark_subscribe_pending();
+        self.connection.clear_reconnect();
         self.queue_sync_history();
         self.queue_op(BackendOp::Subscribe);
     }
 
-    fn schedule_live_reconnect(&mut self) {
-        if self.live_reconnect_at_tick.is_none() {
-            self.live_reconnect_at_tick =
-                Some(self.tick.saturating_add(LIVE_RECONNECT_DELAY_TICKS));
+    fn note_live_event_received(&mut self) {
+        self.connection.note_live_event(self.tick);
+        self.sync_connection_surfaces();
+    }
+
+    fn handle_live_stream_failure(&mut self, reason: String) {
+        self.connection.note_live_failure(reason);
+        self.connection.schedule_reconnect_from(self.tick);
+        self.chat.clear_partial_stream();
+        self.is_streaming = false;
+        self.active_submission = None;
+        self.dispatch_next_queued_submission();
+        self.sync_connection_surfaces();
+    }
+
+    fn handle_subscribe_failure(&mut self, error: BackendError) {
+        self.connection.finish_subscribe_attempt();
+        self.connection.note_live_failure(format!("{error}"));
+        self.connection.schedule_reconnect_from(self.tick);
+        self.sync_connection_surfaces();
+    }
+
+    fn note_connection_backend_error(&mut self, context: &str, error: &BackendError) -> bool {
+        let reason = match error {
+            BackendError::Connection { message } => Some(format!("{context}: {message}")),
+            BackendError::Timeout => Some(format!("{context}: request timed out")),
+            _ => None,
+        };
+
+        if let Some(reason) = reason {
+            self.error = None;
+            self.connection.note_live_failure(reason);
+            self.connection.schedule_reconnect_from(self.tick);
+            self.sync_connection_surfaces();
+            return true;
+        }
+
+        false
+    }
+
+    fn note_connection_message(&mut self, context: &str, message: &str) -> bool {
+        let lowered = message.to_ascii_lowercase();
+        let looks_like_connection_issue = lowered.contains("connection")
+            || lowered.contains("timed out")
+            || lowered.contains("timeout")
+            || lowered.contains("network")
+            || lowered.contains("dns")
+            || lowered.contains("broken pipe");
+
+        if !looks_like_connection_issue {
+            return false;
+        }
+
+        self.error = None;
+        self.connection
+            .note_live_failure(format!("{context}: {message}"));
+        self.connection.schedule_reconnect_from(self.tick);
+        self.sync_connection_surfaces();
+        true
+    }
+
+    fn queue_connection_health_check(&mut self) {
+        if self.connection.health_check_due(self.tick) {
+            self.connection.mark_health_check_started();
+            self.queue_op(BackendOp::Health);
         }
     }
 
     fn live_reconnect_due(&self) -> bool {
-        self.live_reconnect_at_tick
-            .map(|tick| self.tick >= tick)
-            .unwrap_or(false)
+        self.connection.reconnect_due(self.tick)
     }
 
     fn envelope_matches_scope(&self, envelope: &EventEnvelope) -> bool {
@@ -671,6 +977,7 @@ impl AppState {
     }
 
     fn apply_live_envelope(&mut self, envelope: EventEnvelope) -> bool {
+        self.note_live_event_received();
         if !self.envelope_matches_scope(&envelope) {
             return true;
         }
@@ -693,9 +1000,34 @@ impl AppState {
                 }
             }
             Err(error) => {
-                self.error = Some(alloc::format!("sync history: {error}"));
+                if !self.note_connection_backend_error("Sync catch-up failed", &error) {
+                    self.error = Some(alloc::format!("sync history: {error}"));
+                }
             }
         }
+    }
+
+    fn handle_connection_health_result(
+        &mut self,
+        result: ocpncord_backend::Result<ocpncord_backend::Health>,
+    ) {
+        match result {
+            Ok(health) if health.healthy => self.connection.record_health_success(self.tick),
+            Ok(health) => self.connection.record_health_degraded(
+                self.tick,
+                format!("server reported unhealthy (version {})", health.version),
+            ),
+            Err(BackendError::Connection { message }) => self
+                .connection
+                .record_health_failure(self.tick, format!("connection error: {message}")),
+            Err(BackendError::Timeout) => self
+                .connection
+                .record_health_failure(self.tick, "request timed out".into()),
+            Err(error) => self
+                .connection
+                .record_health_non_success(self.tick, format!("health check failed: {error}")),
+        }
+        self.sync_connection_surfaces();
     }
 
     fn queue_startup(&mut self) {
@@ -716,7 +1048,8 @@ impl AppState {
         self.active_submission = None;
         self.queued_submissions.clear();
         self.sync_known_sequences.clear();
-        self.live_reconnect_at_tick = None;
+        self.connection = ConnectionState::new();
+        self.last_connection_tier = ConnectionTier::Yellow;
         self.pending_ops.clear();
         self.active_blocking_prompt = None;
         self.pending_permissions.clear();
@@ -748,6 +1081,42 @@ impl AppState {
 
     pub fn active_session(&self) -> Option<&ocpncord_backend::Session> {
         self.active_session.as_ref()
+    }
+
+    fn idle_connection_allowed(&self) -> bool {
+        !self.should_show_response_indicator()
+    }
+
+    pub fn connection_status_display(&self) -> ConnectionStatusDisplay {
+        self.connection
+            .display(self.tick, self.idle_connection_allowed())
+    }
+
+    fn sync_connection_surfaces(&mut self) {
+        let status = self.connection_status_display();
+        if let Some(modal) = self
+            .active_modal
+            .as_deref_mut()
+            .and_then(|modal| modal.as_server_config_mut())
+        {
+            modal.set_connection_status(status.clone());
+        }
+
+        if status.tier != self.last_connection_tier {
+            let variant = match status.tier {
+                ConnectionTier::Green => ToastVariant::Success,
+                ConnectionTier::Yellow => ToastVariant::Warning,
+                ConnectionTier::Red => ToastVariant::Error,
+            };
+            self.push_toast(Toast {
+                title: Some("Server".into()),
+                message: status.detail,
+                variant,
+                created_at: self.tick,
+                duration: 6,
+            });
+            self.last_connection_tier = status.tier;
+        }
     }
 
     pub fn set_session_directory_override(&mut self, session_directory: String) {
@@ -1211,7 +1580,9 @@ impl AppState {
                 match event {
                     ocpncord_backend::BackendEvent::Error { message } => {
                         log::error!("backend event error: {message}");
-                        self.error = Some(message);
+                        if !self.note_connection_message("Backend error", &message) {
+                            self.error = Some(message);
+                        }
                         self.chat.clear_partial_stream();
                         self.is_streaming = false;
                         self.active_submission = None;
@@ -1476,15 +1847,7 @@ impl AppState {
                             session_id: session_id.clone(),
                         });
                     }
-                    ocpncord_backend::BackendEvent::ServerConnected => {
-                        self.push_toast(Toast {
-                            title: Some("Server".into()),
-                            message: "Connected".into(),
-                            variant: ToastVariant::Success,
-                            created_at: self.tick,
-                            duration: 4,
-                        });
-                    }
+                    ocpncord_backend::BackendEvent::ServerConnected => {}
                     ocpncord_backend::BackendEvent::GlobalDisposed => {
                         self.error = Some("Server disposed all instances".into());
                     }
@@ -1515,6 +1878,8 @@ impl AppState {
                 if self.live_reconnect_due() {
                     self.queue_live_resubscribe();
                 }
+                self.queue_connection_health_check();
+                self.sync_connection_surfaces();
             }
             Event::Quit => return false,
         }
@@ -1936,8 +2301,10 @@ impl AppState {
                     self.active_submission = Some(submission);
                 }
             }
-            Err(e) => {
-                self.error = Some(alloc::format!("{}", e));
+            Err(error) => {
+                if !self.note_connection_backend_error("Submission failed", &error) {
+                    self.error = Some(alloc::format!("{}", error));
+                }
                 self.is_streaming = false;
                 self.chat.clear_partial_stream();
                 self.active_submission = None;
@@ -1978,8 +2345,10 @@ impl AppState {
                     }
                 }
             }
-            Err(e) => {
-                self.error = Some(alloc::format!("{}", e));
+            Err(error) => {
+                if !self.note_connection_backend_error("Session creation failed", &error) {
+                    self.error = Some(alloc::format!("{}", error));
+                }
             }
         }
     }
@@ -2011,7 +2380,11 @@ impl AppState {
                 self.clear_active_modal();
                 self.open_next_blocking_modal_if_idle();
             }
-            Err(e) => self.error = Some(alloc::format!("{}", e)),
+            Err(error) => {
+                if !self.note_connection_backend_error("Session load failed", &error) {
+                    self.error = Some(alloc::format!("{}", error));
+                }
+            }
         }
     }
 
@@ -2057,7 +2430,9 @@ impl AppState {
         {
             modal.set_test_result(result);
         } else if let Err(error) = result {
-            self.error = Some(alloc::format!("{error}"));
+            if !self.note_connection_backend_error("Server test failed", &error) {
+                self.error = Some(alloc::format!("{error}"));
+            }
         }
     }
 
@@ -2070,7 +2445,9 @@ impl AppState {
         {
             modal.set_apply_error(message);
         } else {
-            self.error = Some(message);
+            if !self.note_connection_backend_error("Server apply failed", &error) {
+                self.error = Some(message);
+            }
         }
     }
 
@@ -2183,8 +2560,10 @@ impl AppState {
     }
 
     fn handle_simple_result(&mut self, result: ocpncord_backend::Result<()>) {
-        if let Err(e) = result {
-            self.error = Some(alloc::format!("{}", e));
+        if let Err(error) = result {
+            if !self.note_connection_backend_error("Operation failed", &error) {
+                self.error = Some(alloc::format!("{}", error));
+            }
         }
     }
 
@@ -2225,15 +2604,43 @@ impl AppState {
 
     fn render_status_line(&self, frame: &mut ratatui::Frame, area: Rect) {
         let (agent, mode, model) = self.active_agent_status();
+        let connection = self.connection_status_display();
+        let response = self.response_indicator_content();
+
+        let agent_segment = format!("[{agent}]  mode: {mode}");
+        let model_segment = format!("  model: {model}");
+        let server_segment = format!("  server: {}", connection.summary);
+        let response_segment = response
+            .as_ref()
+            .map(|(label, _, _)| format!("  x {label}"))
+            .unwrap_or_default();
+        let show_model = agent_segment.chars().count()
+            + model_segment.chars().count()
+            + server_segment.chars().count()
+            + response_segment.chars().count()
+            <= area.width as usize;
+
         let mut spans = vec![
             Span::styled("[", self.theme.text_dim),
             Span::styled(agent, self.theme.text_accent),
             Span::styled("]  mode: ", self.theme.text_dim),
             Span::styled(mode, self.mode_status_style(mode)),
-            Span::styled("  model: ", self.theme.text_dim),
-            Span::styled(model, self.theme.text_dim),
+            Span::styled("  server: ", self.theme.text_dim),
+            Span::styled(
+                connection.summary,
+                self.connection_status_style(connection.tier),
+            ),
         ];
-        if let Some((label, spinner_style, label_style)) = self.response_indicator_content() {
+        if show_model {
+            spans.splice(
+                4..4,
+                [
+                    Span::styled("  model: ", self.theme.text_dim),
+                    Span::styled(model, self.theme.text_dim),
+                ],
+            );
+        }
+        if let Some((label, spinner_style, label_style)) = response {
             let spinner =
                 ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][(self.tick as usize / 3) % 10];
             spans.push(Span::styled("  ", self.theme.text_dim));
@@ -2249,6 +2656,14 @@ impl AppState {
             "subagent" => self.theme.part_subtask,
             "all" => self.theme.text_accent,
             _ => self.theme.text_dim,
+        }
+    }
+
+    fn connection_status_style(&self, tier: ConnectionTier) -> Style {
+        match tier {
+            ConnectionTier::Green => self.theme.part_tool_done,
+            ConnectionTier::Yellow => self.theme.toast_warning,
+            ConnectionTier::Red => self.theme.text_error,
         }
     }
 
@@ -2692,6 +3107,7 @@ fn backend_op_future_from_ptr<'a, B: Backend + 'a>(
 async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> BackendOpResult<B> {
     match op {
         BackendOp::LoadAgents => BackendOpResult::Agents(backend.list_agents().await),
+        BackendOp::Health => BackendOpResult::Health(backend.health().await),
         BackendOp::Subscribe => BackendOpResult::Subscribe(backend.subscribe_live().await),
         BackendOp::SyncHistory { request } => {
             BackendOpResult::SyncHistory(backend.sync_history(&request).await)
@@ -2910,9 +3326,13 @@ where
     ) {
         match result {
             BackendOpResult::Agents(result) => state.apply_agent_result(result),
+            BackendOpResult::Health(result) => state.handle_connection_health_result(result),
             BackendOpResult::Subscribe(result) => match result {
-                Ok(stream) => *live_events = Some(stream),
-                Err(e) => state.error = Some(alloc::format!("{}", e)),
+                Ok(stream) => {
+                    state.connection.clear_reconnect();
+                    *live_events = Some(stream);
+                }
+                Err(error) => state.handle_subscribe_failure(error),
             },
             BackendOpResult::SyncHistory(result) => state.handle_sync_history_result(result),
             BackendOpResult::CreateSession { purpose, result } => {
@@ -3014,14 +3434,12 @@ where
                 DriverEvent::Live(Some(Ok(envelope))) => state.apply_live_envelope(envelope),
                 DriverEvent::Live(Some(Err(error))) => {
                     *live_events = None;
-                    state.schedule_live_reconnect();
-                    state.handle_event(Event::Backend(BackendEvent::Error {
-                        message: alloc::format!("{error}"),
-                    }))
+                    state.handle_live_stream_failure(format!("{error}"));
+                    true
                 }
                 DriverEvent::Live(None) => {
                     *live_events = None;
-                    state.schedule_live_reconnect();
+                    state.handle_live_stream_failure("live stream closed".into());
                     true
                 }
                 DriverEvent::Operation => true,
@@ -3964,6 +4382,317 @@ mod tests {
             app.backend().sync_history_requests.len() >= 2,
             "startup catch-up plus reconnect catch-up should be requested"
         );
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Red
+        );
+        assert_eq!(app.state.connection_status_display().summary, "offline");
+    }
+
+    #[test]
+    fn connection_status_becomes_live_on_live_event_and_stale_after_timeout() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Yellow
+        );
+        assert_eq!(app.state.connection_status_display().summary, "connecting");
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Green
+        );
+        assert_eq!(app.state.connection_status_display().summary, "live");
+
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Yellow
+        );
+        assert_eq!(app.state.connection_status_display().summary, "unconfirmed");
+    }
+
+    #[test]
+    fn stale_connection_becomes_idle_after_clean_health_check() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        app.state
+            .handle_connection_health_result(Ok(ocpncord_backend::Health {
+                healthy: true,
+                version: "mock".into(),
+            }));
+
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Green
+        );
+        assert_eq!(app.state.connection_status_display().summary, "idle");
+    }
+
+    #[test]
+    fn unhealthy_health_check_shows_degraded_state() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        app.state
+            .handle_connection_health_result(Ok(ocpncord_backend::Health {
+                healthy: false,
+                version: "mock".into(),
+            }));
+
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Yellow
+        );
+        assert_eq!(app.state.connection_status_display().summary, "degraded");
+        assert!(app
+            .state
+            .connection_status_display()
+            .detail
+            .contains("unhealthy"));
+    }
+
+    #[test]
+    fn stale_connection_needs_only_successful_health_checks_since_last_live_event() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        app.state
+            .handle_connection_health_result(Ok(ocpncord_backend::Health {
+                healthy: true,
+                version: "mock".into(),
+            }));
+        assert_eq!(app.state.connection_status_display().summary, "idle");
+
+        app.state.tick += CONNECTION_HEALTH_POLL_INTERVAL_TICKS;
+        app.state
+            .handle_connection_health_result(Err(BackendError::Parse {
+                message: "bad payload".into(),
+            }));
+        assert_eq!(app.state.connection_status_display().summary, "unconfirmed");
+
+        app.state.tick += CONNECTION_HEALTH_POLL_INTERVAL_TICKS;
+        app.state
+            .handle_connection_health_result(Ok(ocpncord_backend::Health {
+                healthy: true,
+                version: "mock".into(),
+            }));
+        assert_eq!(app.state.connection_status_display().summary, "unconfirmed");
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick += CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        app.state
+            .handle_connection_health_result(Ok(ocpncord_backend::Health {
+                healthy: true,
+                version: "mock".into(),
+            }));
+        assert_eq!(app.state.connection_status_display().summary, "idle");
+    }
+
+    #[test]
+    fn idle_connection_is_suppressed_while_response_is_active() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        app.state
+            .handle_connection_health_result(Ok(ocpncord_backend::Health {
+                healthy: true,
+                version: "mock".into(),
+            }));
+        assert_eq!(app.state.connection_status_display().summary, "idle");
+
+        run(&mut app, char_key('h'));
+        run(&mut app, enter_key());
+
+        assert!(app.state.should_show_response_indicator());
+        assert_eq!(app.state.connection_status_display().summary, "unconfirmed");
+    }
+
+    #[test]
+    fn fresh_live_event_promotes_idle_connection_back_to_live() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        app.state
+            .handle_connection_health_result(Ok(ocpncord_backend::Health {
+                healthy: true,
+                version: "mock".into(),
+            }));
+        assert_eq!(app.state.connection_status_display().summary, "idle");
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Green
+        );
+        assert_eq!(app.state.connection_status_display().summary, "live");
+    }
+
+    #[test]
+    fn stale_connection_turns_red_when_health_check_fails() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        app.backend_mut().health_status = None;
+
+        run(&mut app, Event::Tick);
+
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Red
+        );
+        assert_eq!(app.state.connection_status_display().summary, "offline");
+    }
+
+    #[test]
+    fn recent_live_event_stays_green_even_if_health_check_fails() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_HEALTH_POLL_INTERVAL_TICKS;
+        app.backend_mut().health_status = None;
+
+        run(&mut app, Event::Tick);
+
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Green
+        );
+        assert_eq!(app.state.connection_status_display().summary, "live");
+    }
+
+    #[test]
+    fn connection_transitions_emit_single_tier_toasts() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+
+        let first = app
+            .state
+            .toasts
+            .back()
+            .expect("green transition should toast");
+        assert_eq!(first.variant, ToastVariant::Success);
+
+        let toast_count = app.state.toasts.len();
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        assert_eq!(app.state.toasts.len(), toast_count);
+
+        app.state
+            .handle_live_stream_failure("connection lost".into());
+
+        let last = app
+            .state
+            .toasts
+            .back()
+            .expect("red transition should toast");
+        assert_eq!(last.variant, ToastVariant::Error);
+        assert!(last.message.contains("connection lost"));
+    }
+
+    #[test]
+    fn server_config_modal_shows_shared_connection_status() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.set_active_modal(Box::new(ServerConfigModal::new(
+            "http://localhost:4096".into(),
+        )));
+
+        let modal = app
+            .state
+            .active_modal
+            .as_deref_mut()
+            .and_then(|modal| modal.as_server_config_mut())
+            .expect("server config modal should be active");
+        assert_eq!(modal.active_connection_summary(), "live");
+    }
+
+    #[test]
+    fn server_config_modal_shows_shared_idle_connection_status() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        app.state
+            .handle_connection_health_result(Ok(ocpncord_backend::Health {
+                healthy: true,
+                version: "mock".into(),
+            }));
+        app.state.set_active_modal(Box::new(ServerConfigModal::new(
+            "http://localhost:4096".into(),
+        )));
+
+        let modal = app
+            .state
+            .active_modal
+            .as_deref_mut()
+            .and_then(|modal| modal.as_server_config_mut())
+            .expect("server config modal should be active");
+        assert_eq!(modal.active_connection_summary(), "idle");
+    }
+
+    #[test]
+    fn server_config_modal_shows_shared_degraded_connection_status() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        app.state
+            .handle_connection_health_result(Ok(ocpncord_backend::Health {
+                healthy: false,
+                version: "mock".into(),
+            }));
+        app.state.set_active_modal(Box::new(ServerConfigModal::new(
+            "http://localhost:4096".into(),
+        )));
+
+        let modal = app
+            .state
+            .active_modal
+            .as_deref_mut()
+            .and_then(|modal| modal.as_server_config_mut())
+            .expect("server config modal should be active");
+        assert_eq!(modal.active_connection_summary(), "degraded");
     }
 
     #[test]
@@ -4004,7 +4733,7 @@ mod tests {
         assert!(screen.contains(">"), "screen: {screen}");
         assert!(screen.contains("Waiting for agent"), "screen: {screen}");
         assert!(screen.contains("mode: primary"), "screen: {screen}");
-        assert!(screen.contains("model: default"), "screen: {screen}");
+        assert!(screen.contains("server: "), "screen: {screen}");
     }
 
     #[test]
@@ -4680,7 +5409,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_error_during_stream_shows_error_and_clears_stream() {
+    fn backend_connection_error_uses_shared_connection_state_and_clears_stream() {
         let mut backend = MockBackend::default();
         backend.live_events = vec![live_event(ocpncord_backend::BackendEvent::Error {
             message: "connection lost".into(),
@@ -4699,7 +5428,64 @@ mod tests {
             }),
         );
         assert!(!app.state.is_streaming());
-        assert!(app.state.error().unwrap_or("").contains("connection lost"));
+        assert!(app.state.error().is_none());
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Red
+        );
+        assert_eq!(app.state.connection_status_display().summary, "offline");
+    }
+
+    #[test]
+    fn sync_history_connection_error_uses_shared_connection_state() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .handle_sync_history_result(Err(BackendError::Connection {
+                message: "server unavailable".into(),
+            }));
+
+        assert!(app.state.error().is_none());
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Red
+        );
+        assert_eq!(app.state.connection_status_display().summary, "offline");
+        assert!(
+            app.state
+                .connection_status_display()
+                .detail
+                .contains("Sync catch-up failed"),
+            "detail: {}",
+            app.state.connection_status_display().detail
+        );
+    }
+
+    #[test]
+    fn session_creation_connection_error_uses_shared_connection_state() {
+        let mut backend = MockBackend::default();
+        backend.fail_create_session = Some(BackendError::Connection {
+            message: "server unavailable".into(),
+        });
+        let mut app = new_app(backend);
+
+        run(&mut app, char_key('h'));
+        let running = run(
+            &mut app,
+            Event::Key(KeyEvent {
+                scancode: Scancode::Enter,
+                modifiers: Modifiers::default(),
+            }),
+        );
+
+        assert!(running);
+        assert!(app.state.error().is_none());
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Red
+        );
+        assert_eq!(app.state.connection_status_display().summary, "offline");
     }
 
     #[test]
