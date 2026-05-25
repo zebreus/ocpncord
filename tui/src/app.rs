@@ -414,7 +414,6 @@ pub struct AppState {
     draft: Option<String>,
     error: Option<String>,
     is_streaming: bool,
-    response_indicator_until_tick: u64,
     chat: ChatState,
     active_submission: Option<Submission>,
     queued_submissions: Vec<Submission>,
@@ -468,7 +467,6 @@ impl AppState {
             draft: None,
             error: None,
             is_streaming: false,
-            response_indicator_until_tick: 0,
             chat: ChatState::new(),
             active_submission: None,
             queued_submissions: Vec::new(),
@@ -712,7 +710,6 @@ impl AppState {
         self.draft = None;
         self.error = None;
         self.is_streaming = false;
-        self.response_indicator_until_tick = 0;
         self.chat = ChatState::new();
         self.active_submission = None;
         self.queued_submissions.clear();
@@ -864,11 +861,11 @@ impl AppState {
     }
 
     fn mark_response_active(&mut self) {
-        self.response_indicator_until_tick = self.tick.saturating_add(80);
+        self.is_streaming = true;
     }
 
     fn should_show_response_indicator(&self) -> bool {
-        self.is_streaming || self.response_indicator_until_tick > self.tick
+        self.is_streaming || self.active_submission.is_some()
     }
 
     fn queue_or_dispatch_submission(&mut self, submission: Submission, message: LoadedMessage) {
@@ -904,6 +901,7 @@ impl AppState {
         self.is_streaming = true;
         self.mark_response_active();
         self.chat.clear_partial_stream();
+        self.active_submission = Some(submission.clone());
         self.queue_op(BackendOp::Submit { submission });
     }
 
@@ -926,6 +924,7 @@ impl AppState {
     }
     fn finish_streaming_response(&mut self) {
         let was_streaming = self.is_streaming;
+        self.chat.complete_running_tools_with_output();
         self.is_streaming = false;
         self.active_submission = None;
 
@@ -1140,10 +1139,10 @@ impl AppState {
                 #[allow(unreachable_patterns)]
                 match event {
                     ocpncord_backend::BackendEvent::Error { message } => {
+                        log::error!("backend event error: {message}");
                         self.error = Some(message);
                         self.chat.clear_partial_stream();
                         self.is_streaming = false;
-                        self.response_indicator_until_tick = 0;
                         self.active_submission = None;
                         self.dispatch_next_queued_submission();
                     }
@@ -1172,9 +1171,18 @@ impl AppState {
                         self.chat.clear_messages();
                         self.active_mode = AppMode::StartPage;
                     }
-                    ocpncord_backend::BackendEvent::SessionIdle { .. } => {}
-                    ocpncord_backend::BackendEvent::SessionError { error, .. } => {
+                    ocpncord_backend::BackendEvent::SessionIdle { session_id } => {
+                        log::debug!("session idle: {session_id}");
+                        if self.active_session_matches(&session_id) {
+                            self.finish_streaming_response();
+                        }
+                    }
+                    ocpncord_backend::BackendEvent::SessionError { session_id, error } => {
+                        log::error!("session error for {session_id}: {error:?}");
                         self.error = Some(alloc::format!("Session error: {:?}", error));
+                        if self.active_session_matches(&session_id) {
+                            self.finish_streaming_response();
+                        }
                     }
                     ocpncord_backend::BackendEvent::SessionDiff { .. } => {}
                     ocpncord_backend::BackendEvent::SessionCompacted { .. } => {}
@@ -1633,7 +1641,6 @@ impl AppState {
             });
         }
         self.is_streaming = false;
-        self.response_indicator_until_tick = 0;
         self.chat.clear_partial_stream();
         self.active_submission = None;
         self.queued_submissions.clear();
@@ -1847,12 +1854,13 @@ impl AppState {
     ) {
         match result {
             Ok(_) => {
-                self.active_submission = Some(submission);
+                if self.active_submission.is_none() {
+                    self.active_submission = Some(submission);
+                }
             }
             Err(e) => {
                 self.error = Some(alloc::format!("{}", e));
                 self.is_streaming = false;
-                self.response_indicator_until_tick = 0;
                 self.chat.clear_partial_stream();
                 self.active_submission = None;
                 self.dispatch_next_queued_submission();
@@ -2170,10 +2178,20 @@ impl AppState {
         let start_y = area.height.saturating_sub(total_content_height) / 2;
 
         let logo_area = Rect::new(area.x, start_y, area.width, logo_height);
-        Text::from(START_PAGE_LOGO)
-            .style(self.theme.logo)
-            .alignment(Alignment::Center)
-            .render(logo_area, frame.buffer_mut());
+        if area.width >= 74 {
+            Text::from(START_PAGE_LOGO)
+                .style(self.theme.logo)
+                .alignment(Alignment::Center)
+                .render(logo_area, frame.buffer_mut());
+        } else {
+            Text::from("ocpncord")
+                .style(self.theme.logo)
+                .alignment(Alignment::Center)
+                .render(
+                    Rect::new(area.x, start_y + 2, area.width, 1),
+                    frame.buffer_mut(),
+                );
+        }
 
         let tip_area = Rect::new(area.x, start_y + logo_height, area.width, tip_height);
         Text::from(START_PAGE_TIP)
@@ -2276,14 +2294,7 @@ impl AppState {
         }
 
         if let Some(ref err) = self.error {
-            let area = frame.area();
-            let msg = alloc::format!(" Error: {} ", err);
-            let msg_width = msg.len() as u16;
-            let x = (area.width.saturating_sub(msg_width)) / 2;
-            let err_area = Rect::new(x, area.height / 2, msg_width.min(area.width), 1);
-            Text::from(msg.as_str())
-                .style(self.theme.text_error)
-                .render(err_area, frame.buffer_mut());
+            self.render_error_panel(frame, frame.area(), err);
         }
 
         self.render_toasts(frame, frame.area());
@@ -2312,6 +2323,33 @@ impl AppState {
             block.render(modal_area, frame.buffer_mut());
             modal.render(frame, &self.theme, content_area);
         }
+    }
+
+    fn render_error_panel(&self, frame: &mut ratatui::Frame, area: Rect, error: &str) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let width = ((area.width as u32 * 3) / 4)
+            .clamp(32, area.width as u32)
+            .min(area.width as u32) as u16;
+        let height = ((area.height as u32) / 3)
+            .clamp(5, 10)
+            .min(area.height as u32) as u16;
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        let y = area.y + area.height.saturating_sub(height) / 2;
+        let panel_area = Rect::new(x, y, width, height);
+        Clear.render(panel_area, frame.buffer_mut());
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(self.theme.text_error)
+            .title("Error")
+            .title_style(self.theme.text_error);
+        let inner = block.inner(panel_area);
+        block.render(panel_area, frame.buffer_mut());
+        Paragraph::new(error)
+            .style(self.theme.text_error)
+            .wrap(Wrap { trim: false })
+            .render(inner, frame.buffer_mut());
     }
 
     fn render_side_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -5260,10 +5298,14 @@ mod tests {
                 let cell = buf.cell((x, y));
                 let symbol = cell.map(|c| c.symbol());
                 if symbol == Some("█") {
+                    let in_modal_scrollbar = x == modal_area.right().saturating_sub(2)
+                        && y >= content_area.top()
+                        && y < content_area.bottom();
                     if x >= modal_area.left()
                         && x < modal_area.right()
                         && y >= modal_area.top()
                         && y < modal_area.bottom()
+                        && !in_modal_scrollbar
                     {
                         has_logo_block_inside_modal = true;
                     } else {

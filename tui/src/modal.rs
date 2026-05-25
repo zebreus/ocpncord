@@ -54,6 +54,39 @@ enum SessionListState {
     Error(String),
 }
 
+fn fit_with_ellipsis(text: String, width: usize) -> String {
+    let len = text.chars().count();
+    if len <= width {
+        return text;
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(3)).collect();
+    out.push_str("...");
+    out
+}
+
+fn short_id(id: &str) -> String {
+    let len = id.chars().count();
+    if len <= 12 {
+        return id.into();
+    }
+    let head: String = id.chars().take(6).collect();
+    let tail: String = id
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}...{tail}")
+}
+
 pub struct SessionListModal {
     state: SessionListState,
     sessions: Vec<Session>,
@@ -161,10 +194,10 @@ impl Modal for SessionListModal {
                     .sessions
                     .iter()
                     .map(|session| {
-                        ListItem::new(Line::from(alloc::format!(
-                            "{}  [{}]",
-                            session.title,
-                            session.id
+                        let row = alloc::format!("{}  [{}]", session.title, short_id(&session.id));
+                        ListItem::new(Line::from(fit_with_ellipsis(
+                            row,
+                            list_content_area.width as usize,
                         )))
                     })
                     .collect();
@@ -385,9 +418,7 @@ impl Modal for ServerConfigModal {
         };
         lines.push(self.status_line().style(status_style));
         lines.push(Line::from(""));
-        lines.push(
-            Line::from("Tab/Left/Right: move  Enter: activate  Esc: cancel").style(theme.text_dim),
-        );
+        lines.push(Line::from("Tab/Arrows move  Enter activate  Esc cancel").style(theme.text_dim));
 
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
@@ -446,7 +477,7 @@ impl Modal for ServerConfigModal {
         let width = if area.width < 50 {
             area.width
         } else {
-            ((area.width as u32 * 3) / 5).clamp(50, area.width as u32) as u16
+            ((area.width as u32 * 3) / 5).clamp(56, area.width as u32) as u16
         };
         (width, 10_u16.min(area.height))
     }
@@ -483,6 +514,8 @@ impl DisplayConfigModal {
 
 impl Modal for DisplayConfigModal {
     fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect) {
+        let list_height = area.height.saturating_sub(1);
+        let list_area = Rect::new(area.x, area.y, area.width, list_height);
         let rows: Vec<ListItem<'_>> = PART_KIND_ORDER
             .iter()
             .map(|kind| {
@@ -500,14 +533,18 @@ impl Modal for DisplayConfigModal {
                 .style(theme.text)
                 .highlight_style(theme.selection)
                 .highlight_symbol("> "),
-            area,
+            list_area,
             frame.buffer_mut(),
             &mut state,
         );
 
         if area.height > 0 {
             let help_y = area.y + area.height.saturating_sub(1);
-            Line::from("Up/Down: select  Enter/Space: cycle  Esc: close")
+            let help = fit_with_ellipsis(
+                "Up/Down move  Enter cycle  Esc close".into(),
+                area.width as usize,
+            );
+            Line::from(help)
                 .style(theme.text_dim)
                 .render(Rect::new(area.x, help_y, area.width, 1), frame.buffer_mut());
         }
@@ -547,7 +584,7 @@ impl Modal for DisplayConfigModal {
         let width = if area.width < 36 {
             area.width
         } else {
-            ((area.width as u32 * 2) / 5).clamp(36, area.width as u32) as u16
+            ((area.width as u32 * 2) / 5).clamp(44, area.width as u32) as u16
         };
         (width, 15.min(area.height))
     }
@@ -573,7 +610,6 @@ struct ModelChoice {
     label: String,
     provider: String,
     family: Option<String>,
-    details: String,
 }
 
 impl ModelPickerModal {
@@ -596,36 +632,17 @@ impl ModelPickerModal {
 
         let mut models = Vec::new();
         for (provider_id, provider) in config.provider {
-            let provider_label = provider
-                .name
-                .unwrap_or_else(|| provider.id.clone().unwrap_or_else(|| provider_id.clone()));
             for (model_id, model) in provider.models {
                 let full_id = format!("{provider_id}/{model_id}");
                 let model_label = model
                     .name
                     .clone()
                     .unwrap_or_else(|| model.id.clone().unwrap_or_else(|| model_id.clone()));
-                let mut detail = provider_label.clone();
-                if let Some(family) = &model.family {
-                    detail.push_str(" - ");
-                    detail.push_str(family);
-                }
-                if let Some(status) = &model.status {
-                    detail.push_str(" - ");
-                    detail.push_str(status);
-                }
-                if model.reasoning == Some(true) {
-                    detail.push_str(" - reasoning");
-                }
-                if model.tool_call == Some(true) {
-                    detail.push_str(" - tools");
-                }
                 models.push(ModelChoice {
                     id: full_id,
                     label: model_label,
                     provider: provider_id.clone(),
                     family: model.family.clone(),
-                    details: detail,
                 });
             }
         }
@@ -637,68 +654,26 @@ impl ModelPickerModal {
 
         let mut choices: Vec<ModelChoice> = models
             .iter()
-            .map(|model| {
-                let mut detail = model.provider_id.clone();
-                if let Some(family) = &model.family {
-                    detail.push_str(" - ");
-                    detail.push_str(family);
-                }
-                if let Some(status) = &model.status {
-                    detail.push_str(" - ");
-                    detail.push_str(status);
-                }
-                if let Some(capabilities) = &model.capabilities {
-                    if capabilities.reasoning == Some(true) {
-                        detail.push_str(" - reasoning");
-                    }
-                    if capabilities.tool_call == Some(true) {
-                        detail.push_str(" - tools");
-                    }
-                    if capabilities.attachment == Some(true) {
-                        detail.push_str(" - attachments");
-                    }
-                }
-                ModelChoice {
-                    id: format!("{}/{}", model.provider_id, model.id),
-                    label: model.name.clone().unwrap_or_else(|| model.id.clone()),
-                    provider: model.provider_id.clone(),
-                    family: model.family.clone(),
-                    details: detail,
-                }
+            .map(|model| ModelChoice {
+                id: format!("{}/{}", model.provider_id, model.id),
+                label: model.name.clone().unwrap_or_else(|| model.id.clone()),
+                provider: model.provider_id.clone(),
+                family: model.family.clone(),
             })
             .collect();
 
         for (provider_id, provider) in config.provider {
-            let provider_label = provider
-                .name
-                .unwrap_or_else(|| provider.id.clone().unwrap_or_else(|| provider_id.clone()));
             for (model_id, model) in provider.models {
                 let full_id = format!("{provider_id}/{model_id}");
                 let model_label = model
                     .name
                     .clone()
                     .unwrap_or_else(|| model.id.clone().unwrap_or_else(|| model_id.clone()));
-                let mut detail = provider_label.clone();
-                if let Some(family) = &model.family {
-                    detail.push_str(" - ");
-                    detail.push_str(family);
-                }
-                if let Some(status) = &model.status {
-                    detail.push_str(" - ");
-                    detail.push_str(status);
-                }
-                if model.reasoning == Some(true) {
-                    detail.push_str(" - reasoning");
-                }
-                if model.tool_call == Some(true) {
-                    detail.push_str(" - tools");
-                }
                 choices.push(ModelChoice {
                     id: full_id,
                     label: model_label,
                     provider: provider_id.clone(),
                     family: model.family.clone(),
-                    details: detail,
                 });
             }
         }
@@ -815,6 +790,21 @@ impl ModelPickerModal {
         }
     }
 
+    fn current_display(&self) -> String {
+        let Some(current) = self
+            .current_model
+            .as_deref()
+            .or(self.agent_model.as_deref())
+        else {
+            return "No model configured".into();
+        };
+        self.models
+            .iter()
+            .find(|choice| choice.id == current)
+            .map(|choice| format!("{}  [{}]", choice.label, choice.provider))
+            .unwrap_or_else(|| current.into())
+    }
+
     fn move_selected(&mut self, delta: isize) {
         if self.filtered_indices.is_empty() {
             self.selected = 0;
@@ -891,12 +881,10 @@ impl Modal for ModelPickerModal {
             return;
         }
 
-        let current = self
-            .current_model
-            .as_deref()
-            .or(self.agent_model.as_deref())
-            .unwrap_or("No model configured");
-        let current_label = fit_with_ellipsis(format!("Current: {current}"), area.width as usize);
+        let current_label = fit_with_ellipsis(
+            format!("Current: {}", self.current_display()),
+            area.width as usize,
+        );
         Text::from(current_label)
             .style(theme.text_dim)
             .render(Rect::new(area.x, area.y, area.width, 1), frame.buffer_mut());
@@ -935,6 +923,17 @@ impl Modal for ModelPickerModal {
         let list_area = Rect::new(area.x, list_y, area.width, area.bottom() - list_y);
         let visible_rows = list_area.height.max(1);
         self.visible_rows.set(visible_rows);
+        let needs_scrollbar = self.filtered_indices.len() > visible_rows as usize;
+        let list_content_area = if needs_scrollbar && list_area.width > 1 {
+            Rect::new(
+                list_area.x,
+                list_area.y,
+                list_area.width - 1,
+                list_area.height,
+            )
+        } else {
+            list_area
+        };
         let rows: Vec<ListItem<'_>> = self
             .filtered_indices
             .iter()
@@ -943,10 +942,10 @@ impl Modal for ModelPickerModal {
             .filter_map(|model_index| self.models.get(*model_index))
             .map(|choice| {
                 let marker = self.current_marker(choice);
-                let display = format!("{marker} {}  [{}]", choice.label, choice.details);
+                let display = format!("{marker} {}  [{}]", choice.label, choice.provider);
                 ListItem::new(Line::from(fit_with_ellipsis(
                     display,
-                    list_area.width as usize,
+                    list_content_area.width as usize,
                 )))
             })
             .collect();
@@ -956,12 +955,12 @@ impl Modal for ModelPickerModal {
             List::new(rows)
                 .style(theme.text)
                 .highlight_style(theme.selection),
-            list_area,
+            list_content_area,
             frame.buffer_mut(),
             &mut state,
         );
 
-        if self.filtered_indices.len() > visible_rows as usize {
+        if needs_scrollbar {
             let mut scroll_state =
                 ScrollbarState::new(self.filtered_indices.len()).position(self.scroll as usize);
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -1014,31 +1013,24 @@ impl Modal for ModelPickerModal {
     }
 }
 
-fn fit_with_ellipsis(text: String, width: usize) -> String {
-    let len = text.chars().count();
-    if len <= width {
-        return text;
-    }
-    if width <= 3 {
-        return text.chars().take(width).collect();
-    }
-    let mut out: String = text.chars().take(width - 3).collect();
-    out.push_str("...");
-    out
-}
-
 // --- Help modal ---
 
-pub struct HelpModal;
+const HELP_LINE_COUNT: u16 = 32;
+
+pub struct HelpModal {
+    scroll: u16,
+    visible_height: Cell<u16>,
+}
 
 impl HelpModal {
     pub fn new() -> Self {
-        Self
+        Self {
+            scroll: 0,
+            visible_height: Cell::new(1),
+        }
     }
-}
 
-impl Modal for HelpModal {
-    fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect) {
+    fn lines(&self, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'_>> = Vec::new();
         for (text, heading) in [
             ("Slash Commands", true),
@@ -1079,15 +1071,85 @@ impl Modal for HelpModal {
                 theme.text
             }));
         }
+        lines
+    }
 
-        Paragraph::new(Text::from(lines))
+    fn move_scroll(&mut self, delta: i16) {
+        let visible_height = self.visible_height.get().max(1);
+        let max_scroll = HELP_LINE_COUNT.saturating_sub(visible_height);
+        let scroll = self.scroll.min(max_scroll);
+        if delta < 0 {
+            self.scroll = scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.scroll = scroll.saturating_add(delta as u16).min(max_scroll);
+        }
+    }
+
+    #[cfg(test)]
+    fn set_visible_height_for_test(&self, visible_height: u16) {
+        self.visible_height.set(visible_height);
+    }
+
+    #[cfg(test)]
+    fn scroll_offset(&self) -> u16 {
+        self.scroll
+    }
+}
+
+impl Modal for HelpModal {
+    fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect) {
+        let lines = self.lines(theme);
+        let content_len = lines.len();
+        let visible_height = area.height.max(1);
+        self.visible_height.set(visible_height);
+        let scroll = self
+            .scroll
+            .min((content_len as u16).saturating_sub(visible_height));
+        let content_area = if content_len > visible_height as usize && area.width > 1 {
+            Rect::new(area.x, area.y, area.width - 1, area.height)
+        } else {
+            area
+        };
+        let visible_lines: Vec<Line<'_>> = lines
+            .into_iter()
+            .skip(scroll as usize)
+            .take(visible_height as usize)
+            .collect();
+
+        Paragraph::new(Text::from(visible_lines))
             .wrap(Wrap { trim: false })
-            .render(area, frame.buffer_mut());
+            .render(content_area, frame.buffer_mut());
+
+        if content_len > visible_height as usize {
+            let max_scroll = (content_len as u16).saturating_sub(visible_height);
+            let mut state =
+                ScrollbarState::new(max_scroll.max(1) as usize).position(scroll as usize);
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_style(theme.scrollbar)
+                .track_style(theme.text_dim)
+                .render(area, frame.buffer_mut(), &mut state);
+        }
     }
 
     fn handle_event(&mut self, event: Event) -> Action {
         match event {
             Event::Key(ref ke) if ke.scancode == Scancode::Escape => Action::CloseModal,
+            Event::Key(ref ke) if ke.scancode == Scancode::Up => {
+                self.move_scroll(-1);
+                Action::None
+            }
+            Event::Key(ref ke) if ke.scancode == Scancode::Down => {
+                self.move_scroll(1);
+                Action::None
+            }
+            Event::Key(ref ke) if ke.scancode == Scancode::PageUp => {
+                self.move_scroll(-8);
+                Action::None
+            }
+            Event::Key(ref ke) if ke.scancode == Scancode::PageDown => {
+                self.move_scroll(8);
+                Action::None
+            }
             _ => Action::None,
         }
     }
@@ -1753,6 +1815,42 @@ mod tests {
             "Should show File reference. Screen: {}",
             screen
         );
+    }
+
+    #[test]
+    fn help_modal_clamps_scroll_at_bottom() {
+        let mut modal = HelpModal::new();
+        modal.set_visible_height_for_test(20);
+
+        for _ in 0..40 {
+            modal.handle_event(key(Scancode::Down));
+        }
+        assert_eq!(modal.scroll_offset(), HELP_LINE_COUNT - 20);
+
+        modal.handle_event(key(Scancode::Up));
+        assert_eq!(modal.scroll_offset(), HELP_LINE_COUNT - 21);
+    }
+
+    #[test]
+    fn help_modal_renders_scrollbar_when_scrollable() {
+        let modal = HelpModal::new();
+        let theme = Theme::default();
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                modal.render(frame, &theme, Rect::new(0, 0, 60, 20));
+            })
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("█"), "screen: {screen}");
+        assert!(screen.contains("▼"), "screen: {screen}");
     }
 
     #[test]

@@ -255,7 +255,19 @@ impl ChatState {
 
     pub(crate) fn finish_streaming_response(&mut self, message_id: &str, session_id: &str) {
         self.upsert_assistant_message_from_partial(message_id, session_id);
+        self.complete_running_tools_with_output();
         self.clear_partial_stream();
+    }
+
+    pub(crate) fn complete_running_tools_with_output(&mut self) {
+        for part in self.partial_parts.iter_mut() {
+            complete_running_tool_with_output(part);
+        }
+        for message in self.messages.iter_mut() {
+            for part in message.parts.iter_mut() {
+                complete_running_tool_with_output(part);
+            }
+        }
     }
 
     pub(crate) fn apply_message_updated(&mut self, message: ocpncord_backend::Message) -> bool {
@@ -272,8 +284,9 @@ impl ChatState {
                 false
             }
             ocpncord_backend::MessageRole::Assistant => {
+                let completed = message_completed(&message);
                 self.finish_streaming_response(message_id, message_session_id);
-                true
+                completed
             }
         }
     }
@@ -525,6 +538,13 @@ fn message_identity(
     }
 }
 
+fn message_completed(message: &ocpncord_backend::Message) -> bool {
+    match message {
+        ocpncord_backend::Message::User(message) => message.time.completed.is_some(),
+        ocpncord_backend::Message::Assistant(message) => message.time.completed.is_some(),
+    }
+}
+
 fn parts_equivalent(left: &ocpncord_backend::Part, right: &ocpncord_backend::Part) -> bool {
     match (left, right) {
         (ocpncord_backend::Part::Text(left), ocpncord_backend::Part::Text(right)) => {
@@ -550,7 +570,13 @@ fn parts_describe_same_entity(
 ) -> bool {
     match (left, right) {
         (ocpncord_backend::Part::Tool(left), ocpncord_backend::Part::Tool(right)) => {
-            left.tool == right.tool
+            if let (Some(left_id), Some(right_id)) =
+                (left.identity.id.as_deref(), right.identity.id.as_deref())
+            {
+                left_id == right_id
+            } else {
+                left.tool == right.tool && left.identity.id.is_none() && right.identity.id.is_none()
+            }
         }
         (ocpncord_backend::Part::StepStart(left), ocpncord_backend::Part::StepStart(right)) => {
             left.session_id == right.session_id && left.snapshot == right.snapshot
@@ -661,6 +687,36 @@ fn tool_states_equivalent(
         ) => left_error == right_error,
         _ => false,
     }
+}
+
+fn complete_running_tool_with_output(part: &mut ocpncord_backend::Part) {
+    let ocpncord_backend::Part::Tool(tool) = part else {
+        return;
+    };
+    let ocpncord_backend::ToolState::Running {
+        input,
+        title,
+        metadata,
+        time,
+    } = &tool.state
+    else {
+        return;
+    };
+    let Some(metadata) = metadata.as_ref() else {
+        return;
+    };
+    let Some(output) = metadata.get("output").cloned() else {
+        return;
+    };
+    let start = time.as_ref().map(|time| time.start).unwrap_or_default();
+    tool.state = ocpncord_backend::ToolState::Completed {
+        input: input.clone(),
+        output,
+        title: title.clone().unwrap_or_else(|| tool.tool.clone()),
+        metadata: metadata.clone(),
+        time: ocpncord_backend::ToolTimeCompleted { start, end: start },
+        attachments: Vec::new(),
+    };
 }
 
 fn stream_text_kind(part: &ocpncord_backend::Part) -> Option<StreamTextKind> {
@@ -1373,6 +1429,44 @@ mod tests {
         assert!(rendered.contains("git status --short"), "{rendered}");
         assert!(rendered.contains("found 3 matches"), "{rendered}");
         assert!(rendered.contains("src/lib.rs"), "{rendered}");
+    }
+
+    #[test]
+    fn running_tool_with_output_metadata_is_completed_on_finalize() {
+        let mut input = alloc::collections::BTreeMap::new();
+        input.insert("command".into(), "pwd".into());
+        let mut metadata = alloc::collections::BTreeMap::new();
+        metadata.insert("output".into(), "/tmp/project".into());
+        let mut state = ChatState::new();
+        state.merge_stream_part(
+            Some("tool-1".into()),
+            Part::Tool(ToolPart {
+                identity: PartIdentity {
+                    id: Some("tool-1".into()),
+                    message_id: None,
+                },
+                tool: "bash".into(),
+                state: ToolState::Running {
+                    input,
+                    title: Some("Print working directory".into()),
+                    metadata: Some(metadata),
+                    time: Some(ocpncord_backend::ToolTime { start: 7 }),
+                },
+            }),
+        );
+
+        state.complete_running_tools_with_output();
+
+        match &state.partial_parts()[0] {
+            Part::Tool(tool) => match &tool.state {
+                ToolState::Completed { output, title, .. } => {
+                    assert_eq!(output, "/tmp/project");
+                    assert_eq!(title, "Print working directory");
+                }
+                other => panic!("expected completed tool, got {other:?}"),
+            },
+            other => panic!("expected tool part, got {other:?}"),
+        }
     }
 
     #[test]

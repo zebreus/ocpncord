@@ -13,6 +13,7 @@ use log::{LevelFilter, Log, Metadata, Record};
 
 use clap::Parser;
 use crossterm::cursor::{Hide, Show};
+use crossterm::event::DisableMouseCapture;
 use crossterm::style::{
     Attribute, Color as CrosstermColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
@@ -452,7 +453,8 @@ struct Cli {
 
 fn setup_terminal() -> Terminal<CrosstermBackend> {
     let _ = enable_raw_mode();
-    let _ = execute!(stdout(), EnterAlternateScreen);
+    let _ = execute!(stdout(), EnterAlternateScreen, DisableMouseCapture);
+    let _ = stdout().write_all(b"\x1b[?1007l");
     Terminal::new(CrosstermBackend::new()).unwrap()
 }
 
@@ -460,11 +462,17 @@ fn setup_terminal() -> Terminal<CrosstermBackend> {
 async fn main() {
     let cli = Cli::parse();
 
-    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Debug));
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(LevelFilter::Debug);
+        log::info!("native logger initialized");
+    } else {
+        let _ = writeln!(std::io::stderr(), "failed to initialize native logger");
+    }
 
     static TCP: StdTcp = StdTcp;
     static DNS: StdDns = StdDns;
     let backend = OpenCodeBackend::new(&cli.url, &TCP, &DNS);
+    log::info!("starting ocpncord-native with server {}", cli.url);
     let terminal = setup_terminal();
     let events = NativeEvents::new();
     let mut app = App::new(backend, events, terminal);
@@ -473,7 +481,10 @@ async fn main() {
         app.set_session_directory_override(session_directory);
     }
     app.run().await;
+    log::info!("ocpncord-native stopped");
+    log::logger().flush();
 
+    let _ = stdout().write_all(b"\x1b[?1007h");
     let _ = execute!(stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
