@@ -817,7 +817,8 @@ pub(crate) fn render_chat(
         .render(text_area, frame.buffer_mut());
 
     if show_scrollbar {
-        let mut state = ScrollbarState::new(content_height).position(scroll_y as usize);
+        let mut state =
+            ScrollbarState::new((max_scroll as usize).max(1)).position(scroll_y as usize);
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .thumb_style(theme.scrollbar)
             .track_style(theme.text_dim)

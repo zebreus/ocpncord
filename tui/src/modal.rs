@@ -214,8 +214,9 @@ impl Modal for SessionListModal {
                     &mut state,
                 );
                 if self.sessions.len() > visible_height as usize {
+                    let max_scroll = self.sessions.len().saturating_sub(visible_height as usize);
                     let mut scrollbar_state =
-                        ScrollbarState::new(self.sessions.len()).position(scroll as usize);
+                        ScrollbarState::new(max_scroll.max(1)).position(scroll as usize);
                     Scrollbar::new(ScrollbarOrientation::VerticalRight)
                         .thumb_style(theme.scrollbar)
                         .track_style(theme.text_dim)
@@ -961,8 +962,12 @@ impl Modal for ModelPickerModal {
         );
 
         if needs_scrollbar {
+            let max_scroll = self
+                .filtered_indices
+                .len()
+                .saturating_sub(visible_rows as usize);
             let mut scroll_state =
-                ScrollbarState::new(self.filtered_indices.len()).position(self.scroll as usize);
+                ScrollbarState::new(max_scroll.max(1)).position(self.scroll as usize);
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .thumb_style(theme.scrollbar)
                 .render(list_area, frame.buffer_mut(), &mut scroll_state);

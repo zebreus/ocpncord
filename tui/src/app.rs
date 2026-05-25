@@ -2488,7 +2488,12 @@ impl AppState {
         StatefulWidget::render(List::new(items), area, frame.buffer_mut(), &mut state);
 
         if self.terminal.lines.len() > area.height as usize {
-            let mut scrollbar = ScrollbarState::new(self.terminal.lines.len()).position(start_idx);
+            let max_scroll = self
+                .terminal
+                .lines
+                .len()
+                .saturating_sub(area.height as usize);
+            let mut scrollbar = ScrollbarState::new(max_scroll.max(1)).position(start_idx);
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .thumb_style(self.theme.scrollbar)
                 .track_style(self.theme.text_dim)
