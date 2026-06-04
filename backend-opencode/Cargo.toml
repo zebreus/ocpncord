@@ -22,6 +22,11 @@ serde_json.workspace = true
 reqwless.workspace = true
 embedded-io-async.workspace = true
 embedded-nal-async.workspace = true
+# Not used directly: pins the transitive `der` dependency of embedded-tls to the
+# pre-release it was built against. embedded-tls 0.18.0 requires `der
+# 0.8.0-rc.*`, but the stable `der 0.8.0` (and later) break it, so without this
+# pin a fresh resolve picks the broken stable release and fails to compile.
+der = { version = "=0.8.0-rc.10", default-features = false }
 
 [dev-dependencies]
 futures.workspace = true

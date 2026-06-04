@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "ocpncord-backend"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "futures-core",
  "serde",
@@ -1036,8 +1036,9 @@ dependencies = [
 
 [[package]]
 name = "ocpncord-backend-opencode"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
+ "der 0.8.0-rc.10",
  "embedded-io-async",
  "embedded-nal-async",
  "futures",
@@ -1051,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "ocpncord-native"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "clap",
  "crossterm",
@@ -1068,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "ocpncord-tui"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "futures",
  "futures-core",
