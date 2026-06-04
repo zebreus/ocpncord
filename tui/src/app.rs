@@ -59,7 +59,16 @@ const MAX_STORED_TOASTS: usize = 16;
 const MAX_VISIBLE_TOASTS: usize = 5;
 const LIVE_RECONNECT_DELAY_TICKS: u64 = 4;
 const CONNECTION_LIVE_FRESHNESS_TICKS: u64 = 100;
-const CONNECTION_HEALTH_POLL_INTERVAL_TICKS: u64 = 100;
+// Must stay strictly below CONNECTION_LIVE_FRESHNESS_TICKS so a health check
+// fires (and confirms reachability) *while the stream is still fresh*. Once the
+// freshness window lapses the already-recorded clean health check lets the
+// status go straight from "live" to "idle" instead of dipping through
+// "unconfirmed". `note_live_event` clears the health confirmation and reschedules
+// the next poll to `last_event + interval`, so during active streaming the poll
+// keeps getting deferred and only fires once the events stop.
+const CONNECTION_HEALTH_POLL_INTERVAL_TICKS: u64 = 60;
+const _: () =
+    assert!(CONNECTION_HEALTH_POLL_INTERVAL_TICKS < CONNECTION_LIVE_FRESHNESS_TICKS);
 const CONNECTION_HEALTH_SLOW_PROBE_VISIBILITY_TICKS: u64 = 10;
 const DEFAULT_SERVER_URL: &str = "http://localhost:4096";
 const START_PAGE_LOGO: &str = r#"██████   ██████ ██████  ███    ██ ██████  ██████  ██████  ██████
@@ -4439,6 +4448,37 @@ mod tests {
                 version: "mock".into(),
             }));
 
+        assert_eq!(
+            app.state.connection_status_display().tier,
+            ConnectionTier::Green
+        );
+        assert_eq!(app.state.connection_status_display().summary, "idle");
+    }
+
+    #[test]
+    fn live_goes_straight_to_idle_when_health_confirmed_before_freshness_expires() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        assert_eq!(app.state.connection_status_display().summary, "live");
+
+        // The poll interval is shorter than the freshness window, so a health
+        // check completes successfully while the stream is still fresh. The
+        // status must remain "live" (the clean health check is recorded but not
+        // yet surfaced).
+        app.state.tick = CONNECTION_HEALTH_POLL_INTERVAL_TICKS;
+        app.state
+            .handle_connection_health_result(Ok(ocpncord_backend::Health {
+                healthy: true,
+                version: "mock".into(),
+            }));
+        assert_eq!(app.state.connection_status_display().summary, "live");
+
+        // Once the freshness window lapses, the already-recorded clean health
+        // check sends us directly to "idle" — never through "unconfirmed".
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
         assert_eq!(
             app.state.connection_status_display().tier,
             ConnectionTier::Green
