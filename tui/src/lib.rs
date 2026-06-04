@@ -16,6 +16,7 @@ mod key_chord;
 mod modal;
 mod prompt_bar;
 mod theme;
+mod user_work;
 
 pub use app::{Action, App, AppMode, ModalId, Tab};
 pub use chat::{PartDisplayMode, PartKind};

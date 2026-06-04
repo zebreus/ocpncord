@@ -178,7 +178,6 @@ pub(crate) struct ChatState {
     partial_part_indices: BTreeMap<String, usize>,
     latest_text_part_index: Option<usize>,
     messages: Vec<LoadedMessage>,
-    queued_messages: Vec<LoadedMessage>,
 }
 
 impl ChatState {
@@ -192,10 +191,6 @@ impl ChatState {
 
     pub(crate) fn messages(&self) -> &[LoadedMessage] {
         &self.messages
-    }
-
-    pub(crate) fn queued_messages(&self) -> &[LoadedMessage] {
-        &self.queued_messages
     }
 
     pub(crate) fn clear_partial_stream(&mut self) {
@@ -215,22 +210,6 @@ impl ChatState {
 
     pub(crate) fn push_message(&mut self, message: LoadedMessage) {
         self.messages.push(message);
-    }
-
-    pub(crate) fn queue_message(&mut self, message: LoadedMessage) {
-        self.queued_messages.push(message);
-    }
-
-    pub(crate) fn pop_queued_message(&mut self) -> Option<LoadedMessage> {
-        if self.queued_messages.is_empty() {
-            None
-        } else {
-            Some(self.queued_messages.remove(0))
-        }
-    }
-
-    pub(crate) fn clear_queued_messages(&mut self) {
-        self.queued_messages.clear();
     }
 
     pub(crate) fn has_partial_response(&self) -> bool {

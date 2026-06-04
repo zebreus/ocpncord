@@ -14,8 +14,8 @@ use futures_core::Stream;
 use ocpncord_backend::{Backend, BackendError, EventEnvelope, EventScope};
 
 use crate::chat::{
-    loaded_messages_from_details, render_chat, user_loaded_message, ChatDisplayPolicy, ChatState,
-    ChatTranscript, LoadedMessage, PartDisplayMode, PartKind,
+    loaded_messages_from_details, render_chat, ChatDisplayPolicy, ChatState, ChatTranscript,
+    LoadedMessage, PartDisplayMode, PartKind,
 };
 use crate::command_palette::CommandPaletteModal;
 use crate::event::{Event, Scancode};
@@ -26,6 +26,9 @@ use crate::modal::{
 };
 use crate::prompt_bar::{InputMode, PromptBar};
 use crate::theme::Theme;
+use crate::user_work::{
+    Submission, SubmissionKind, UserWorkEffect, UserWorkId, UserWorkKind, UserWorkQueue, WorkStart,
+};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
@@ -390,49 +393,6 @@ enum ActiveBlockingPrompt {
     Question(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SubmissionKind {
-    Prompt,
-    Command,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Submission {
-    pub kind: SubmissionKind,
-    pub session_id: String,
-    pub text: String,
-    pub execution_text: String,
-    pub agent: String,
-}
-
-impl Submission {
-    fn prompt(session_id: String, text: String, agent: String) -> Self {
-        Self {
-            kind: SubmissionKind::Prompt,
-            session_id,
-            execution_text: text.clone(),
-            text,
-            agent,
-        }
-    }
-
-    fn command(session_id: String, text: String, agent: String) -> Self {
-        let execution_text = text
-            .trim_start()
-            .strip_prefix('!')
-            .unwrap_or(text.as_str())
-            .trim_start()
-            .to_string();
-        Self {
-            kind: SubmissionKind::Command,
-            session_id,
-            execution_text,
-            text,
-            agent,
-        }
-    }
-}
-
 /// A single LSP diagnostic entry.
 #[derive(Debug, Clone)]
 pub struct LspDiagnostic {
@@ -488,11 +448,7 @@ impl Default for TerminalPane {
 
 #[derive(Debug, Clone)]
 enum CreateSessionPurpose {
-    Send {
-        text: String,
-        mode: InputMode,
-        agent: String,
-    },
+    UserWork { work_id: UserWorkId },
     NewChat,
 }
 
@@ -570,6 +526,7 @@ enum BackendOp {
         purpose: CreateSessionPurpose,
     },
     Submit {
+        work_id: UserWorkId,
         submission: Submission,
     },
     ListSessions,
@@ -622,7 +579,7 @@ enum BackendOpResult<B: Backend> {
         result: ocpncord_backend::Result<ocpncord_backend::Session>,
     },
     Submit {
-        submission: Submission,
+        work_id: UserWorkId,
         result: ocpncord_backend::Result<ocpncord_backend::SubmissionReceipt>,
     },
     ListSessions(ocpncord_backend::Result<Vec<ocpncord_backend::Session>>),
@@ -672,8 +629,9 @@ pub struct AppState {
     error: Option<String>,
     is_streaming: bool,
     chat: ChatState,
-    active_submission: Option<Submission>,
-    queued_submissions: Vec<Submission>,
+    user_work: UserWorkQueue,
+    active_assistant_finalized: bool,
+    active_session_idle: bool,
     sync_known_sequences: BTreeMap<String, u64>,
     connection: ConnectionState,
     last_connection_tier: ConnectionTier,
@@ -727,8 +685,9 @@ impl AppState {
             error: None,
             is_streaming: false,
             chat: ChatState::new(),
-            active_submission: None,
-            queued_submissions: Vec::new(),
+            user_work: UserWorkQueue::new(),
+            active_assistant_finalized: false,
+            active_session_idle: false,
             sync_known_sequences: BTreeMap::new(),
             connection: ConnectionState::new(),
             last_connection_tier: ConnectionTier::Yellow,
@@ -902,8 +861,10 @@ impl AppState {
         self.connection.schedule_reconnect_from(self.tick);
         self.chat.clear_partial_stream();
         self.is_streaming = false;
-        self.active_submission = None;
-        self.dispatch_next_queued_submission();
+        self.user_work.clear_active();
+        self.active_assistant_finalized = false;
+        self.active_session_idle = false;
+        self.dispatch_next_user_work();
         self.sync_connection_surfaces();
     }
 
@@ -1029,7 +990,10 @@ impl AppState {
         result: ocpncord_backend::Result<ocpncord_backend::Health>,
     ) {
         match result {
-            Ok(health) if health.healthy => self.connection.record_health_success(self.tick),
+            Ok(health) if health.healthy => {
+                self.connection.record_health_success(self.tick);
+                self.queue_pending_user_work_session_creation();
+            }
             Ok(health) => self.connection.record_health_degraded(
                 self.tick,
                 format!("server reported unhealthy (version {})", health.version),
@@ -1062,8 +1026,9 @@ impl AppState {
         self.error = None;
         self.is_streaming = false;
         self.chat = ChatState::new();
-        self.active_submission = None;
-        self.queued_submissions.clear();
+        self.user_work.clear();
+        self.active_assistant_finalized = false;
+        self.active_session_idle = false;
         self.sync_known_sequences.clear();
         self.connection = ConnectionState::new();
         self.last_connection_tier = ConnectionTier::Yellow;
@@ -1236,14 +1201,6 @@ impl AppState {
         self.chat.messages()
     }
 
-    pub fn active_submission(&self) -> Option<&Submission> {
-        self.active_submission.as_ref()
-    }
-
-    pub fn queued_submissions(&self) -> &[Submission] {
-        &self.queued_submissions
-    }
-
     pub fn tick(&self) -> u64 {
         self.tick
     }
@@ -1253,7 +1210,7 @@ impl AppState {
     }
 
     fn should_show_response_indicator(&self) -> bool {
-        self.is_streaming || self.active_submission.is_some()
+        self.is_streaming || self.user_work.has_active_work()
     }
 
     fn response_indicator_content(&self) -> Option<(String, Style, Style)> {
@@ -1292,7 +1249,7 @@ impl AppState {
                 self.theme.text_accent,
                 self.theme.text_dim,
             )),
-            _ if self.active_submission.is_some() => Some((
+            _ if self.user_work.has_active_work() => Some((
                 "Waiting for agent...".into(),
                 self.theme.text_accent,
                 self.theme.text_dim,
@@ -1305,50 +1262,48 @@ impl AppState {
         }
     }
 
-    fn queue_or_dispatch_submission(&mut self, submission: Submission, message: LoadedMessage) {
-        if self.is_streaming || self.active_submission.is_some() {
-            self.queued_submissions.push(submission);
-            self.chat.queue_message(message);
-            return;
+    fn apply_user_work_effect(&mut self, effect: UserWorkEffect) {
+        match effect {
+            UserWorkEffect::CreateSession { work_id } => {
+                self.queue_op(BackendOp::CreateSession {
+                    title: "Chat".into(),
+                    session_directory: self.create_session_directory(),
+                    purpose: CreateSessionPurpose::UserWork { work_id },
+                });
+            }
+            UserWorkEffect::Submit(start) => self.start_user_work(start),
         }
-
-        self.start_submission(submission, message);
     }
 
-    fn take_next_queued_submission(&mut self) -> Option<(Submission, LoadedMessage)> {
-        if self.queued_submissions.is_empty() {
-            return None;
-        }
-
-        let Some(message) = self.chat.pop_queued_message() else {
-            return None;
-        };
-
+    fn start_user_work(&mut self, start: WorkStart) {
         if self.chat.has_partial_response() {
             self.chat.flush_partial_response(self.active_session_id());
         }
-
-        Some((self.queued_submissions.remove(0), message))
-    }
-
-    fn start_submission(&mut self, submission: Submission, message: LoadedMessage) {
-        self.chat.push_message(message);
-        self.draft = Some(submission.text.clone());
+        self.chat.push_message(start.message);
+        self.draft = Some(start.submission.text.clone());
         self.active_mode = AppMode::Chat;
         self.is_streaming = true;
+        self.active_assistant_finalized = false;
+        self.active_session_idle = false;
         self.mark_response_active();
         self.current_session_status = None;
         self.chat.clear_partial_stream();
-        self.active_submission = Some(submission.clone());
-        self.queue_op(BackendOp::Submit { submission });
+        self.queue_op(BackendOp::Submit {
+            work_id: start.id,
+            submission: start.submission,
+        });
     }
 
-    fn dispatch_next_queued_submission(&mut self) {
-        let Some((submission, message)) = self.take_next_queued_submission() else {
-            return;
-        };
+    fn dispatch_next_user_work(&mut self) {
+        if let Some(start) = self.user_work.dispatch_next(self.is_streaming) {
+            self.start_user_work(start);
+        }
+    }
 
-        self.start_submission(submission, message);
+    fn queue_pending_user_work_session_creation(&mut self) {
+        if let Some(work_id) = self.user_work.request_next_session_creation() {
+            self.apply_user_work_effect(UserWorkEffect::CreateSession { work_id });
+        }
     }
 
     fn active_session_id(&self) -> Option<String> {
@@ -1379,14 +1334,39 @@ impl AppState {
 
     fn finish_streaming_response(&mut self) {
         let was_streaming = self.is_streaming;
+        let had_active_work = self.user_work.has_active_work();
         self.chat.complete_running_tools_with_output();
         self.is_streaming = false;
-        self.active_submission = None;
+        self.active_assistant_finalized = false;
+        self.active_session_idle = false;
         self.current_session_status = None;
 
-        if was_streaming {
-            self.dispatch_next_queued_submission();
+        if was_streaming || had_active_work {
+            if let Some(start) = self.user_work.finish_active(false) {
+                self.start_user_work(start);
+            }
         }
+    }
+
+    fn handle_session_idle(&mut self, session_id: &str) {
+        log::debug!("session idle: {session_id}");
+        if !self.active_session_matches(session_id) {
+            return;
+        }
+
+        if self.user_work.has_active_work() && self.user_work.has_pending_work() {
+            self.active_session_idle = true;
+            if self.active_assistant_finalized {
+                self.finish_streaming_response();
+            } else {
+                self.chat.complete_running_tools_with_output();
+                self.is_streaming = false;
+                self.current_session_status = None;
+            }
+            return;
+        }
+
+        self.finish_streaming_response();
     }
 
     fn apply_message_updated(&mut self, session_id: String, message: ocpncord_backend::Message) {
@@ -1395,7 +1375,10 @@ impl AppState {
         }
 
         if self.chat.apply_message_updated(message) {
-            self.finish_streaming_response();
+            self.active_assistant_finalized = true;
+            if !self.user_work.has_pending_work() || self.active_session_idle {
+                self.finish_streaming_response();
+            }
         }
     }
 
@@ -1601,9 +1584,11 @@ impl AppState {
                         }
                         self.chat.clear_partial_stream();
                         self.is_streaming = false;
-                        self.active_submission = None;
+                        self.user_work.clear_active();
+                        self.active_assistant_finalized = false;
+                        self.active_session_idle = false;
                         self.current_session_status = None;
-                        self.dispatch_next_queued_submission();
+                        self.dispatch_next_user_work();
                     }
                     ocpncord_backend::BackendEvent::SessionCreated { session } => {
                         let is_new = self
@@ -1613,7 +1598,7 @@ impl AppState {
                             .unwrap_or(true);
                         self.active_session = Some(session);
                         self.active_mode = AppMode::Chat;
-                        if is_new {
+                        if is_new && self.user_work.is_empty() {
                             self.chat.clear_messages();
                             self.current_session_status = None;
                         }
@@ -1636,10 +1621,7 @@ impl AppState {
                         self.current_session_status = None;
                     }
                     ocpncord_backend::BackendEvent::SessionIdle { session_id } => {
-                        log::debug!("session idle: {session_id}");
-                        if self.active_session_matches(&session_id) {
-                            self.finish_streaming_response();
-                        }
+                        self.handle_session_idle(&session_id);
                     }
                     ocpncord_backend::BackendEvent::SessionError { session_id, error } => {
                         log::error!("session error for {session_id}: {error:?}");
@@ -1912,23 +1894,28 @@ impl AppState {
         }
 
         let agent = self.active_agent_name().to_string();
-        if let Some(session_id) = self.active_session_id() {
-            self.prompt_bar.clear();
-            let message = user_loaded_message(&text);
-            let submission = match mode {
-                InputMode::Shell => Submission::command(session_id, text.clone(), agent),
-                _ => Submission::prompt(session_id, text.clone(), agent),
-            };
-            self.queue_or_dispatch_submission(submission, message);
-        } else {
-            self.queue_op(BackendOp::CreateSession {
-                title: "Chat".into(),
-                session_directory: self.create_session_directory(),
-                purpose: CreateSessionPurpose::Send { text, mode, agent },
-            });
-        }
+        let kind = match mode {
+            InputMode::Shell => UserWorkKind::Command,
+            _ => UserWorkKind::Prompt,
+        };
+        self.enqueue_user_work(kind, text, agent);
 
         true
+    }
+
+    fn enqueue_user_work(&mut self, kind: UserWorkKind, text: String, agent: String) {
+        self.prompt_bar.clear();
+        self.active_mode = AppMode::Chat;
+        let effect = self.user_work.enqueue(
+            kind,
+            text,
+            agent,
+            self.active_session_id(),
+            self.should_show_response_indicator(),
+        );
+        if let Some(effect) = effect {
+            self.apply_user_work_effect(effect);
+        }
     }
 
     fn handle_slash_command(&mut self, text: &str) -> bool {
@@ -2072,22 +2059,7 @@ impl AppState {
 
     fn handle_unknown_slash_command(&mut self, text: &str) -> bool {
         let agent = self.active_agent_name().to_string();
-        if let Some(session_id) = self.active_session_id() {
-            self.prompt_bar.clear();
-            let message = user_loaded_message(text);
-            let submission = Submission::prompt(session_id, text.into(), agent);
-            self.queue_or_dispatch_submission(submission, message);
-        } else {
-            self.queue_op(BackendOp::CreateSession {
-                title: "Chat".into(),
-                session_directory: self.create_session_directory(),
-                purpose: CreateSessionPurpose::Send {
-                    text: text.into(),
-                    mode: InputMode::Normal,
-                    agent,
-                },
-            });
-        }
+        self.enqueue_user_work(UserWorkKind::Prompt, text.into(), agent);
 
         true
     }
@@ -2100,10 +2072,11 @@ impl AppState {
         }
         self.is_streaming = false;
         self.chat.clear_partial_stream();
-        self.active_submission = None;
+        self.user_work.clear_active();
+        self.active_assistant_finalized = false;
+        self.active_session_idle = false;
         self.current_session_status = None;
-        self.queued_submissions.clear();
-        self.chat.clear_queued_messages();
+        self.user_work.clear();
         true
     }
 
@@ -2306,25 +2279,23 @@ impl AppState {
         true
     }
 
-    fn handle_submit_result<B: Backend>(
+    fn handle_submit_result(
         &mut self,
-        submission: Submission,
+        work_id: UserWorkId,
         result: ocpncord_backend::Result<ocpncord_backend::SubmissionReceipt>,
     ) {
         match result {
-            Ok(_) => {
-                if self.active_submission.is_none() {
-                    self.active_submission = Some(submission);
-                }
-            }
+            Ok(_) => {}
             Err(error) => {
                 if !self.note_connection_backend_error("Submission failed", &error) {
                     self.error = Some(alloc::format!("{}", error));
                 }
                 self.is_streaming = false;
                 self.chat.clear_partial_stream();
-                self.active_submission = None;
-                self.dispatch_next_queued_submission();
+                self.user_work.submit_failed(work_id);
+                self.active_assistant_finalized = false;
+                self.active_session_idle = false;
+                self.dispatch_next_user_work();
             }
         }
     }
@@ -2338,19 +2309,14 @@ impl AppState {
             Ok(session) => {
                 self.active_session = Some(session);
                 match purpose {
-                    CreateSessionPurpose::Send { text, mode, agent } => {
-                        self.prompt_bar.clear();
-                        let session_id = self
-                            .active_session
-                            .as_ref()
-                            .map(|session| session.id.clone())
-                            .unwrap_or_default();
-                        let message = user_loaded_message(&text);
-                        let submission = match mode {
-                            InputMode::Shell => Submission::command(session_id, text, agent),
-                            _ => Submission::prompt(session_id, text, agent),
-                        };
-                        self.queue_or_dispatch_submission(submission, message);
+                    CreateSessionPurpose::UserWork { work_id } => {
+                        let session_id = self.active_session_id().unwrap_or_default();
+                        if let Some(start) =
+                            self.user_work
+                                .session_created(work_id, session_id, self.is_streaming)
+                        {
+                            self.start_user_work(start);
+                        }
                     }
                     CreateSessionPurpose::NewChat => {
                         self.prompt_bar.clear();
@@ -2362,6 +2328,9 @@ impl AppState {
                 }
             }
             Err(error) => {
+                if let CreateSessionPurpose::UserWork { work_id } = purpose {
+                    self.user_work.create_session_failed(work_id);
+                }
                 if !self.note_connection_backend_error("Session creation failed", &error) {
                     self.error = Some(alloc::format!("{}", error));
                 }
@@ -2390,7 +2359,9 @@ impl AppState {
                 self.active_session = Some(session);
                 self.active_mode = AppMode::Chat;
                 self.is_streaming = false;
-                self.active_submission = None;
+                self.user_work.clear();
+                self.active_assistant_finalized = false;
+                self.active_session_idle = false;
                 self.current_session_status = None;
                 self.chat.replace_messages(messages);
                 self.clear_active_modal();
@@ -2768,6 +2739,7 @@ impl AppState {
                 self.render_status_line(frame, status_area);
             }
             AppMode::Chat => {
+                let queued_messages = self.user_work.queued_messages();
                 let rows = Layout::new(
                     Direction::Vertical,
                     [
@@ -2784,7 +2756,7 @@ impl AppState {
                     ChatTranscript {
                         messages: self.chat.messages(),
                         active_parts: self.chat.partial_parts(),
-                        queued_messages: self.chat.queued_messages(),
+                        queued_messages: &queued_messages,
                         is_streaming: self.is_streaming,
                         display_policy: &self.display_policy,
                     },
@@ -3136,7 +3108,10 @@ async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> Backe
             purpose,
             result: backend.create_session(&title, &session_directory).await,
         },
-        BackendOp::Submit { submission } => {
+        BackendOp::Submit {
+            work_id,
+            submission,
+        } => {
             let result = match submission.kind {
                 SubmissionKind::Prompt => {
                     backend
@@ -3157,7 +3132,7 @@ async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> Backe
                         .await
                 }
             };
-            BackendOpResult::Submit { submission, result }
+            BackendOpResult::Submit { work_id, result }
         }
         BackendOp::ListSessions => BackendOpResult::ListSessions(backend.list_sessions().await),
         BackendOp::LoadSession { session_id } => {
@@ -3354,8 +3329,8 @@ where
             BackendOpResult::CreateSession { purpose, result } => {
                 state.handle_create_session_result(purpose, result)
             }
-            BackendOpResult::Submit { submission, result } => {
-                state.handle_submit_result::<B>(submission, result);
+            BackendOpResult::Submit { work_id, result } => {
+                state.handle_submit_result(work_id, result);
             }
             BackendOpResult::ListSessions(result) => state.handle_list_sessions(result),
             BackendOpResult::LoadSession { result } => state.handle_load_session(result),
@@ -4109,16 +4084,6 @@ mod tests {
             }],
             "prompt should be sent with the selected agent"
         );
-        assert_eq!(
-            app.state.active_submission(),
-            Some(&Submission {
-                kind: SubmissionKind::Prompt,
-                session_id: "mock-session-id".into(),
-                text: "h".into(),
-                execution_text: "h".into(),
-                agent: "plan".into(),
-            })
-        );
     }
 
     #[test]
@@ -4840,11 +4805,6 @@ mod tests {
             1,
             "the active prompt remains the only dispatched prompt"
         );
-        assert_eq!(
-            app.state.queued_submissions().len(),
-            1,
-            "Enter should queue another prompt while streaming"
-        );
         assert_eq!(app.state.prompt_text(), "");
 
         let test_backend = TestBackend::new(80, 8);
@@ -4853,6 +4813,7 @@ mod tests {
         let screen = rendered_screen(&terminal);
 
         assert!(screen.contains(">"), "screen: {screen}");
+        assert!(screen.contains("next [queued]"), "screen: {screen}");
         assert!(screen.contains("Waiting for agent"), "screen: {screen}");
         assert!(screen.contains("mode: primary"), "screen: {screen}");
         assert!(screen.contains("server: "), "screen: {screen}");
@@ -4977,15 +4938,6 @@ mod tests {
         }
         run(&mut app, enter_key());
 
-        assert_eq!(
-            app.state
-                .queued_submissions()
-                .iter()
-                .map(|submission| submission.text.as_str())
-                .collect::<Vec<_>>(),
-            vec!["second", "third"]
-        );
-
         let test_backend = TestBackend::new(80, 10);
         let mut terminal = Terminal::new(test_backend).unwrap();
         terminal.draw(|frame| app.state.render(frame)).unwrap();
@@ -5005,10 +4957,21 @@ mod tests {
                 "msg-assistant-1",
             )),
         );
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::SessionIdle {
+                session_id: "mock-session-id".into(),
+            }),
+        );
 
         assert_eq!(app.backend().prompt_calls.len(), 2);
         assert_eq!(app.backend().prompt_calls[1].text, "second");
-        assert_eq!(app.state.queued_submissions()[0].text, "third");
+
+        let test_backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+        assert!(screen.contains("third [queued]"), "screen: {screen}");
     }
 
     #[test]
@@ -5134,7 +5097,81 @@ mod tests {
             run(&mut app, char_key(ch));
         }
         run(&mut app, enter_key());
-        assert_eq!(app.state.queued_submissions().len(), 1);
+        assert_eq!(app.backend().prompt_calls.len(), 1);
+
+        run(
+            &mut app,
+            Event::Backend(assistant_message_updated(
+                "mock-session-id",
+                "msg-assistant-1",
+            )),
+        );
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::SessionIdle {
+                session_id: "mock-session-id".into(),
+            }),
+        );
+
+        assert!(
+            app.backend().prompt_calls.len() == 2,
+            "assistant finalization should dispatch queued prompt"
+        );
+        assert_eq!(app.backend().prompt_calls[1].text, "second");
+    }
+
+    #[test]
+    fn session_idle_does_not_dispatch_queued_prompt_before_delayed_assistant_message() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        for ch in "first".chars() {
+            run(&mut app, char_key(ch));
+        }
+        run(&mut app, enter_key());
+        assert_eq!(app.backend().prompt_calls[0].text, "first");
+
+        for ch in "second".chars() {
+            run(&mut app, char_key(ch));
+        }
+        run(&mut app, enter_key());
+        assert_eq!(app.backend().prompt_calls.len(), 1);
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::SessionIdle {
+                session_id: "mock-session-id".into(),
+            }),
+        );
+
+        assert_eq!(
+            app.backend().prompt_calls.len(),
+            1,
+            "queued prompt must wait for the active assistant message"
+        );
+
+        run(
+            &mut app,
+            Event::Backend(message_part_updated(
+                "mock-session-id",
+                "msg-assistant-1",
+                "prt-assistant-1",
+                ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+                    identity: Default::default(),
+                    text: "assistant one".into(),
+                }),
+            )),
+        );
+
+        let test_backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+        let first = screen.find("first").expect(&screen);
+        let assistant = screen.find("assistant one").expect(&screen);
+        let second = screen.find("second [queued]").expect(&screen);
+        assert!(first < assistant, "screen: {screen}");
+        assert!(assistant < second, "screen: {screen}");
 
         run(
             &mut app,
@@ -5144,11 +5181,39 @@ mod tests {
             )),
         );
 
-        assert!(
-            app.backend().prompt_calls.len() == 2,
-            "assistant finalization should dispatch queued prompt"
-        );
+        assert_eq!(app.backend().prompt_calls.len(), 2);
         assert_eq!(app.backend().prompt_calls[1].text, "second");
+    }
+
+    #[test]
+    fn rapid_first_messages_without_session_share_one_created_session() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        for ch in "first".chars() {
+            assert!(app.state.handle_event(char_key(ch)));
+        }
+        assert!(app.state.handle_event(enter_key()));
+        for ch in "second".chars() {
+            assert!(app.state.handle_event(char_key(ch)));
+        }
+        assert!(app.state.handle_event(enter_key()));
+
+        futures::executor::block_on(app.drain_backend_ops_for_test());
+
+        assert_eq!(
+            app.backend().sessions.len(),
+            1,
+            "rapid first prompts should not create competing sessions"
+        );
+        assert_eq!(app.backend().prompt_calls.len(), 1);
+        assert_eq!(app.backend().prompt_calls[0].text, "first");
+
+        let test_backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+        assert!(screen.contains("second [queued]"), "screen: {screen}");
     }
 
     #[test]
@@ -5166,16 +5231,6 @@ mod tests {
         assert_eq!(app.backend().command_calls.len(), 1);
         assert_eq!(app.backend().command_calls[0].text, "pwd");
         assert_eq!(app.backend().prompt_calls.len(), 0);
-        assert_eq!(
-            app.state.active_submission(),
-            Some(&Submission {
-                kind: SubmissionKind::Command,
-                session_id: "mock-session-id".into(),
-                text: "!pwd".into(),
-                execution_text: "pwd".into(),
-                agent: "build".into(),
-            })
-        );
     }
 
     /// Test that the real SSE event path (MessagePartUpdated + MessageUpdated) works.
@@ -5611,7 +5666,7 @@ mod tests {
     }
 
     #[test]
-    fn session_creation_error_shows_error_and_stays_on_start_page() {
+    fn session_creation_error_keeps_user_message_visible_as_queued() {
         let mut backend = MockBackend::default();
         backend.fail_create_session = Some(ocpncord_backend::BackendError::Api {
             status: 500,
@@ -5630,13 +5685,46 @@ mod tests {
         assert!(running);
         assert_eq!(
             app.state.active_mode(),
-            AppMode::StartPage,
-            "should stay on StartPage on error"
+            AppMode::Chat,
+            "the typed user work should stay visible in Chat"
         );
         assert!(
             app.state.error().unwrap_or("").contains("server error"),
             "error should contain failure message"
         );
+
+        let test_backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|frame| app.state.render(frame)).unwrap();
+        let screen = rendered_screen(&terminal);
+        assert!(screen.contains("h [queued]"), "screen: {screen}");
+    }
+
+    #[test]
+    fn failed_first_message_session_creation_retries_after_clean_health_check() {
+        let mut backend = MockBackend::default();
+        backend.fail_create_session = Some(BackendError::Connection {
+            message: "server unavailable".into(),
+        });
+        let mut app = new_app(backend);
+
+        run(&mut app, char_key('h'));
+        run(&mut app, enter_key());
+
+        assert_eq!(app.backend().sessions.len(), 0);
+        assert_eq!(app.backend().prompt_calls.len(), 0);
+
+        app.state
+            .handle_connection_health_result(Ok(ocpncord_backend::Health {
+                healthy: true,
+                version: "mock".into(),
+            }));
+        futures::executor::block_on(app.drain_backend_ops_for_test());
+
+        assert_eq!(app.backend().sessions.len(), 1);
+        assert_eq!(app.backend().prompt_calls.len(), 1);
+        assert_eq!(app.backend().prompt_calls[0].text, "h");
+        assert_eq!(app.state.draft(), Some("h"));
     }
 
     #[test]
