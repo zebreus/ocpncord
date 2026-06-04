@@ -18,8 +18,10 @@ pub struct MockBackend {
     pub messages: Vec<MessageSummary>,
     pub message_detail: Option<MessageDetail>,
     pub health_status: Option<Health>,
-    pub server_url: String,
+    pub server_connection: ServerConnection,
     pub set_server_url_calls: Vec<String>,
+    pub set_server_connection_calls: Vec<ServerConnection>,
+    pub test_server_connection_calls: Vec<ServerConnection>,
     pub config_info: Option<Config>,
     pub models: Option<Vec<ModelSummary>>,
     pub list_models_calls: usize,
@@ -51,8 +53,10 @@ impl Default for MockBackend {
                 healthy: true,
                 version: "mock".into(),
             }),
-            server_url: "http://localhost:4096".into(),
+            server_connection: ServerConnection::unauthenticated("http://localhost:4096"),
             set_server_url_calls: Vec::new(),
+            set_server_connection_calls: Vec::new(),
+            test_server_connection_calls: Vec::new(),
             config_info: Some(Config {
                 model: Some("mock/model".into()),
                 username: Some("mock-user".into()),
@@ -122,23 +126,33 @@ fn default_command_submission_receipt(
     })
 }
 
+fn normalize_mock_connection(mut connection: ServerConnection) -> ServerConnection {
+    connection.url = connection.url.trim_end_matches('/').into();
+    connection
+}
+
 impl Backend for MockBackend {
     type EventStream = MockStream;
 
-    fn server_url(&self) -> Option<&str> {
-        Some(&self.server_url)
+    fn server_connection(&self) -> Option<ServerConnection> {
+        Some(self.server_connection.clone())
     }
 
-    async fn test_server_url(&mut self, _url: &str) -> Result<Health> {
+    async fn test_server_connection(&mut self, connection: &ServerConnection) -> Result<Health> {
+        self.test_server_connection_calls
+            .push(normalize_mock_connection(connection.clone()));
         self.health().await.map_err(|_| BackendError::Connection {
             message: "server test failed".into(),
         })
     }
 
-    async fn set_server_url(&mut self, url: &str) -> Result<()> {
+    async fn set_server_connection(&mut self, connection: ServerConnection) -> Result<()> {
         self.health().await?;
-        self.server_url = url.trim_end_matches('/').into();
-        self.set_server_url_calls.push(self.server_url.clone());
+        self.server_connection = normalize_mock_connection(connection);
+        self.set_server_url_calls
+            .push(self.server_connection.url.clone());
+        self.set_server_connection_calls
+            .push(self.server_connection.clone());
         Ok(())
     }
 

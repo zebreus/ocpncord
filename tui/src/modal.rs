@@ -7,6 +7,7 @@ use crate::event::{Event, Scancode};
 use crate::theme::Theme;
 use alloc::collections::BTreeMap;
 use core::cell::Cell;
+use ocpncord_backend::ServerConnection;
 
 /// An overlay dialog drawn on top of a full-screen view.
 pub trait Modal {
@@ -305,12 +306,16 @@ enum ServerConfigStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServerConfigFocus {
     Url,
+    Username,
+    Password,
     Test,
     Apply,
 }
 
 pub struct ServerConfigModal {
     url: String,
+    username: String,
+    password: String,
     status: ServerConfigStatus,
     focus: ServerConfigFocus,
     active_connection: ConnectionStatusDisplay,
@@ -318,8 +323,14 @@ pub struct ServerConfigModal {
 
 impl ServerConfigModal {
     pub fn new(url: String) -> Self {
+        Self::new_with_connection(ServerConnection::unauthenticated(url))
+    }
+
+    pub fn new_with_connection(connection: ServerConnection) -> Self {
         Self {
-            url,
+            url: connection.url,
+            username: connection.username.unwrap_or_else(|| "opencode".into()),
+            password: connection.password.unwrap_or_default(),
             status: ServerConfigStatus::Idle,
             focus: ServerConfigFocus::Url,
             active_connection: ConnectionStatusDisplay {
@@ -363,13 +374,65 @@ impl ServerConfigModal {
     }
 
     #[cfg(test)]
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    #[cfg(test)]
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+
+    #[cfg(test)]
     pub fn active_connection_summary(&self) -> &str {
         &self.active_connection.summary
     }
 
+    fn connection(&self) -> ServerConnection {
+        let password = if self.password.is_empty() {
+            None
+        } else {
+            Some(self.password.clone())
+        };
+        let username = if password.is_none() || self.username.is_empty() {
+            None
+        } else {
+            Some(self.username.clone())
+        };
+        ServerConnection::new(self.url.clone(), username, password)
+    }
+
+    fn edit_focused_field(&mut self, ch: char) {
+        match self.focus {
+            ServerConfigFocus::Url => self.url.push(ch),
+            ServerConfigFocus::Username => self.username.push(ch),
+            ServerConfigFocus::Password => self.password.push(ch),
+            ServerConfigFocus::Test | ServerConfigFocus::Apply => {}
+        }
+        self.status = ServerConfigStatus::Idle;
+    }
+
+    fn backspace_focused_field(&mut self) {
+        match self.focus {
+            ServerConfigFocus::Url => {
+                self.url.pop();
+            }
+            ServerConfigFocus::Username => {
+                self.username.pop();
+            }
+            ServerConfigFocus::Password => {
+                self.password.pop();
+            }
+            ServerConfigFocus::Test | ServerConfigFocus::Apply => {}
+        }
+        self.status = ServerConfigStatus::Idle;
+    }
+
     fn cycle_focus_forward(&mut self) {
         self.focus = match self.focus {
-            ServerConfigFocus::Url => ServerConfigFocus::Test,
+            ServerConfigFocus::Url => ServerConfigFocus::Username,
+            ServerConfigFocus::Username => ServerConfigFocus::Password,
+            ServerConfigFocus::Password => ServerConfigFocus::Test,
             ServerConfigFocus::Test => ServerConfigFocus::Apply,
             ServerConfigFocus::Apply => ServerConfigFocus::Url,
         };
@@ -378,7 +441,9 @@ impl ServerConfigModal {
     fn cycle_focus_back(&mut self) {
         self.focus = match self.focus {
             ServerConfigFocus::Url => ServerConfigFocus::Apply,
-            ServerConfigFocus::Test => ServerConfigFocus::Url,
+            ServerConfigFocus::Username => ServerConfigFocus::Url,
+            ServerConfigFocus::Password => ServerConfigFocus::Username,
+            ServerConfigFocus::Test => ServerConfigFocus::Password,
             ServerConfigFocus::Apply => ServerConfigFocus::Test,
         };
     }
@@ -405,18 +470,51 @@ impl Modal for ServerConfigModal {
     fn render(&self, frame: &mut Frame, theme: &Theme, area: Rect) {
         let mut lines = Vec::new();
         lines.push(Line::from("Server URL").style(theme.text_dim));
-        let cursor = if self.focus == ServerConfigFocus::Url {
+        let url_cursor = if self.focus == ServerConfigFocus::Url {
             " "
         } else {
             ""
         };
-        lines.push(Line::from(alloc::format!("{}{}", self.url, cursor)).style(
-            if self.focus == ServerConfigFocus::Url {
-                theme.input
-            } else {
-                theme.text
-            },
-        ));
+        lines.push(
+            Line::from(alloc::format!("{}{}", self.url, url_cursor)).style(
+                if self.focus == ServerConfigFocus::Url {
+                    theme.input
+                } else {
+                    theme.text
+                },
+            ),
+        );
+        lines.push(Line::from("Username").style(theme.text_dim));
+        let username_cursor = if self.focus == ServerConfigFocus::Username {
+            " "
+        } else {
+            ""
+        };
+        lines.push(
+            Line::from(alloc::format!("{}{}", self.username, username_cursor)).style(
+                if self.focus == ServerConfigFocus::Username {
+                    theme.input
+                } else {
+                    theme.text
+                },
+            ),
+        );
+        lines.push(Line::from("Password").style(theme.text_dim));
+        let password_cursor = if self.focus == ServerConfigFocus::Password {
+            " "
+        } else {
+            ""
+        };
+        let masked_password = "*".repeat(self.password.chars().count());
+        lines.push(
+            Line::from(alloc::format!("{}{}", masked_password, password_cursor)).style(
+                if self.focus == ServerConfigFocus::Password {
+                    theme.input
+                } else {
+                    theme.text
+                },
+            ),
+        );
         lines.push(Line::from(""));
         let test_style = if self.focus == ServerConfigFocus::Test {
             theme.dialog_button_focused
@@ -466,26 +564,41 @@ impl Modal for ServerConfigModal {
                     self.cycle_focus_back();
                     Action::None
                 }
-                Scancode::Backspace if self.focus == ServerConfigFocus::Url => {
-                    self.url.pop();
-                    self.status = ServerConfigStatus::Idle;
+                Scancode::Backspace
+                    if matches!(
+                        self.focus,
+                        ServerConfigFocus::Url
+                            | ServerConfigFocus::Username
+                            | ServerConfigFocus::Password
+                    ) =>
+                {
+                    self.backspace_focused_field();
                     Action::None
                 }
-                Scancode::Char(ch) if self.focus == ServerConfigFocus::Url => {
+                Scancode::Char(ch)
+                    if matches!(
+                        self.focus,
+                        ServerConfigFocus::Url
+                            | ServerConfigFocus::Username
+                            | ServerConfigFocus::Password
+                    ) =>
+                {
                     if !ke.modifiers.ctrl && !ke.modifiers.alt && !ke.modifiers.meta {
-                        self.url.push(ch);
-                        self.status = ServerConfigStatus::Idle;
+                        self.edit_focused_field(ch);
                     }
                     Action::None
                 }
                 Scancode::Enter => match self.focus {
-                    ServerConfigFocus::Url | ServerConfigFocus::Apply => {
+                    ServerConfigFocus::Url
+                    | ServerConfigFocus::Username
+                    | ServerConfigFocus::Password
+                    | ServerConfigFocus::Apply => {
                         self.set_applying();
-                        Action::ApplyServerUrl(self.url.clone())
+                        Action::ApplyServerConnection(self.connection())
                     }
                     ServerConfigFocus::Test => {
                         self.set_testing();
-                        Action::TestServerUrl(self.url.clone())
+                        Action::TestServerConnection(self.connection())
                     }
                 },
                 _ => Action::None,
@@ -1244,7 +1357,11 @@ mod tests {
         let action = modal.handle_event(key(Scancode::Enter));
         assert_eq!(
             action,
-            Action::ApplyServerUrl("http://localhost:4096/".into())
+            Action::ApplyServerConnection(ServerConnection::new(
+                "http://localhost:4096/",
+                None::<String>,
+                None::<String>,
+            ))
         );
     }
 
@@ -1252,10 +1369,49 @@ mod tests {
     fn server_config_modal_test_button_returns_test_action() {
         let mut modal = ServerConfigModal::new("http://localhost:4096".into());
         modal.handle_event(key(Scancode::Tab));
+        modal.handle_event(key(Scancode::Tab));
+        modal.handle_event(key(Scancode::Tab));
         let action = modal.handle_event(key(Scancode::Enter));
         assert_eq!(
             action,
-            Action::TestServerUrl("http://localhost:4096".into())
+            Action::TestServerConnection(ServerConnection::new(
+                "http://localhost:4096",
+                None::<String>,
+                None::<String>,
+            ))
+        );
+    }
+
+    #[test]
+    fn server_config_modal_masks_password_and_returns_auth() {
+        let mut modal = ServerConfigModal::new_with_connection(ServerConnection::new(
+            "http://localhost:4096",
+            Some("user"),
+            Some("secret"),
+        ));
+        assert_eq!(modal.username(), "user");
+        assert_eq!(modal.password(), "secret");
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| modal.render(frame, &Theme::default(), frame.area()))
+            .unwrap();
+        let screen = rendered_screen_for_test(&terminal);
+        assert!(screen.contains("******"), "screen: {screen}");
+        assert!(!screen.contains("secret"), "screen: {screen}");
+
+        modal.handle_event(key(Scancode::Tab));
+        modal.handle_event(key(Scancode::Tab));
+        modal.handle_event(key(Scancode::Tab));
+        let action = modal.handle_event(key(Scancode::Enter));
+        assert_eq!(
+            action,
+            Action::TestServerConnection(ServerConnection::new(
+                "http://localhost:4096",
+                Some("user"),
+                Some("secret"),
+            ))
         );
     }
 
@@ -1305,6 +1461,19 @@ mod tests {
             scancode,
             modifiers: Default::default(),
         })
+    }
+
+    fn rendered_screen_for_test(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut out = String::new();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                out.push_str(buffer.cell((x, y)).map_or(" ", |cell| cell.symbol()));
+            }
+            out.push('\n');
+        }
+        out
     }
 
     fn permission_request(id: &str) -> PermissionRequest {

@@ -18,6 +18,31 @@ pub struct Health {
     pub version: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerConnection {
+    pub url: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl ServerConnection {
+    pub fn new(
+        url: impl Into<String>,
+        username: Option<impl Into<String>>,
+        password: Option<impl Into<String>>,
+    ) -> Self {
+        Self {
+            url: url.into(),
+            username: username.map(Into::into),
+            password: password.map(Into::into),
+        }
+    }
+
+    pub fn unauthenticated(url: impl Into<String>) -> Self {
+        Self::new(url, None::<String>, None::<String>)
+    }
+}
+
 // --- Session time ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

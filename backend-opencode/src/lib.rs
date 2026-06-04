@@ -4,7 +4,6 @@
 
 extern crate alloc;
 
-use alloc::borrow::ToOwned;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
@@ -25,6 +24,7 @@ const HTTP_HEADER_BUF_SIZE: usize = 4 * 1024;
 const HTTP_BODY_READ_BUF_SIZE: usize = 4 * 1024;
 const SSE_READ_BUF_SIZE: usize = 4 * 1024;
 const SSE_HEADERS: [(&str, &str); 1] = [("Accept", "text/event-stream")];
+const DEFAULT_SERVER_USERNAME: &str = "opencode";
 
 /// An HTTP client for the opencode server REST API.
 ///
@@ -34,7 +34,7 @@ pub struct OpenCodeBackend<
     T: embedded_nal_async::TcpConnect + 'static,
     D: embedded_nal_async::Dns + 'static,
 > {
-    base_url: String,
+    server_connection: ServerConnection,
     header_buf: Vec<u8>,
     transport: &'static T,
     dns: &'static D,
@@ -45,7 +45,22 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 {
     pub fn new(base_url: &str, transport: &'static T, dns: &'static D) -> Self {
         Self {
-            base_url: base_url.trim_end_matches('/').to_owned(),
+            server_connection: normalize_server_connection(ServerConnection::unauthenticated(
+                base_url,
+            )),
+            header_buf: vec![0; HTTP_HEADER_BUF_SIZE],
+            transport,
+            dns,
+        }
+    }
+
+    pub fn new_with_connection(
+        connection: ServerConnection,
+        transport: &'static T,
+        dns: &'static D,
+    ) -> Self {
+        Self {
+            server_connection: normalize_server_connection(connection),
             header_buf: vec![0; HTTP_HEADER_BUF_SIZE],
             transport,
             dns,
@@ -56,11 +71,36 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         HttpClient::new(self.transport, self.dns)
     }
 
-    async fn health_for_base_url(&mut self, base_url: &str) -> Result<Health> {
+    async fn health_for_base_url(
+        &mut self,
+        base_url: &str,
+        connection: Option<&ServerConnection>,
+    ) -> Result<Health> {
         let url = alloc::format!("{}/global/health", base_url.trim_end_matches('/'));
-        let body = self.send_get_body(Method::GET, &url, None).await?;
+        let body = self
+            .send_get_body(Method::GET, &url, None, connection.cloned())
+            .await?;
         serde_json::from_slice(&body).map_err(parse_err)
     }
+}
+
+fn normalize_server_connection(mut connection: ServerConnection) -> ServerConnection {
+    connection.url = connection.url.trim_end_matches('/').into();
+    connection.username = connection.username.filter(|username| !username.is_empty());
+    connection.password = connection.password.filter(|password| !password.is_empty());
+    if connection.password.is_none() {
+        connection.username = None;
+    }
+    connection
+}
+
+fn server_basic_auth(connection: &ServerConnection) -> Option<(String, String)> {
+    let password = connection.password.as_ref()?;
+    let username = connection
+        .username
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SERVER_USERNAME.into());
+    Some((username, password.clone()))
 }
 
 // --- Error helpers ---
@@ -256,10 +296,17 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         method: Method,
         url: &str,
         body_bytes: Option<&[u8]>,
+        connection: Option<ServerConnection>,
     ) -> Result<Vec<u8>> {
         let mut client = self.make_client();
+        let basic_auth = connection.as_ref().and_then(server_basic_auth);
         if let Some(bytes) = body_bytes {
             let handle = client.request(method, url).await.map_err(conn_err)?;
+            let handle = if let Some((username, password)) = basic_auth.as_ref() {
+                handle.basic_auth(username, password)
+            } else {
+                handle
+            };
             let mut handle = handle
                 .body(bytes)
                 .content_type(ContentType::ApplicationJson);
@@ -271,7 +318,12 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             }
             read_body_to_vec(response).await
         } else {
-            let mut handle = client.request(method, url).await.map_err(conn_err)?;
+            let handle = client.request(method, url).await.map_err(conn_err)?;
+            let mut handle = if let Some((username, password)) = basic_auth.as_ref() {
+                handle.basic_auth(username, password)
+            } else {
+                handle
+            };
             let response = handle.send(&mut self.header_buf).await.map_err(conn_err)?;
             if !response.status.is_successful() {
                 let status = response.status.0;
@@ -290,15 +342,24 @@ fn incremental_sse_stream<
     transport: &'static T,
     dns: &'static D,
     url: String,
+    connection: Option<ServerConnection>,
 ) -> BufferedStream {
     BufferedStream::live(move |sink| async move {
         let mut header_buf = alloc::vec![0u8; HTTP_HEADER_BUF_SIZE];
         let mut read_buf = alloc::vec![0u8; SSE_READ_BUF_SIZE];
         let mut parser = SseParser::new();
         let mut client = HttpClient::new(transport, dns);
+        let basic_auth = connection.as_ref().and_then(server_basic_auth);
 
         let mut handle = match client.request(Method::GET, &url).await {
-            Ok(handle) => handle.headers(&SSE_HEADERS),
+            Ok(handle) => {
+                let handle = if let Some((username, password)) = basic_auth.as_ref() {
+                    handle.basic_auth(username, password)
+                } else {
+                    handle
+                };
+                handle.headers(&SSE_HEADERS)
+            }
             Err(error) => {
                 sink.push(Err(conn_err(error)));
                 sink.finish();
@@ -350,80 +411,133 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 {
     type EventStream = BufferedStream;
 
-    fn server_url(&self) -> Option<&str> {
-        Some(&self.base_url)
+    fn server_connection(&self) -> Option<ServerConnection> {
+        Some(self.server_connection.clone())
     }
 
-    async fn test_server_url(&mut self, url: &str) -> Result<Health> {
-        self.health_for_base_url(url).await
+    async fn test_server_connection(&mut self, connection: &ServerConnection) -> Result<Health> {
+        let connection = normalize_server_connection(connection.clone());
+        self.health_for_base_url(&connection.url, Some(&connection))
+            .await
     }
 
-    async fn set_server_url(&mut self, url: &str) -> Result<()> {
-        self.base_url = url.trim_end_matches('/').to_owned();
+    async fn set_server_connection(&mut self, connection: ServerConnection) -> Result<()> {
+        self.server_connection = normalize_server_connection(connection);
         Ok(())
     }
 
     async fn health(&mut self) -> Result<Health> {
-        let base_url = self.base_url.clone();
-        self.health_for_base_url(&base_url).await
+        let base_url = self.server_connection.url.clone();
+        let connection = self.server_connection.clone();
+        self.health_for_base_url(&base_url, Some(&connection)).await
     }
 
     async fn list_sessions(&mut self) -> Result<Vec<Session>> {
-        let url = alloc::format!("{}/session", self.base_url);
-        let body = self.send_get_body(Method::GET, &url, None).await?;
+        let url = alloc::format!("{}/session", self.server_connection.url);
+        let body = self
+            .send_get_body(
+                Method::GET,
+                &url,
+                None,
+                Some(self.server_connection.clone()),
+            )
+            .await?;
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
     async fn get_session(&mut self, id: &SessionId) -> Result<Session> {
-        let url = alloc::format!("{}/session/{id}", self.base_url);
-        let body = self.send_get_body(Method::GET, &url, None).await?;
+        let url = alloc::format!("{}/session/{id}", self.server_connection.url);
+        let body = self
+            .send_get_body(
+                Method::GET,
+                &url,
+                None,
+                Some(self.server_connection.clone()),
+            )
+            .await?;
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
     async fn create_session(&mut self, title: &str, session_directory: &str) -> Result<Session> {
-        let url = alloc::format!("{}/session", self.base_url);
+        let url = alloc::format!("{}/session", self.server_connection.url);
         let body = ocpncord_backend::CreateSessionBody {
             title,
             directory: session_directory,
         };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
         let body = self
-            .send_get_body(Method::POST, &url, Some(json.as_bytes()))
+            .send_get_body(
+                Method::POST,
+                &url,
+                Some(json.as_bytes()),
+                Some(self.server_connection.clone()),
+            )
             .await?;
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
     async fn delete_session(&mut self, id: &SessionId) -> Result<()> {
-        let url = alloc::format!("{}/session/{id}", self.base_url);
-        self.send_get_body(Method::DELETE, &url, None).await?;
+        let url = alloc::format!("{}/session/{id}", self.server_connection.url);
+        self.send_get_body(
+            Method::DELETE,
+            &url,
+            None,
+            Some(self.server_connection.clone()),
+        )
+        .await?;
         Ok(())
     }
 
     async fn update_session(&mut self, id: &SessionId, title: &str) -> Result<Session> {
-        let url = alloc::format!("{}/session/{id}", self.base_url);
+        let url = alloc::format!("{}/session/{id}", self.server_connection.url);
         let body = ocpncord_backend::UpdateSessionBody { title };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
         let body = self
-            .send_get_body(Method::PATCH, &url, Some(json.as_bytes()))
+            .send_get_body(
+                Method::PATCH,
+                &url,
+                Some(json.as_bytes()),
+                Some(self.server_connection.clone()),
+            )
             .await?;
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
     async fn children_sessions(&mut self, id: &SessionId) -> Result<Vec<Session>> {
-        let url = alloc::format!("{}/session/{id}/children", self.base_url);
-        let body = self.send_get_body(Method::GET, &url, None).await?;
+        let url = alloc::format!("{}/session/{id}/children", self.server_connection.url);
+        let body = self
+            .send_get_body(
+                Method::GET,
+                &url,
+                None,
+                Some(self.server_connection.clone()),
+            )
+            .await?;
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
     async fn abort_session(&mut self, id: &SessionId) -> Result<()> {
-        let url = alloc::format!("{}/session/{id}/abort", self.base_url);
-        self.send_get_body(Method::POST, &url, None).await?;
+        let url = alloc::format!("{}/session/{id}/abort", self.server_connection.url);
+        self.send_get_body(
+            Method::POST,
+            &url,
+            None,
+            Some(self.server_connection.clone()),
+        )
+        .await?;
         Ok(())
     }
 
     async fn list_messages(&mut self, id: &SessionId) -> Result<Vec<MessageSummary>> {
-        let url = alloc::format!("{}/session/{id}/message", self.base_url);
-        let body = self.send_get_body(Method::GET, &url, None).await?;
+        let url = alloc::format!("{}/session/{id}/message", self.server_connection.url);
+        let body = self
+            .send_get_body(
+                Method::GET,
+                &url,
+                None,
+                Some(self.server_connection.clone()),
+            )
+            .await?;
         let details: Vec<MessageDetail> = serde_json::from_slice(&body).map_err(parse_err)?;
         Ok(details.into_iter().map(|d| d.info).collect())
     }
@@ -435,11 +549,18 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
     ) -> Result<MessageDetail> {
         let url = alloc::format!(
             "{}/session/{}/message/{}",
-            self.base_url,
+            self.server_connection.url,
             session_id,
             message_id
         );
-        let body = self.send_get_body(Method::GET, &url, None).await?;
+        let body = self
+            .send_get_body(
+                Method::GET,
+                &url,
+                None,
+                Some(self.server_connection.clone()),
+            )
+            .await?;
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
@@ -449,7 +570,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         text: &str,
         agent: Option<&str>,
     ) -> Result<SubmissionReceipt> {
-        let url = alloc::format!("{}/session/{id}/prompt_async", self.base_url);
+        let url = alloc::format!("{}/session/{id}/prompt_async", self.server_connection.url);
         let prompt_body = ocpncord_backend::PromptBody {
             parts: &[ocpncord_backend::TextPartBody {
                 type_: "text",
@@ -458,8 +579,13 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             agent,
         };
         let json = serde_json::to_string(&prompt_body).map_err(parse_err)?;
-        self.send_get_body(Method::POST, &url, Some(json.as_bytes()))
-            .await?;
+        self.send_get_body(
+            Method::POST,
+            &url,
+            Some(json.as_bytes()),
+            Some(self.server_connection.clone()),
+        )
+        .await?;
         Ok(accepted_submission_receipt(id, agent))
     }
 
@@ -469,7 +595,7 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         text: &str,
         agent: Option<&str>,
     ) -> Result<SubmissionReceipt> {
-        let url = alloc::format!("{}/session/{id}/command", self.base_url);
+        let url = alloc::format!("{}/session/{id}/command", self.server_connection.url);
         let cmd_body = ocpncord_backend::CommandBody {
             command: text,
             arguments: "",
@@ -477,79 +603,157 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         };
         let json = serde_json::to_string(&cmd_body).map_err(parse_err)?;
         let body = self
-            .send_get_body(Method::POST, &url, Some(json.as_bytes()))
+            .send_get_body(
+                Method::POST,
+                &url,
+                Some(json.as_bytes()),
+                Some(self.server_connection.clone()),
+            )
             .await?;
         parse_submission_receipt(&body)
     }
 
     async fn reply_permission(&mut self, reply: &PermissionReply) -> Result<()> {
-        let url = alloc::format!("{}/permission/{}/reply", self.base_url, reply.request_id);
+        let url = alloc::format!(
+            "{}/permission/{}/reply",
+            self.server_connection.url,
+            reply.request_id
+        );
         let body = ocpncord_backend::PermissionReplyBody {
             reply: reply.reply.as_str(),
         };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
-        self.send_get_body(Method::POST, &url, Some(json.as_bytes()))
-            .await?;
+        self.send_get_body(
+            Method::POST,
+            &url,
+            Some(json.as_bytes()),
+            Some(self.server_connection.clone()),
+        )
+        .await?;
         Ok(())
     }
 
     async fn reply_question(&mut self, reply: &QuestionReply) -> Result<()> {
-        let url = alloc::format!("{}/question/{}/reply", self.base_url, reply.request_id);
+        let url = alloc::format!(
+            "{}/question/{}/reply",
+            self.server_connection.url,
+            reply.request_id
+        );
         let body = ocpncord_backend::QuestionReplyBody {
             answers: reply.answers.as_slice(),
         };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
-        self.send_get_body(Method::POST, &url, Some(json.as_bytes()))
-            .await?;
+        self.send_get_body(
+            Method::POST,
+            &url,
+            Some(json.as_bytes()),
+            Some(self.server_connection.clone()),
+        )
+        .await?;
         Ok(())
     }
 
     async fn reject_question(&mut self, request_id: &str) -> Result<()> {
-        let url = alloc::format!("{}/question/{request_id}/reject", self.base_url);
-        self.send_get_body(Method::POST, &url, None).await?;
+        let url = alloc::format!(
+            "{}/question/{request_id}/reject",
+            self.server_connection.url
+        );
+        self.send_get_body(
+            Method::POST,
+            &url,
+            None,
+            Some(self.server_connection.clone()),
+        )
+        .await?;
         Ok(())
     }
 
     async fn list_agents(&mut self) -> Result<Vec<Agent>> {
-        let url = alloc::format!("{}/agent", self.base_url);
-        let body = self.send_get_body(Method::GET, &url, None).await?;
+        let url = alloc::format!("{}/agent", self.server_connection.url);
+        let body = self
+            .send_get_body(
+                Method::GET,
+                &url,
+                None,
+                Some(self.server_connection.clone()),
+            )
+            .await?;
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
     async fn find_text(&mut self, pattern: &str) -> Result<Vec<TextMatch>> {
         let encoded = encode_query_component(pattern);
-        let url = alloc::format!("{}/find?pattern={}", self.base_url, encoded);
-        let body = self.send_get_body(Method::GET, &url, None).await?;
+        let url = alloc::format!("{}/find?pattern={}", self.server_connection.url, encoded);
+        let body = self
+            .send_get_body(
+                Method::GET,
+                &url,
+                None,
+                Some(self.server_connection.clone()),
+            )
+            .await?;
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
     async fn subscribe_live(&mut self) -> Result<Self::EventStream> {
-        let url = global_event_url(&self.base_url);
-        Ok(incremental_sse_stream(self.transport, self.dns, url))
+        let url = global_event_url(&self.server_connection.url);
+        Ok(incremental_sse_stream(
+            self.transport,
+            self.dns,
+            url,
+            Some(self.server_connection.clone()),
+        ))
     }
 
     async fn sync_history(&mut self, request: &SyncHistoryRequest) -> Result<SyncHistoryBatch> {
-        let url = sync_history_url(&self.base_url, &request.scope);
+        let url = sync_history_url(&self.server_connection.url, &request.scope);
         let json = serde_json::to_string(&request.known_sequences).map_err(parse_err)?;
         let body = self
-            .send_get_body(Method::POST, &url, Some(json.as_bytes()))
+            .send_get_body(
+                Method::POST,
+                &url,
+                Some(json.as_bytes()),
+                Some(self.server_connection.clone()),
+            )
             .await?;
         parse_sync_history(&body, &request.scope)
     }
 
     async fn get_config(&mut self) -> Result<Config> {
-        let url = alloc::format!("{}/global/config", self.base_url);
-        let body = self.send_get_body(Method::GET, &url, None).await?;
+        let url = alloc::format!("{}/global/config", self.server_connection.url);
+        let body = self
+            .send_get_body(
+                Method::GET,
+                &url,
+                None,
+                Some(self.server_connection.clone()),
+            )
+            .await?;
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
     async fn list_models(&mut self) -> Result<Vec<ModelSummary>> {
-        let url = alloc::format!("{}/config/providers", self.base_url);
-        match self.send_get_body(Method::GET, &url, None).await {
+        let url = alloc::format!("{}/config/providers", self.server_connection.url);
+        match self
+            .send_get_body(
+                Method::GET,
+                &url,
+                None,
+                Some(self.server_connection.clone()),
+            )
+            .await
+        {
             Ok(body) => parse_config_provider_models(&body),
             Err(error) if should_fallback_to_api_models(&error) => {
-                let url = alloc::format!("{}/api/model", self.base_url);
-                let body = self.send_get_body(Method::GET, &url, None).await?;
+                let url = alloc::format!("{}/api/model", self.server_connection.url);
+                let body = self
+                    .send_get_body(
+                        Method::GET,
+                        &url,
+                        None,
+                        Some(self.server_connection.clone()),
+                    )
+                    .await?;
                 parse_api_models(&body)
             }
             Err(error) => Err(error),
@@ -557,54 +761,87 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
     }
 
     async fn set_auth(&mut self, provider: &str, api_key: &str) -> Result<()> {
-        let url = alloc::format!("{}/auth/{provider}", self.base_url);
+        let url = alloc::format!("{}/auth/{provider}", self.server_connection.url);
         let body = ocpncord_backend::AuthBody {
             type_: "api",
             key: api_key,
         };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
-        self.send_get_body(Method::PUT, &url, Some(json.as_bytes()))
-            .await?;
+        self.send_get_body(
+            Method::PUT,
+            &url,
+            Some(json.as_bytes()),
+            Some(self.server_connection.clone()),
+        )
+        .await?;
         Ok(())
     }
 
     async fn set_config(&mut self, config: &Config) -> Result<Config> {
-        let url = alloc::format!("{}/global/config", self.base_url);
+        let url = alloc::format!("{}/global/config", self.server_connection.url);
         let body = ocpncord_backend::ConfigBody {
             model: config.model.as_deref(),
             username: config.username.as_deref(),
         };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
         let body = self
-            .send_get_body(Method::PATCH, &url, Some(json.as_bytes()))
+            .send_get_body(
+                Method::PATCH,
+                &url,
+                Some(json.as_bytes()),
+                Some(self.server_connection.clone()),
+            )
             .await?;
         serde_json::from_slice(&body).map_err(parse_err)
     }
 
     async fn dispose(&mut self) -> Result<()> {
-        let url = alloc::format!("{}/global/dispose", self.base_url);
-        self.send_get_body(Method::POST, &url, None).await?;
+        let url = alloc::format!("{}/global/dispose", self.server_connection.url);
+        self.send_get_body(
+            Method::POST,
+            &url,
+            None,
+            Some(self.server_connection.clone()),
+        )
+        .await?;
         Ok(())
     }
 
     async fn upgrade(&mut self) -> Result<()> {
-        let url = alloc::format!("{}/global/upgrade", self.base_url);
-        self.send_get_body(Method::POST, &url, None).await?;
+        let url = alloc::format!("{}/global/upgrade", self.server_connection.url);
+        self.send_get_body(
+            Method::POST,
+            &url,
+            None,
+            Some(self.server_connection.clone()),
+        )
+        .await?;
         Ok(())
     }
 
     async fn log(&mut self, level: &str, message: &str) -> Result<()> {
-        let url = alloc::format!("{}/log", self.base_url);
+        let url = alloc::format!("{}/log", self.server_connection.url);
         let body = ocpncord_backend::LogBody { level, message };
         let json = serde_json::to_string(&body).map_err(parse_err)?;
-        self.send_get_body(Method::POST, &url, Some(json.as_bytes()))
-            .await?;
+        self.send_get_body(
+            Method::POST,
+            &url,
+            Some(json.as_bytes()),
+            Some(self.server_connection.clone()),
+        )
+        .await?;
         Ok(())
     }
 
     async fn remove_auth(&mut self, provider: &str) -> Result<()> {
-        let url = alloc::format!("{}/auth/{provider}", self.base_url);
-        self.send_get_body(Method::DELETE, &url, None).await?;
+        let url = alloc::format!("{}/auth/{provider}", self.server_connection.url);
+        self.send_get_body(
+            Method::DELETE,
+            &url,
+            None,
+            Some(self.server_connection.clone()),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -691,6 +928,13 @@ mod tests {
 
     impl Read for StdTcpStream {
         async fn read(&mut self, buf: &mut [u8]) -> CoreResult<usize, Self::Error> {
+            // Mirror the production transport: a zero-length read returns
+            // immediately instead of awaiting socket readability, which would
+            // otherwise hang on a kept-alive connection. See the matching guard
+            // (and explanation) in `native/src/main.rs`.
+            if buf.is_empty() {
+                return Ok(0);
+            }
             self.0.read(buf).await
         }
     }
@@ -709,6 +953,16 @@ mod tests {
         static TCP: StdTcp = StdTcp;
         static DNS: StdDns = StdDns;
         OpenCodeBackend::new(base_url, &TCP, &DNS)
+    }
+
+    fn backend_with_connection(connection: ServerConnection) -> OpenCodeBackend<StdTcp, StdDns> {
+        static TCP: StdTcp = StdTcp;
+        static DNS: StdDns = StdDns;
+        OpenCodeBackend::new_with_connection(connection, &TCP, &DNS)
+    }
+
+    fn health_body() -> &'static str {
+        r#"{"healthy":true,"version":"mock"}"#
     }
 
     fn content_length(headers: &str) -> usize {
@@ -773,6 +1027,113 @@ mod tests {
         });
 
         (alloc::format!("http://127.0.0.1:{}", addr.port()), rx)
+    }
+
+    /// Serves a single `Transfer-Encoding: chunked` response (no
+    /// `Content-Length`) and then deliberately keeps the connection open
+    /// without sending anything further — exactly how a Caddy/nginx reverse
+    /// proxy fronting the opencode server behaves with HTTP keep-alive. This is
+    /// the scenario that used to hang the client: after consuming the
+    /// terminating `0\r\n\r\n` chunk, the body reader issues a final
+    /// zero-length read that must not block.
+    async fn spawn_chunked_keepalive_server(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            // Drain the request headers.
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            // Emit the body as two chunks followed by the terminating chunk.
+            let (first, second) = body.split_at(body.len() / 2);
+            let response = alloc::format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+                first.len(),
+                second.len(),
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+
+            // Hold the connection open (keep-alive) so any trailing read on the
+            // client would block forever if it were not zero-length.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        alloc::format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    #[tokio::test]
+    async fn reads_chunked_response_on_keepalive_connection() {
+        let base_url = spawn_chunked_keepalive_server(
+            r#"[{"name":"build","mode":"primary"},{"name":"plan","mode":"primary"}]"#,
+        )
+        .await;
+        let mut backend = backend(&base_url);
+
+        let agents = timeout(Duration::from_secs(5), backend.list_agents())
+            .await
+            .expect("list_agents must not hang on a chunked keep-alive response")
+            .expect("list_agents should parse the chunked body");
+
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].name, "build");
+        assert_eq!(agents[1].name, "plan");
+    }
+
+    #[tokio::test]
+    async fn server_auth_is_omitted_when_not_configured() {
+        let (base_url, request_rx) = spawn_capture_server(health_body()).await;
+        let mut backend = backend(&base_url);
+
+        backend.health().await.unwrap();
+        let request = request_rx.await.unwrap();
+
+        assert!(request.contains("GET /global/health HTTP/1.1"));
+        assert!(!request.contains("Authorization:"));
+    }
+
+    #[tokio::test]
+    async fn server_auth_uses_default_username_for_health() {
+        let (base_url, request_rx) = spawn_capture_server(health_body()).await;
+        let mut backend = backend_with_connection(ServerConnection::new(
+            base_url,
+            None::<String>,
+            Some("secret"),
+        ));
+
+        backend.health().await.unwrap();
+        let request = request_rx.await.unwrap();
+
+        assert!(request.contains("GET /global/health HTTP/1.1"));
+        assert!(request.contains("Authorization: Basic b3BlbmNvZGU6c2VjcmV0\r\n"));
+    }
+
+    #[tokio::test]
+    async fn server_auth_uses_custom_username_for_health() {
+        let (base_url, request_rx) = spawn_capture_server(health_body()).await;
+        let mut backend = backend_with_connection(ServerConnection::new(
+            base_url,
+            Some("user"),
+            Some("secret"),
+        ));
+
+        backend.health().await.unwrap();
+        let request = request_rx.await.unwrap();
+
+        assert!(request.contains("Authorization: Basic dXNlcjpzZWNyZXQ=\r\n"));
     }
 
     fn http_response(status_line: &str, body: &str) -> String {
@@ -1255,6 +1616,32 @@ mod tests {
 
         let request = request_rx.await.unwrap();
         assert!(request.contains("GET /global/event HTTP/1.1"));
+
+        let _ = release_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn subscribe_live_sends_server_auth_header() {
+        let (base_url, request_rx, release_tx) = spawn_capture_streaming_sse_server(
+            "data: {\"type\":\"server.connected\",\"properties\":{}}\n\n",
+        )
+        .await;
+        let mut backend = backend_with_connection(ServerConnection::new(
+            base_url,
+            Some("user"),
+            Some("secret"),
+        ));
+
+        let mut stream = backend.subscribe_live().await.unwrap();
+        let _ = timeout(Duration::from_millis(500), stream.next())
+            .await
+            .expect("stream should yield before the SSE connection closes")
+            .expect("stream should produce an event")
+            .expect("event should parse successfully");
+
+        let request = request_rx.await.unwrap();
+        assert!(request.contains("GET /global/event HTTP/1.1"));
+        assert!(request.contains("Authorization: Basic dXNlcjpzZWNyZXQ=\r\n"));
 
         let _ = release_tx.send(());
     }

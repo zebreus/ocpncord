@@ -23,6 +23,7 @@ use crossterm::terminal::{
 use crossterm::{execute, queue};
 use embedded_io_async::{ErrorType, Read};
 use embedded_nal_async::{AddrType, Dns, TcpConnect};
+use ocpncord_backend::ServerConnection;
 use ocpncord_backend_opencode::OpenCodeBackend;
 use ocpncord_tui::Event;
 use ocpncord_tui::{App, KeyEvent, Modifiers, Scancode};
@@ -151,6 +152,17 @@ impl ErrorType for StdTcpStream {
 
 impl Read for StdTcpStream {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        // A zero-length read must return immediately. tokio's `TcpStream::read`
+        // would instead await socket readability, which never resolves on a
+        // kept-alive connection that has no further data — e.g. reqwless's
+        // chunked body reader issues a final zero-length read after consuming
+        // the terminating `0\r\n\r\n` chunk. Without this short-circuit, any
+        // response sent with `Transfer-Encoding: chunked` (as produced by a
+        // Caddy/nginx reverse proxy in front of the opencode server) hangs
+        // forever. See the `Read` contract: an empty buffer reads zero bytes.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         self.0.read(buf).await
     }
 }
@@ -444,9 +456,21 @@ struct Cli {
     #[arg(long = "url", default_value = "http://localhost:4096")]
     url: String,
 
+    /// OpenCode server Basic Auth username
+    #[arg(long = "username")]
+    username: Option<String>,
+
+    /// OpenCode server Basic Auth password
+    #[arg(long = "password")]
+    password: Option<String>,
+
     /// Optional server-side working directory for new sessions
     #[arg(long = "session-directory")]
     session_directory: Option<String>,
+}
+
+fn server_connection_from_cli(cli: &Cli) -> ServerConnection {
+    ServerConnection::new(cli.url.clone(), cli.username.clone(), cli.password.clone())
 }
 
 // --- Render target setup --------------------------------------------------
@@ -471,8 +495,13 @@ async fn main() {
 
     static TCP: StdTcp = StdTcp;
     static DNS: StdDns = StdDns;
-    let backend = OpenCodeBackend::new(&cli.url, &TCP, &DNS);
-    log::info!("starting ocpncord-native with server {}", cli.url);
+    let server_connection = server_connection_from_cli(&cli);
+    let backend = OpenCodeBackend::new_with_connection(server_connection.clone(), &TCP, &DNS);
+    log::info!(
+        "starting ocpncord-native with server {} (auth configured: {})",
+        server_connection.url,
+        server_connection.password.is_some()
+    );
     let terminal = setup_terminal();
     let events = NativeEvents::new();
     let mut app = App::new(backend, events, terminal);

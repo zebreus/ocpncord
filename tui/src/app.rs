@@ -111,6 +111,7 @@ struct ConnectionState {
     last_health_probe_state: Option<HealthProbeState>,
     last_successful_health_tick: Option<u64>,
     saw_non_successful_health_since_live: bool,
+    health_check_queued: bool,
     health_check_in_flight: bool,
     health_check_started_at_tick: Option<u64>,
     next_health_check_at_tick: u64,
@@ -127,6 +128,7 @@ impl ConnectionState {
             last_health_probe_state: None,
             last_successful_health_tick: None,
             saw_non_successful_health_since_live: false,
+            health_check_queued: false,
             health_check_in_flight: false,
             health_check_started_at_tick: None,
             next_health_check_at_tick: CONNECTION_HEALTH_POLL_INTERVAL_TICKS,
@@ -168,15 +170,23 @@ impl ConnectionState {
     }
 
     fn health_check_due(&self, tick: u64) -> bool {
-        !self.health_check_in_flight && tick >= self.next_health_check_at_tick
+        !self.health_check_queued
+            && !self.health_check_in_flight
+            && tick >= self.next_health_check_at_tick
+    }
+
+    fn mark_health_check_queued(&mut self) {
+        self.health_check_queued = true;
     }
 
     fn mark_health_check_started(&mut self, tick: u64) {
+        self.health_check_queued = false;
         self.health_check_in_flight = true;
         self.health_check_started_at_tick = Some(tick);
     }
 
     fn record_health_success(&mut self, tick: u64) {
+        self.health_check_queued = false;
         self.health_check_in_flight = false;
         self.health_check_started_at_tick = None;
         self.last_health_failure = None;
@@ -186,6 +196,7 @@ impl ConnectionState {
     }
 
     fn record_health_failure(&mut self, tick: u64, reason: String) {
+        self.health_check_queued = false;
         self.health_check_in_flight = false;
         self.health_check_started_at_tick = None;
         self.last_health_failure = Some(reason.clone());
@@ -195,6 +206,7 @@ impl ConnectionState {
     }
 
     fn record_health_degraded(&mut self, tick: u64, reason: String) {
+        self.health_check_queued = false;
         self.health_check_in_flight = false;
         self.health_check_started_at_tick = None;
         self.last_health_failure = None;
@@ -204,6 +216,7 @@ impl ConnectionState {
     }
 
     fn record_health_non_success(&mut self, tick: u64, reason: String) {
+        self.health_check_queued = false;
         self.health_check_in_flight = false;
         self.health_check_started_at_tick = None;
         self.last_health_failure = None;
@@ -350,8 +363,8 @@ pub enum Action {
     ReplyPermission(String, String, PermissionReplyAction),
     ReplyQuestion(String, String, Vec<Vec<String>>),
     RejectQuestion(String),
-    TestServerUrl(String),
-    ApplyServerUrl(String),
+    TestServerConnection(ocpncord_backend::ServerConnection),
+    ApplyServerConnection(ocpncord_backend::ServerConnection),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,12 +552,8 @@ enum BackendOp {
     OpenModelPicker {
         cached_models: Option<Vec<ocpncord_backend::ModelSummary>>,
     },
-    TestServerUrl {
-        url: String,
-    },
-    ApplyServerUrl {
-        url: String,
-    },
+    TestServerConnection(ocpncord_backend::ServerConnection),
+    ApplyServerConnection(ocpncord_backend::ServerConnection),
     SelectModel {
         model: String,
     },
@@ -593,11 +602,11 @@ enum BackendOpResult<B: Backend> {
             Option<Vec<ocpncord_backend::ModelSummary>>,
         )>,
     },
-    TestServerUrl {
+    TestServerConnection {
         result: ocpncord_backend::Result<ocpncord_backend::Health>,
     },
-    ApplyServerUrl {
-        url: String,
+    ApplyServerConnection {
+        connection: ocpncord_backend::ServerConnection,
         result: ocpncord_backend::Result<ocpncord_backend::Health>,
     },
     SelectModel {
@@ -662,17 +671,27 @@ pub struct AppState {
     // Optional directory override for creating new sessions.
     session_directory_override: Option<String>,
     current_branch: Option<String>,
-    current_server_url: String,
+    current_server_connection: ocpncord_backend::ServerConnection,
     current_session_status: Option<ocpncord_backend::SessionStatus>,
     display_policy: ChatDisplayPolicy,
 }
 
 impl AppState {
     pub fn new() -> Self {
-        Self::new_with_server_url(DEFAULT_SERVER_URL.into())
+        Self::new_with_server_connection(ocpncord_backend::ServerConnection::unauthenticated(
+            DEFAULT_SERVER_URL,
+        ))
     }
 
     pub fn new_with_server_url(current_server_url: String) -> Self {
+        Self::new_with_server_connection(ocpncord_backend::ServerConnection::unauthenticated(
+            current_server_url,
+        ))
+    }
+
+    pub fn new_with_server_connection(
+        current_server_connection: ocpncord_backend::ServerConnection,
+    ) -> Self {
         Self {
             active_mode: AppMode::StartPage,
             theme: Theme::default(),
@@ -710,7 +729,7 @@ impl AppState {
             todos: Vec::new(),
             session_directory_override: None,
             current_branch: None,
-            current_server_url,
+            current_server_connection,
             current_session_status: None,
             display_policy: ChatDisplayPolicy::default(),
         }
@@ -916,8 +935,14 @@ impl AppState {
 
     fn queue_connection_health_check(&mut self) {
         if self.connection.health_check_due(self.tick) {
-            self.connection.mark_health_check_started(self.tick);
+            self.connection.mark_health_check_queued();
             self.queue_op(BackendOp::Health);
+        }
+    }
+
+    fn mark_backend_op_started(&mut self, op: &BackendOp) {
+        if matches!(op, BackendOp::Health) {
+            self.connection.mark_health_check_started(self.tick);
         }
     }
 
@@ -1016,8 +1041,8 @@ impl AppState {
         self.queue_live_resubscribe();
     }
 
-    fn reset_for_server_switch(&mut self, url: String) {
-        self.current_server_url = url;
+    fn reset_for_server_switch(&mut self, connection: ocpncord_backend::ServerConnection) {
+        self.current_server_connection = connection;
         self.active_mode = AppMode::StartPage;
         self.prompt_bar.clear();
         self.chat_scroll = 0;
@@ -2023,8 +2048,8 @@ impl AppState {
                 if context.clear_prompt {
                     self.prompt_bar.clear();
                 }
-                self.set_active_modal(Box::new(ServerConfigModal::new(
-                    self.current_server_url.clone(),
+                self.set_active_modal(Box::new(ServerConfigModal::new_with_connection(
+                    self.current_server_connection.clone(),
                 )));
                 true
             }
@@ -2117,8 +2142,8 @@ impl AppState {
                 self.set_active_modal(Box::new(HelpModal::new()));
             }
             Some(Action::OpenModal(ModalId::ServerConfig)) => {
-                self.set_active_modal(Box::new(ServerConfigModal::new(
-                    self.current_server_url.clone(),
+                self.set_active_modal(Box::new(ServerConfigModal::new_with_connection(
+                    self.current_server_connection.clone(),
                 )));
             }
             Some(Action::OpenModal(ModalId::DisplayConfig)) => {
@@ -2268,11 +2293,11 @@ impl AppState {
                     title: title.clone(),
                 });
             }
-            Some(Action::TestServerUrl(ref url)) => {
-                self.queue_op(BackendOp::TestServerUrl { url: url.clone() });
+            Some(Action::TestServerConnection(ref connection)) => {
+                self.queue_op(BackendOp::TestServerConnection(connection.clone()));
             }
-            Some(Action::ApplyServerUrl(ref url)) => {
-                self.queue_op(BackendOp::ApplyServerUrl { url: url.clone() });
+            Some(Action::ApplyServerConnection(ref connection)) => {
+                self.queue_op(BackendOp::ApplyServerConnection(connection.clone()));
             }
             _ => {}
         }
@@ -3168,21 +3193,18 @@ async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> Backe
             .await;
             BackendOpResult::OpenModelPicker { result }
         }
-        BackendOp::TestServerUrl { url } => BackendOpResult::TestServerUrl {
-            result: backend.test_server_url(&url).await,
+        BackendOp::TestServerConnection(connection) => BackendOpResult::TestServerConnection {
+            result: backend.test_server_connection(&connection).await,
         },
-        BackendOp::ApplyServerUrl { url } => {
-            let normalized_url = url.trim_end_matches('/').to_string();
+        BackendOp::ApplyServerConnection(mut connection) => {
+            connection.url = connection.url.trim_end_matches('/').to_string();
             let result = async {
-                let health = backend.test_server_url(&normalized_url).await?;
-                backend.set_server_url(&normalized_url).await?;
+                let health = backend.test_server_connection(&connection).await?;
+                backend.set_server_connection(connection.clone()).await?;
                 Ok(health)
             }
             .await;
-            BackendOpResult::ApplyServerUrl {
-                url: normalized_url,
-                result,
-            }
+            BackendOpResult::ApplyServerConnection { connection, result }
         }
         BackendOp::SelectModel { model } => {
             let requested = model.clone();
@@ -3255,12 +3277,11 @@ where
     T: ratatui_core::backend::Backend,
 {
     pub fn new(backend: B, events: E, terminal: ratatui_core::terminal::Terminal<T>) -> Self {
-        let server_url = backend
-            .server_url()
-            .unwrap_or(DEFAULT_SERVER_URL)
-            .to_string();
+        let server_connection = backend.server_connection().unwrap_or_else(|| {
+            ocpncord_backend::ServerConnection::unauthenticated(DEFAULT_SERVER_URL)
+        });
         Self {
-            state: AppState::new_with_server_url(server_url),
+            state: AppState::new_with_server_connection(server_connection),
             backend,
             events,
             live_events: None,
@@ -3300,6 +3321,7 @@ where
     #[cfg(test)]
     async fn drain_backend_ops_for_test(&mut self) {
         while let Some(op) = self.state.pending_ops.pop_front() {
+            self.state.mark_backend_op_started(&op);
             let result = backend_op_future(&mut self.backend, op).await;
             self.apply_backend_op_result(result);
         }
@@ -3336,12 +3358,14 @@ where
             BackendOpResult::LoadSession { result } => state.handle_load_session(result),
             BackendOpResult::DeleteSession(result) => state.handle_delete_session(result),
             BackendOpResult::OpenModelPicker { result } => state.handle_open_model_picker(result),
-            BackendOpResult::TestServerUrl { result } => state.handle_test_server_url(result),
-            BackendOpResult::ApplyServerUrl { url, result } => match result {
+            BackendOpResult::TestServerConnection { result } => {
+                state.handle_test_server_url(result)
+            }
+            BackendOpResult::ApplyServerConnection { connection, result } => match result {
                 Ok(_) => {
                     *live_events = None;
                     state.clear_active_modal();
-                    state.reset_for_server_switch(url);
+                    state.reset_for_server_switch(connection);
                 }
                 Err(error) => state.handle_apply_server_url_error(error),
             },
@@ -3378,6 +3402,7 @@ where
         loop {
             if active_op.is_none() {
                 if let Some(op) = state.pending_ops.pop_front() {
+                    state.mark_backend_op_started(&op);
                     active_op = Some(backend_op_future_from_ptr(backend_ptr, op));
                 }
             }
@@ -4521,6 +4546,35 @@ mod tests {
         assert_eq!(app.state.connection_status_display().summary, "unconfirmed");
 
         app.state.tick += 1;
+        assert_eq!(app.state.connection_status_display().summary, "verifying");
+    }
+
+    #[test]
+    fn queued_health_check_does_not_surface_verifying_before_it_starts() {
+        let backend = MockBackend::default();
+        let mut app = new_app(backend);
+
+        app.state
+            .apply_live_envelope(EventEnvelope::new(BackendEvent::ServerConnected));
+        app.state.tick = CONNECTION_LIVE_FRESHNESS_TICKS + 1;
+        assert_eq!(app.state.connection_status_display().summary, "unconfirmed");
+
+        app.state.queue_op(BackendOp::LoadAgents);
+        app.state.queue_connection_health_check();
+        app.state.tick += CONNECTION_HEALTH_SLOW_PROBE_VISIBILITY_TICKS;
+
+        assert_eq!(app.state.connection_status_display().summary, "unconfirmed");
+
+        let op = app.state.pending_ops.pop_front().unwrap();
+        app.state.mark_backend_op_started(&op);
+        assert!(matches!(op, BackendOp::LoadAgents));
+        assert_eq!(app.state.connection_status_display().summary, "unconfirmed");
+
+        let op = app.state.pending_ops.pop_front().unwrap();
+        app.state.mark_backend_op_started(&op);
+        assert!(matches!(op, BackendOp::Health));
+        app.state.tick += CONNECTION_HEALTH_SLOW_PROBE_VISIBILITY_TICKS;
+
         assert_eq!(app.state.connection_status_display().summary, "verifying");
     }
 
@@ -5991,7 +6045,8 @@ mod tests {
     #[test]
     fn applying_server_url_resets_state_and_reconnects() {
         let mut backend = MockBackend::default();
-        backend.server_url = "http://old:4096".into();
+        backend.server_connection =
+            ocpncord_backend::ServerConnection::unauthenticated("http://old:4096");
         let mut app = new_app(backend);
         app.state.active_session = Some(make_session("old-session", "Old"));
         app.state
@@ -6000,11 +6055,12 @@ mod tests {
         app.state
             .set_active_modal(Box::new(ServerConfigModal::new("http://new:4096".into())));
 
-        app.state
-            .apply_action(Some(Action::ApplyServerUrl("http://new:4096/".into())));
+        app.state.apply_action(Some(Action::ApplyServerConnection(
+            ocpncord_backend::ServerConnection::unauthenticated("http://new:4096/"),
+        )));
         futures::executor::block_on(app.drain_backend_ops_for_test());
 
-        assert_eq!(app.backend().server_url, "http://new:4096");
+        assert_eq!(app.backend().server_connection.url, "http://new:4096");
         assert_eq!(
             app.backend().set_server_url_calls,
             vec!["http://new:4096".to_string()]
@@ -6021,22 +6077,70 @@ mod tests {
     #[test]
     fn applying_invalid_server_url_keeps_modal_and_existing_backend() {
         let mut backend = MockBackend::default();
-        backend.server_url = "http://old:4096".into();
+        backend.server_connection =
+            ocpncord_backend::ServerConnection::unauthenticated("http://old:4096");
         backend.health_status = None;
         let mut app = new_app(backend);
         app.state
             .set_active_modal(Box::new(ServerConfigModal::new("http://bad:4096".into())));
 
-        app.state
-            .apply_action(Some(Action::ApplyServerUrl("http://bad:4096".into())));
+        app.state.apply_action(Some(Action::ApplyServerConnection(
+            ocpncord_backend::ServerConnection::unauthenticated("http://bad:4096"),
+        )));
         futures::executor::block_on(app.drain_backend_ops_for_test());
 
-        assert_eq!(app.backend().server_url, "http://old:4096");
+        assert_eq!(app.backend().server_connection.url, "http://old:4096");
         assert!(app.backend().set_server_url_calls.is_empty());
         assert_eq!(
             app.state.active_modal().map(|modal| modal.title()),
             Some("Server Connection")
         );
+    }
+
+    #[test]
+    fn applying_server_connection_updates_auth_and_reopens_modal_with_auth() {
+        let mut backend = MockBackend::default();
+        backend.server_connection =
+            ocpncord_backend::ServerConnection::unauthenticated("http://old:4096");
+        let mut app = new_app(backend);
+
+        app.state.apply_action(Some(Action::ApplyServerConnection(
+            ocpncord_backend::ServerConnection::new(
+                "http://new:4096/",
+                Some("user"),
+                Some("secret"),
+            ),
+        )));
+        futures::executor::block_on(app.drain_backend_ops_for_test());
+
+        assert_eq!(app.backend().server_connection.url, "http://new:4096");
+        assert_eq!(
+            app.backend().server_connection.username,
+            Some("user".to_string())
+        );
+        assert_eq!(
+            app.backend().server_connection.password,
+            Some("secret".to_string())
+        );
+        assert_eq!(
+            app.backend().set_server_connection_calls,
+            vec![ocpncord_backend::ServerConnection::new(
+                "http://new:4096",
+                Some("user"),
+                Some("secret"),
+            )]
+        );
+
+        app.state
+            .apply_action(Some(Action::OpenModal(ModalId::ServerConfig)));
+        let modal = app
+            .state
+            .active_modal
+            .as_deref_mut()
+            .and_then(|modal| modal.as_server_config_mut())
+            .expect("server config modal should open");
+        assert_eq!(modal.username(), "user");
+        assert_eq!(modal.password(), "secret");
     }
 
     #[test]
