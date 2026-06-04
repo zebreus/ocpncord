@@ -18,6 +18,19 @@ RECOGNIZED_KEYS = frozenset({
     *[f"C-{c}" for c in "abcdefghijklmnopqrstuvwxyz"],
 })
 
+# tmux send-keys uses its own names for some keys. Anything not listed here is
+# already a valid tmux key name and is passed through unchanged (Enter, Escape,
+# Tab, Space, arrows, Home, End, PageUp, PageDown, F1-F12, C-a..C-z).
+TMUX_KEY_NAMES = {
+    "Backspace": "BSpace",
+    "Delete": "DC",
+}
+
+
+def tmux_key_name(name):
+    """Translate a recognized key name to the name tmux send-keys expects."""
+    return TMUX_KEY_NAMES.get(name, name)
+
 DESCRIPTION = """Send keystrokes to the TUI via tmux send-keys.
 
 Recognized key names for <...>:
@@ -94,7 +107,7 @@ def send_actions(actions, target):
     for action_type, value in actions:
         if action_type == "key":
             subprocess.run(
-                ["tmux", "send-keys", "-t", target, value],
+                ["tmux", "send-keys", "-t", target, tmux_key_name(value)],
                 check=True,
                 capture_output=True,
             )
@@ -412,6 +425,24 @@ class TestParseKeys(unittest.TestCase):
                 ("key", "Down"),
             ],
         )
+
+    # --- tmux key-name translation ---
+
+    def test_tmux_name_backspace(self):
+        self.assertEqual(tmux_key_name("Backspace"), "BSpace")
+
+    def test_tmux_name_delete(self):
+        self.assertEqual(tmux_key_name("Delete"), "DC")
+
+    def test_tmux_name_passthrough(self):
+        for name in ("Enter", "Escape", "Tab", "Space", "Up", "Down",
+                     "Left", "Right", "Home", "End", "PageUp", "PageDown",
+                     "F1", "F12", "C-c", "C-x"):
+            self.assertEqual(tmux_key_name(name), name)
+
+    def test_every_recognized_key_maps_to_nonempty(self):
+        for name in RECOGNIZED_KEYS:
+            self.assertTrue(tmux_key_name(name))
 
     def test_recognized_key_set_has_all_expected(self):
         expected = {
