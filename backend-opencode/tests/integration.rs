@@ -95,7 +95,7 @@ impl embedded_io_async::Write for StdTcpStream {
 fn backend() -> OpenCodeBackend<StdTcp, StdDns> {
     static TCP: StdTcp = StdTcp;
     static DNS: StdDns = StdDns;
-    OpenCodeBackend::new("http://localhost:4096", &TCP, &DNS)
+    OpenCodeBackend::new("http://localhost:4096", &TCP, &DNS, 0)
 }
 
 #[tokio::test]

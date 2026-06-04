@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use embedded_io_async::Read;
 use ocpncord_backend::*;
-use reqwless::client::HttpClient;
+use reqwless::client::{HttpClient, TlsConfig, TlsVerify};
 use reqwless::headers::ContentType;
 use reqwless::request::{Method, RequestBuilder};
 use reqwless::response::Response;
@@ -26,6 +26,24 @@ const SSE_READ_BUF_SIZE: usize = 4 * 1024;
 const SSE_HEADERS: [(&str, &str); 1] = [("Accept", "text/event-stream")];
 const DEFAULT_SERVER_USERNAME: &str = "opencode";
 
+/// The only trust anchor we accept for `https://` connections: Let's Encrypt's
+/// RSA root, ISRG Root X1 (DER-encoded). Servers whose certificate chains to
+/// this root validate; everything else is rejected.
+///
+/// We trust X1 (not the ECDSA X2) because embedded-tls verifies the chain
+/// linearly from the trust anchor down to the leaf, requiring the *topmost*
+/// certificate the server sends to be signed by this anchor. Let's Encrypt's
+/// current hierarchy sends a chain ending in ISRG Root X2 cross-signed by X1
+/// (an RSA `sha256WithRSAEncryption` signature), so X1 must be the anchor and
+/// the reqwless `rsa` feature must be enabled to verify that link.
+const ISRG_ROOT_X1_DER: &[u8] = include_bytes!("isrg_root_x1.der");
+
+/// TLS read buffer: must hold a full TLS record (16 KiB plaintext + overhead).
+const TLS_READ_BUF_SIZE: usize = 16 * 1024 + 256;
+/// TLS write buffer: encrypts outgoing records, and also buffers plain-HTTP
+/// requests when a TLS-configured client talks to an `http://` URL.
+const TLS_WRITE_BUF_SIZE: usize = 16 * 1024;
+
 /// An HTTP client for the opencode server REST API.
 ///
 /// Generic over the TCP transport and DNS resolver, allowing it to work
@@ -38,12 +56,20 @@ pub struct OpenCodeBackend<
     header_buf: Vec<u8>,
     transport: &'static T,
     dns: &'static D,
+    /// Unpredictable per-process base seed for the TLS RNG, supplied by the
+    /// host (`backend-opencode` is `no_std` and has no entropy source).
+    tls_seed: u64,
+    /// Incremented per connection so each TLS handshake gets a distinct seed
+    /// (reusing one seed would reuse the client's ephemeral key material).
+    tls_seed_counter: u64,
 }
 
 impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + 'static>
     OpenCodeBackend<T, D>
 {
-    pub fn new(base_url: &str, transport: &'static T, dns: &'static D) -> Self {
+    /// `seed` is an unpredictable random value used to seed the TLS RNG. It
+    /// must come from the host's entropy source (e.g. `/dev/urandom`).
+    pub fn new(base_url: &str, transport: &'static T, dns: &'static D, seed: u64) -> Self {
         Self {
             server_connection: normalize_server_connection(ServerConnection::unauthenticated(
                 base_url,
@@ -51,24 +77,37 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
             header_buf: vec![0; HTTP_HEADER_BUF_SIZE],
             transport,
             dns,
+            tls_seed: seed,
+            tls_seed_counter: 0,
         }
     }
 
+    /// `seed` is an unpredictable random value used to seed the TLS RNG. It
+    /// must come from the host's entropy source (e.g. `/dev/urandom`).
     pub fn new_with_connection(
         connection: ServerConnection,
         transport: &'static T,
         dns: &'static D,
+        seed: u64,
     ) -> Self {
         Self {
             server_connection: normalize_server_connection(connection),
             header_buf: vec![0; HTTP_HEADER_BUF_SIZE],
             transport,
             dns,
+            tls_seed: seed,
+            tls_seed_counter: 0,
         }
     }
 
-    fn make_client(&self) -> HttpClient<'static, T, D> {
-        HttpClient::new(self.transport, self.dns)
+    /// Returns a fresh TLS RNG seed for the next connection, advancing the
+    /// counter so consecutive connections never share ephemeral key material.
+    fn next_tls_seed(&mut self) -> u64 {
+        let seed = self
+            .tls_seed
+            .wrapping_add(self.tls_seed_counter.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        self.tls_seed_counter = self.tls_seed_counter.wrapping_add(1);
+        seed
     }
 
     async fn health_for_base_url(
@@ -298,7 +337,22 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         body_bytes: Option<&[u8]>,
         connection: Option<ServerConnection>,
     ) -> Result<Vec<u8>> {
-        let mut client = self.make_client();
+        let seed = self.next_tls_seed();
+        // TLS buffers are scope-local and must outlive `client` (declared first
+        // for drop order). A TLS-configured client also serves `http://` URLs.
+        let mut tls_read = alloc::vec![0u8; TLS_READ_BUF_SIZE];
+        let mut tls_write = alloc::vec![0u8; TLS_WRITE_BUF_SIZE];
+        let tls = TlsConfig::new(
+            seed,
+            &mut tls_read,
+            &mut tls_write,
+            TlsVerify::Certificate {
+                ca: ISRG_ROOT_X1_DER,
+                cert: None,
+                key: None,
+            },
+        );
+        let mut client = HttpClient::new_with_tls(self.transport, self.dns, tls);
         let basic_auth = connection.as_ref().and_then(server_basic_auth);
         if let Some(bytes) = body_bytes {
             let handle = client.request(method, url).await.map_err(conn_err)?;
@@ -343,12 +397,25 @@ fn incremental_sse_stream<
     dns: &'static D,
     url: String,
     connection: Option<ServerConnection>,
+    seed: u64,
 ) -> BufferedStream {
     BufferedStream::live(move |sink| async move {
         let mut header_buf = alloc::vec![0u8; HTTP_HEADER_BUF_SIZE];
         let mut read_buf = alloc::vec![0u8; SSE_READ_BUF_SIZE];
+        let mut tls_read_buf = alloc::vec![0u8; TLS_READ_BUF_SIZE];
+        let mut tls_write_buf = alloc::vec![0u8; TLS_WRITE_BUF_SIZE];
         let mut parser = SseParser::new();
-        let mut client = HttpClient::new(transport, dns);
+        let tls = TlsConfig::new(
+            seed,
+            &mut tls_read_buf,
+            &mut tls_write_buf,
+            TlsVerify::Certificate {
+                ca: ISRG_ROOT_X1_DER,
+                cert: None,
+                key: None,
+            },
+        );
+        let mut client = HttpClient::new_with_tls(transport, dns, tls);
         let basic_auth = connection.as_ref().and_then(server_basic_auth);
 
         let mut handle = match client.request(Method::GET, &url).await {
@@ -697,11 +764,13 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
 
     async fn subscribe_live(&mut self) -> Result<Self::EventStream> {
         let url = global_event_url(&self.server_connection.url);
+        let seed = self.next_tls_seed();
         Ok(incremental_sse_stream(
             self.transport,
             self.dns,
             url,
             Some(self.server_connection.clone()),
+            seed,
         ))
     }
 
@@ -952,13 +1021,13 @@ mod tests {
     fn backend(base_url: &str) -> OpenCodeBackend<StdTcp, StdDns> {
         static TCP: StdTcp = StdTcp;
         static DNS: StdDns = StdDns;
-        OpenCodeBackend::new(base_url, &TCP, &DNS)
+        OpenCodeBackend::new(base_url, &TCP, &DNS, 0)
     }
 
     fn backend_with_connection(connection: ServerConnection) -> OpenCodeBackend<StdTcp, StdDns> {
         static TCP: StdTcp = StdTcp;
         static DNS: StdDns = StdDns;
-        OpenCodeBackend::new_with_connection(connection, &TCP, &DNS)
+        OpenCodeBackend::new_with_connection(connection, &TCP, &DNS, 0)
     }
 
     fn health_body() -> &'static str {

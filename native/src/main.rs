@@ -473,6 +473,16 @@ fn server_connection_from_cli(cli: &Cli) -> ServerConnection {
     ServerConnection::new(cli.url.clone(), cli.username.clone(), cli.password.clone())
 }
 
+/// Reads an unpredictable 64-bit seed for the TLS RNG from `/dev/urandom`.
+/// The backend is `no_std` and has no entropy source, so the host supplies it.
+fn read_tls_seed() -> u64 {
+    let mut seed_bytes = [0u8; 8];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut seed_bytes))
+        .expect("read /dev/urandom for TLS seed");
+    u64::from_le_bytes(seed_bytes)
+}
+
 // --- Render target setup --------------------------------------------------
 
 fn setup_terminal() -> Terminal<CrosstermBackend> {
@@ -496,7 +506,9 @@ async fn main() {
     static TCP: StdTcp = StdTcp;
     static DNS: StdDns = StdDns;
     let server_connection = server_connection_from_cli(&cli);
-    let backend = OpenCodeBackend::new_with_connection(server_connection.clone(), &TCP, &DNS);
+    let tls_seed = read_tls_seed();
+    let backend =
+        OpenCodeBackend::new_with_connection(server_connection.clone(), &TCP, &DNS, tls_seed);
     log::info!(
         "starting ocpncord-native with server {} (auth configured: {})",
         server_connection.url,
