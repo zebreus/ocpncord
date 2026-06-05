@@ -35,7 +35,6 @@ ratatui-core = { version = "0.1", default-features = false }
 reqwless = { version = "0.14", default-features = false, features = [
     "embedded-tls",
     "alloc",
-    "rsa",
 ] }
 serde = { version = "1", default-features = false, features = [
     "derive",

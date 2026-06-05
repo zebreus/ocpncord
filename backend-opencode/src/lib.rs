@@ -26,23 +26,24 @@ const SSE_READ_BUF_SIZE: usize = 4 * 1024;
 const SSE_HEADERS: [(&str, &str); 1] = [("Accept", "text/event-stream")];
 const DEFAULT_SERVER_USERNAME: &str = "opencode";
 
-/// The only trust anchor we accept for `https://` connections: Let's Encrypt's
-/// RSA root, ISRG Root X1 (DER-encoded). Servers whose certificate chains to
-/// this root validate; everything else is rejected.
-///
-/// We trust X1 (not the ECDSA X2) because embedded-tls verifies the chain
-/// linearly from the trust anchor down to the leaf, requiring the *topmost*
-/// certificate the server sends to be signed by this anchor. Let's Encrypt's
-/// current hierarchy sends a chain ending in ISRG Root X2 cross-signed by X1
-/// (an RSA `sha256WithRSAEncryption` signature), so X1 must be the anchor and
-/// the reqwless `rsa` feature must be enabled to verify that link.
-const ISRG_ROOT_X1_DER: &[u8] = include_bytes!("isrg_root_x1.der");
-
-/// TLS read buffer: must hold a full TLS record (16 KiB plaintext + overhead).
+/// TLS read buffer: must hold a full incoming TLS record (16 KiB plaintext +
+/// overhead). The server chooses its record size, so this cannot be shrunk
+/// without risking a handshake/read failure on large records.
 const TLS_READ_BUF_SIZE: usize = 16 * 1024 + 256;
-/// TLS write buffer: encrypts outgoing records, and also buffers plain-HTTP
-/// requests when a TLS-configured client talks to an `http://` URL.
-const TLS_WRITE_BUF_SIZE: usize = 16 * 1024;
+/// TLS write buffer: holds one outgoing TLS record before it is encrypted and
+/// flushed. embedded-tls chunks outgoing application data through this buffer
+/// (a large request body is split across several records), so the only hard
+/// floor is fitting the ClientHello (a few hundred bytes) plus record overhead.
+/// 4 KiB leaves generous headroom while saving 12 KiB per connection versus a
+/// full-size record buffer.
+const TLS_WRITE_BUF_SIZE: usize = 4 * 1024;
+
+/// Whether a server URL uses `https://` and therefore needs a TLS-configured
+/// client. Plain `http://` connections skip the TLS config entirely so they
+/// allocate none of the (large) TLS record buffers.
+fn url_is_https(url: &str) -> bool {
+    url.starts_with("https://")
+}
 
 /// An HTTP client for the opencode server REST API.
 ///
@@ -337,22 +338,25 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         body_bytes: Option<&[u8]>,
         connection: Option<ServerConnection>,
     ) -> Result<Vec<u8>> {
-        let seed = self.next_tls_seed();
         // TLS buffers are scope-local and must outlive `client` (declared first
-        // for drop order). A TLS-configured client also serves `http://` URLs.
-        let mut tls_read = alloc::vec![0u8; TLS_READ_BUF_SIZE];
-        let mut tls_write = alloc::vec![0u8; TLS_WRITE_BUF_SIZE];
-        let tls = TlsConfig::new(
-            seed,
-            &mut tls_read,
-            &mut tls_write,
-            TlsVerify::Certificate {
-                ca: ISRG_ROOT_X1_DER,
-                cert: None,
-                key: None,
-            },
-        );
-        let mut client = HttpClient::new_with_tls(self.transport, self.dns, tls);
+        // for drop order). `http://` URLs skip the TLS config entirely, so the
+        // buffers stay unallocated for plain-HTTP connections.
+        let mut tls_read;
+        let mut tls_write;
+        let mut client = if url_is_https(url) {
+            let seed = self.next_tls_seed();
+            tls_read = alloc::vec![0u8; TLS_READ_BUF_SIZE];
+            tls_write = alloc::vec![0u8; TLS_WRITE_BUF_SIZE];
+            // We intentionally do not verify the server certificate: this client
+            // talks to a user-configured opencode server (often behind a
+            // reverse proxy) where we are not defending against MITM, and
+            // dropping verification avoids the RSA/cert-chain crypto entirely
+            // (smaller binary, less handshake stack/heap).
+            let tls = TlsConfig::new(seed, &mut tls_read, &mut tls_write, TlsVerify::None);
+            HttpClient::new_with_tls(self.transport, self.dns, tls)
+        } else {
+            HttpClient::new(self.transport, self.dns)
+        };
         let basic_auth = connection.as_ref().and_then(server_basic_auth);
         if let Some(bytes) = body_bytes {
             let handle = client.request(method, url).await.map_err(conn_err)?;
@@ -402,20 +406,21 @@ fn incremental_sse_stream<
     BufferedStream::live(move |sink| async move {
         let mut header_buf = alloc::vec![0u8; HTTP_HEADER_BUF_SIZE];
         let mut read_buf = alloc::vec![0u8; SSE_READ_BUF_SIZE];
-        let mut tls_read_buf = alloc::vec![0u8; TLS_READ_BUF_SIZE];
-        let mut tls_write_buf = alloc::vec![0u8; TLS_WRITE_BUF_SIZE];
         let mut parser = SseParser::new();
-        let tls = TlsConfig::new(
-            seed,
-            &mut tls_read_buf,
-            &mut tls_write_buf,
-            TlsVerify::Certificate {
-                ca: ISRG_ROOT_X1_DER,
-                cert: None,
-                key: None,
-            },
-        );
-        let mut client = HttpClient::new_with_tls(transport, dns, tls);
+        // TLS buffers stay unallocated for plain-HTTP (`http://`) connections;
+        // they are declared before `client` so they outlive it (drop order).
+        let mut tls_read_buf;
+        let mut tls_write_buf;
+        let mut client = if url_is_https(&url) {
+            tls_read_buf = alloc::vec![0u8; TLS_READ_BUF_SIZE];
+            tls_write_buf = alloc::vec![0u8; TLS_WRITE_BUF_SIZE];
+            // Server certificate is intentionally not verified; see the note in
+            // `send_get_body`.
+            let tls = TlsConfig::new(seed, &mut tls_read_buf, &mut tls_write_buf, TlsVerify::None);
+            HttpClient::new_with_tls(transport, dns, tls)
+        } else {
+            HttpClient::new(transport, dns)
+        };
         let basic_auth = connection.as_ref().and_then(server_basic_auth);
 
         let mut handle = match client.request(Method::GET, &url).await {
