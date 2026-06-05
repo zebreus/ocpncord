@@ -3,7 +3,7 @@ resolver = "2"
 members = ["backend", "backend-opencode", "tui", "native"]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 readme = "README.md"
@@ -20,9 +20,9 @@ futures-core = { version = "0.3", default-features = false, features = [
     "alloc",
 ] }
 log = { version = "0.4", default-features = false }
-ocpncord-backend = { version = "0.4.2", path = "backend" }
-ocpncord-backend-opencode = { version = "0.4.2", path = "backend-opencode" }
-ocpncord-tui = { version = "0.4.2", path = "tui" }
+ocpncord-backend = { version = "0.5.0", path = "backend" }
+ocpncord-backend-opencode = { version = "0.5.0", path = "backend-opencode" }
+ocpncord-tui = { version = "0.5.0", path = "tui" }
 ratatui = { version = "0.30", default-features = false }
 ratatui-core = { version = "0.1", default-features = false }
 # `embedded-tls` (pulled in by reqwless's `embedded-tls` feature) provides the
