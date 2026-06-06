@@ -828,8 +828,7 @@ pub(crate) fn render_chat(
                         .map(String::as_str)
                         .unwrap_or("subagent");
                     lines.push(
-                        Line::from(alloc::format!("↳ subagent {label}"))
-                            .style(theme.part_subtask),
+                        Line::from(alloc::format!("↳ subagent {label}")).style(theme.part_subtask),
                     );
                     current_child = Some(sid);
                 }

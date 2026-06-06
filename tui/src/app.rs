@@ -67,8 +67,7 @@ const CONNECTION_LIVE_FRESHNESS_TICKS: u64 = 100;
 // the next poll to `last_event + interval`, so during active streaming the poll
 // keeps getting deferred and only fires once the events stop.
 const CONNECTION_HEALTH_POLL_INTERVAL_TICKS: u64 = 60;
-const _: () =
-    assert!(CONNECTION_HEALTH_POLL_INTERVAL_TICKS < CONNECTION_LIVE_FRESHNESS_TICKS);
+const _: () = assert!(CONNECTION_HEALTH_POLL_INTERVAL_TICKS < CONNECTION_LIVE_FRESHNESS_TICKS);
 const CONNECTION_HEALTH_SLOW_PROBE_VISIBILITY_TICKS: u64 = 10;
 const DEFAULT_SERVER_URL: &str = "http://localhost:4096";
 const START_PAGE_LOGO: &str = r#"██████   ██████ ██████  ███    ██ ██████  ██████  ██████  ██████
@@ -1698,8 +1697,7 @@ impl AppState {
                     }
                 }
             }
-            Event::Backend(event) =>
-            {
+            Event::Backend(event) => {
                 #[allow(unreachable_patterns)]
                 match event {
                     ocpncord_backend::BackendEvent::Error { message } => {
@@ -3214,14 +3212,20 @@ enum DriverEvent {
     PlatformClosed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriverPollMode {
+    AllSources,
+    BackendOnly,
+}
+
 fn driver_poll_slot(cursor: u8, offset: u8) -> u8 {
     (cursor + offset) % 2
 }
 
-/// Polls the in-flight backend op and the live/platform event sources once,
-/// returning the first ready `DriverEvent` (or `Poll::Pending` when nothing is
-/// ready). A completed op result is stashed in `completed_op`. Shared by the
-/// blocking wait and the non-blocking drain so both stay in sync.
+/// Polls the in-flight backend op and event sources once, returning the first
+/// ready `DriverEvent` (or `Poll::Pending` when nothing is ready). A completed
+/// op result is stashed in `completed_op`. The redraw drain uses `BackendOnly`
+/// because platform streams may legitimately synthesize ready ticks forever.
 fn poll_driver_event<'op, B, E>(
     cx: &mut Context<'_>,
     active_op: &mut Option<BackendOpFuture<'op, B>>,
@@ -3229,6 +3233,7 @@ fn poll_driver_event<'op, B, E>(
     events: &mut E,
     poll_cursor: u8,
     completed_op: &mut Option<BackendOpResult<B>>,
+    mode: DriverPollMode,
 ) -> Poll<DriverEvent>
 where
     B: Backend,
@@ -3250,7 +3255,7 @@ where
                     }
                 }
             }
-            _ => {
+            _ if mode == DriverPollMode::AllSources => {
                 if let Poll::Ready(event) = Pin::new(&mut *events).poll_next(cx) {
                     if let Some(event) = event {
                         return Poll::Ready(DriverEvent::Platform(event));
@@ -3258,6 +3263,7 @@ where
                     return Poll::Ready(DriverEvent::PlatformClosed);
                 }
             }
+            _ => {}
         }
     }
     Poll::Pending
@@ -3607,6 +3613,7 @@ where
                     &mut *events,
                     *poll_cursor,
                     &mut completed_op,
+                    DriverPollMode::AllSources,
                 )
             })
             .await;
@@ -3639,6 +3646,7 @@ where
                     &mut *events,
                     *poll_cursor,
                     &mut completed_op,
+                    DriverPollMode::BackendOnly,
                 ) {
                     Poll::Ready(event) => event,
                     Poll::Pending => break,
@@ -4362,7 +4370,12 @@ mod tests {
 
         futures::executor::block_on(app.run());
 
-        assert_eq!(app.state.active_session().map(|session| session.id.as_str()), None);
+        assert_eq!(
+            app.state
+                .active_session()
+                .map(|session| session.id.as_str()),
+            None
+        );
     }
 
     #[test]
@@ -4395,6 +4408,64 @@ mod tests {
 
         assert_eq!(driver_poll_slot(1, 0), 1);
         assert_eq!(driver_poll_slot(1, 1), 0);
+    }
+
+    struct PanicPlatformEvents;
+
+    impl Stream for PanicPlatformEvents {
+        type Item = Event;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            panic!("backend-only drain must not poll platform events");
+        }
+    }
+
+    #[test]
+    fn backend_only_driver_poll_does_not_poll_platform_events() {
+        let mut active_op: Option<BackendOpFuture<'_, MockBackend>> = None;
+        let mut live_events = None;
+        let mut events = PanicPlatformEvents;
+        let mut completed_op = None;
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let event = poll_driver_event::<MockBackend, _>(
+            &mut cx,
+            &mut active_op,
+            &mut live_events,
+            &mut events,
+            1,
+            &mut completed_op,
+            DriverPollMode::BackendOnly,
+        );
+
+        assert!(matches!(event, Poll::Pending));
+        assert!(completed_op.is_none());
+    }
+
+    #[test]
+    fn backend_only_driver_poll_still_drains_ready_live_events() {
+        let mut backend = MockBackend::default();
+        backend.live_events = vec![live_event(ocpncord_backend::BackendEvent::SessionCreated {
+            session: make_session("session-from-background", "Background"),
+        })];
+        let mut active_op: Option<BackendOpFuture<'_, MockBackend>> = None;
+        let mut live_events = Some(futures::executor::block_on(backend.subscribe_live()).unwrap());
+        let mut events = PanicPlatformEvents;
+        let mut completed_op = None;
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let event = poll_driver_event::<MockBackend, _>(
+            &mut cx,
+            &mut active_op,
+            &mut live_events,
+            &mut events,
+            0,
+            &mut completed_op,
+            DriverPollMode::BackendOnly,
+        );
+
+        assert!(matches!(event, Poll::Ready(DriverEvent::Live(Some(Ok(_))))));
+        assert!(completed_op.is_none());
     }
 
     #[test]
@@ -7592,7 +7663,10 @@ mod tests {
         );
         assert!(app.state.session_in_scope("child-1"));
         assert_eq!(
-            app.state.scope_child_labels().get("child-1").map(String::as_str),
+            app.state
+                .scope_child_labels()
+                .get("child-1")
+                .map(String::as_str),
             Some("explorer: Subagent")
         );
     }
@@ -7674,7 +7748,10 @@ mod tests {
 
         assert!(app.state.session_in_scope("child-1"));
         assert_eq!(
-            app.state.scope_child_labels().get("child-1").map(String::as_str),
+            app.state
+                .scope_child_labels()
+                .get("child-1")
+                .map(String::as_str),
             Some("explorer: Subagent")
         );
     }
