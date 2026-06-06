@@ -24,7 +24,7 @@ use crossterm::{execute, queue};
 use embedded_io_async::{ErrorType, Read};
 use embedded_nal_async::{AddrType, Dns, TcpConnect};
 use ocpncord_backend::ServerConnection;
-use ocpncord_backend_opencode::OpenCodeBackend;
+use ocpncord_backend_opencode::{BufferedTcpConnect, OpenCodeBackend};
 use ocpncord_tui::Event;
 use ocpncord_tui::{App, KeyEvent, Modifiers, Scancode};
 use ratatui_core::backend::Backend;
@@ -503,7 +503,9 @@ async fn main() {
         let _ = writeln!(std::io::stderr(), "failed to initialize native logger");
     }
 
-    static TCP: StdTcp = StdTcp;
+    // Buffer reads so reqwless's byte-at-a-time chunk-header parsing is served
+    // from memory instead of a socket round-trip per byte on slow transports.
+    static TCP: BufferedTcpConnect<StdTcp> = BufferedTcpConnect::new(StdTcp);
     static DNS: StdDns = StdDns;
     let server_connection = server_connection_from_cli(&cli);
     let tls_seed = read_tls_seed();

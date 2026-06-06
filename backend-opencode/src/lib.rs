@@ -17,7 +17,9 @@ use reqwless::request::{Method, RequestBuilder};
 use reqwless::response::Response;
 use serde::Deserialize;
 
+mod buffered;
 mod stream;
+pub use buffered::{BufferedConnection, BufferedTcpConnect};
 pub use stream::{BufferedStream, SseParser};
 
 const HTTP_HEADER_BUF_SIZE: usize = 4 * 1024;
