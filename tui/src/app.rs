@@ -372,7 +372,6 @@ pub enum Action {
     ReplyPermission(String, String, PermissionReplyAction),
     ReplyQuestion(String, String, Vec<Vec<String>>),
     RejectQuestion(String),
-    TestServerConnection(ocpncord_backend::ServerConnection),
     ApplyServerConnection(ocpncord_backend::ServerConnection),
 }
 
@@ -561,7 +560,6 @@ enum BackendOp {
     OpenModelPicker {
         cached_models: Option<Vec<ocpncord_backend::ModelSummary>>,
     },
-    TestServerConnection(ocpncord_backend::ServerConnection),
     ApplyServerConnection(ocpncord_backend::ServerConnection),
     SelectModel {
         model: String,
@@ -611,12 +609,9 @@ enum BackendOpResult<B: Backend> {
             Option<Vec<ocpncord_backend::ModelSummary>>,
         )>,
     },
-    TestServerConnection {
-        result: ocpncord_backend::Result<ocpncord_backend::Health>,
-    },
     ApplyServerConnection {
         connection: ocpncord_backend::ServerConnection,
-        result: ocpncord_backend::Result<ocpncord_backend::Health>,
+        result: ocpncord_backend::Result<()>,
     },
     SelectModel {
         requested: String,
@@ -2302,9 +2297,6 @@ impl AppState {
                     title: title.clone(),
                 });
             }
-            Some(Action::TestServerConnection(ref connection)) => {
-                self.queue_op(BackendOp::TestServerConnection(connection.clone()));
-            }
             Some(Action::ApplyServerConnection(ref connection)) => {
                 self.queue_op(BackendOp::ApplyServerConnection(connection.clone()));
             }
@@ -2438,23 +2430,6 @@ impl AppState {
             Err(e) => modal.set_error(alloc::format!("{}", e)),
         }
         self.set_active_modal(Box::new(modal));
-    }
-
-    fn handle_test_server_url(
-        &mut self,
-        result: ocpncord_backend::Result<ocpncord_backend::Health>,
-    ) {
-        if let Some(modal) = self
-            .active_modal
-            .as_deref_mut()
-            .and_then(|modal| modal.as_server_config_mut())
-        {
-            modal.set_test_result(result);
-        } else if let Err(error) = result {
-            if !self.note_connection_backend_error("Server test failed", &error) {
-                self.error = Some(alloc::format!("{error}"));
-            }
-        }
     }
 
     fn handle_apply_server_url_error(&mut self, error: ocpncord_backend::BackendError) {
@@ -3202,17 +3177,9 @@ async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> Backe
             .await;
             BackendOpResult::OpenModelPicker { result }
         }
-        BackendOp::TestServerConnection(connection) => BackendOpResult::TestServerConnection {
-            result: backend.test_server_connection(&connection).await,
-        },
         BackendOp::ApplyServerConnection(mut connection) => {
             connection.url = connection.url.trim_end_matches('/').to_string();
-            let result = async {
-                let health = backend.test_server_connection(&connection).await?;
-                backend.set_server_connection(connection.clone()).await?;
-                Ok(health)
-            }
-            .await;
+            let result = backend.set_server_connection(connection.clone()).await;
             BackendOpResult::ApplyServerConnection { connection, result }
         }
         BackendOp::SelectModel { model } => {
@@ -3367,9 +3334,6 @@ where
             BackendOpResult::LoadSession { result } => state.handle_load_session(result),
             BackendOpResult::DeleteSession(result) => state.handle_delete_session(result),
             BackendOpResult::OpenModelPicker { result } => state.handle_open_model_picker(result),
-            BackendOpResult::TestServerConnection { result } => {
-                state.handle_test_server_url(result)
-            }
             BackendOpResult::ApplyServerConnection { connection, result } => match result {
                 Ok(_) => {
                     *live_events = None;
@@ -6115,7 +6079,9 @@ mod tests {
     }
 
     #[test]
-    fn applying_invalid_server_url_keeps_modal_and_existing_backend() {
+    fn applying_unreachable_server_url_still_switches_and_closes_modal() {
+        // Apply commits the settings unconditionally; reachability is reported
+        // afterwards by the normal connection machinery, not gated up front.
         let mut backend = MockBackend::default();
         backend.server_connection =
             ocpncord_backend::ServerConnection::unauthenticated("http://old:4096");
@@ -6129,11 +6095,14 @@ mod tests {
         )));
         futures::executor::block_on(app.drain_backend_ops_for_test());
 
-        assert_eq!(app.backend().server_connection.url, "http://old:4096");
-        assert!(app.backend().set_server_url_calls.is_empty());
+        assert_eq!(app.backend().server_connection.url, "http://bad:4096");
         assert_eq!(
-            app.state.active_modal().map(|modal| modal.title()),
-            Some("Server Connection")
+            app.backend().set_server_url_calls,
+            vec!["http://bad:4096".to_string()]
+        );
+        assert!(
+            app.state.active_modal().is_none(),
+            "apply should close the modal even when the server is unreachable"
         );
     }
 

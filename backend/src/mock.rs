@@ -21,7 +21,6 @@ pub struct MockBackend {
     pub server_connection: ServerConnection,
     pub set_server_url_calls: Vec<String>,
     pub set_server_connection_calls: Vec<ServerConnection>,
-    pub test_server_connection_calls: Vec<ServerConnection>,
     pub config_info: Option<Config>,
     pub models: Option<Vec<ModelSummary>>,
     pub list_models_calls: usize,
@@ -56,7 +55,6 @@ impl Default for MockBackend {
             server_connection: ServerConnection::unauthenticated("http://localhost:4096"),
             set_server_url_calls: Vec::new(),
             set_server_connection_calls: Vec::new(),
-            test_server_connection_calls: Vec::new(),
             config_info: Some(Config {
                 model: Some("mock/model".into()),
                 username: Some("mock-user".into()),
@@ -138,16 +136,7 @@ impl Backend for MockBackend {
         Some(self.server_connection.clone())
     }
 
-    async fn test_server_connection(&mut self, connection: &ServerConnection) -> Result<Health> {
-        self.test_server_connection_calls
-            .push(normalize_mock_connection(connection.clone()));
-        self.health().await.map_err(|_| BackendError::Connection {
-            message: "server test failed".into(),
-        })
-    }
-
     async fn set_server_connection(&mut self, connection: ServerConnection) -> Result<()> {
-        self.health().await?;
         self.server_connection = normalize_mock_connection(connection);
         self.set_server_url_calls
             .push(self.server_connection.url.clone());

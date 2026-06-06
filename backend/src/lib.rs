@@ -325,24 +325,10 @@ pub trait Backend {
         None
     }
 
-    async fn test_server_connection(&mut self, _connection: &ServerConnection) -> Result<Health> {
-        Err(BackendError::Connection {
-            message: "server URL testing is not supported by this backend".into(),
-        })
-    }
-
     async fn set_server_connection(&mut self, _connection: ServerConnection) -> Result<()> {
         Err(BackendError::Connection {
             message: "server URL configuration is not supported by this backend".into(),
         })
-    }
-
-    async fn test_server_url(&mut self, url: &str) -> Result<Health> {
-        let mut connection = self
-            .server_connection()
-            .unwrap_or_else(|| ServerConnection::unauthenticated(url));
-        connection.url = url.into();
-        self.test_server_connection(&connection).await
     }
 
     async fn set_server_url(&mut self, url: &str) -> Result<()> {

@@ -41,7 +41,7 @@ use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
-use ocpncord_backend::{Config, Health, ModelSummary, Session};
+use ocpncord_backend::{Config, ModelSummary, Session};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -297,9 +297,7 @@ impl Modal for SessionListModal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ServerConfigStatus {
     Idle,
-    Testing,
     Applying,
-    Success(String),
     Error(String),
 }
 
@@ -308,7 +306,6 @@ enum ServerConfigFocus {
     Url,
     Username,
     Password,
-    Test,
     Apply,
 }
 
@@ -345,23 +342,8 @@ impl ServerConfigModal {
         self.active_connection = status;
     }
 
-    pub fn set_testing(&mut self) {
-        self.status = ServerConfigStatus::Testing;
-    }
-
     pub fn set_applying(&mut self) {
         self.status = ServerConfigStatus::Applying;
-    }
-
-    pub fn set_test_result(&mut self, result: ocpncord_backend::Result<Health>) {
-        self.status = match result {
-            Ok(health) => ServerConfigStatus::Success(alloc::format!(
-                "Connected: healthy={} version={}",
-                health.healthy,
-                health.version
-            )),
-            Err(error) => ServerConfigStatus::Error(alloc::format!("{error}")),
-        };
     }
 
     pub fn set_apply_error(&mut self, error: String) {
@@ -407,7 +389,7 @@ impl ServerConfigModal {
             ServerConfigFocus::Url => self.url.push(ch),
             ServerConfigFocus::Username => self.username.push(ch),
             ServerConfigFocus::Password => self.password.push(ch),
-            ServerConfigFocus::Test | ServerConfigFocus::Apply => {}
+            ServerConfigFocus::Apply => {}
         }
         self.status = ServerConfigStatus::Idle;
     }
@@ -423,7 +405,7 @@ impl ServerConfigModal {
             ServerConfigFocus::Password => {
                 self.password.pop();
             }
-            ServerConfigFocus::Test | ServerConfigFocus::Apply => {}
+            ServerConfigFocus::Apply => {}
         }
         self.status = ServerConfigStatus::Idle;
     }
@@ -432,8 +414,7 @@ impl ServerConfigModal {
         self.focus = match self.focus {
             ServerConfigFocus::Url => ServerConfigFocus::Username,
             ServerConfigFocus::Username => ServerConfigFocus::Password,
-            ServerConfigFocus::Password => ServerConfigFocus::Test,
-            ServerConfigFocus::Test => ServerConfigFocus::Apply,
+            ServerConfigFocus::Password => ServerConfigFocus::Apply,
             ServerConfigFocus::Apply => ServerConfigFocus::Url,
         };
     }
@@ -443,17 +424,14 @@ impl ServerConfigModal {
             ServerConfigFocus::Url => ServerConfigFocus::Apply,
             ServerConfigFocus::Username => ServerConfigFocus::Url,
             ServerConfigFocus::Password => ServerConfigFocus::Username,
-            ServerConfigFocus::Test => ServerConfigFocus::Password,
-            ServerConfigFocus::Apply => ServerConfigFocus::Test,
+            ServerConfigFocus::Apply => ServerConfigFocus::Password,
         };
     }
 
     fn status_line(&self) -> Line<'_> {
         match &self.status {
-            ServerConfigStatus::Idle => Line::from("Edit the server URL, then test or apply."),
-            ServerConfigStatus::Testing => Line::from("Testing connection..."),
+            ServerConfigStatus::Idle => Line::from("Edit the server connection, then apply."),
             ServerConfigStatus::Applying => Line::from("Applying connection..."),
-            ServerConfigStatus::Success(message) => Line::from(message.as_str()),
             ServerConfigStatus::Error(message) => Line::from(message.as_str()),
         }
     }
@@ -516,21 +494,12 @@ impl Modal for ServerConfigModal {
             ),
         );
         lines.push(Line::from(""));
-        let test_style = if self.focus == ServerConfigFocus::Test {
-            theme.dialog_button_focused
-        } else {
-            theme.dialog_button
-        };
         let apply_style = if self.focus == ServerConfigFocus::Apply {
             theme.dialog_button_focused
         } else {
             theme.dialog_button
         };
-        lines.push(Line::from(vec![
-            Span::styled(" Test ", test_style),
-            Span::raw("  "),
-            Span::styled(" Apply ", apply_style),
-        ]));
+        lines.push(Line::from(vec![Span::styled(" Apply ", apply_style)]));
         lines.push(Line::from(""));
         let connection_style = match self.active_connection.tier {
             ConnectionTier::Green => theme.toast_success,
@@ -540,12 +509,13 @@ impl Modal for ServerConfigModal {
         lines.push(self.active_connection_line().style(connection_style));
         let status_style = match self.status {
             ServerConfigStatus::Error(_) => theme.text_error,
-            ServerConfigStatus::Success(_) => theme.toast_success,
             _ => theme.text_dim,
         };
         lines.push(self.status_line().style(status_style));
         lines.push(Line::from(""));
-        lines.push(Line::from("Tab/Arrows move  Enter activate  Esc cancel").style(theme.text_dim));
+        lines.push(
+            Line::from("Tab/Arrows move  Enter confirm/apply  Esc cancel").style(theme.text_dim),
+        );
 
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
@@ -589,16 +559,18 @@ impl Modal for ServerConfigModal {
                     Action::None
                 }
                 Scancode::Enter => match self.focus {
+                    // Pressing Enter while editing a field must not switch the
+                    // connection mid-typing; move focus to Apply so the switch
+                    // only happens on a deliberate confirmation.
                     ServerConfigFocus::Url
                     | ServerConfigFocus::Username
-                    | ServerConfigFocus::Password
-                    | ServerConfigFocus::Apply => {
+                    | ServerConfigFocus::Password => {
+                        self.focus = ServerConfigFocus::Apply;
+                        Action::None
+                    }
+                    ServerConfigFocus::Apply => {
                         self.set_applying();
                         Action::ApplyServerConnection(self.connection())
-                    }
-                    ServerConfigFocus::Test => {
-                        self.set_testing();
-                        Action::TestServerConnection(self.connection())
                     }
                 },
                 _ => Action::None,
@@ -1354,6 +1326,12 @@ mod tests {
         modal.handle_event(key(Scancode::Backspace));
         assert_eq!(modal.url(), "http://localhost:4096/");
 
+        // Enter while editing the URL must not apply; it only moves focus to
+        // Apply so a switch requires a deliberate confirmation.
+        let action = modal.handle_event(key(Scancode::Enter));
+        assert_eq!(action, Action::None);
+
+        // The follow-up Enter on the now-focused Apply button applies.
         let action = modal.handle_event(key(Scancode::Enter));
         assert_eq!(
             action,
@@ -1366,15 +1344,39 @@ mod tests {
     }
 
     #[test]
-    fn server_config_modal_test_button_returns_test_action() {
+    fn server_config_modal_enter_while_typing_does_not_apply() {
         let mut modal = ServerConfigModal::new("http://localhost:4096".into());
+        // Type a partial change, then hit Enter as if confirming the field.
+        modal.handle_event(key(Scancode::Char('/')));
+        let action = modal.handle_event(key(Scancode::Enter));
+        assert_eq!(
+            action,
+            Action::None,
+            "Enter mid-edit must not switch the connection"
+        );
+        // Editing remains possible afterwards (focus moved to Apply, no switch).
+        let action = modal.handle_event(key(Scancode::Enter));
+        assert_eq!(
+            action,
+            Action::ApplyServerConnection(ServerConnection::new(
+                "http://localhost:4096/",
+                None::<String>,
+                None::<String>,
+            ))
+        );
+    }
+
+    #[test]
+    fn server_config_modal_apply_button_returns_apply_action() {
+        let mut modal = ServerConfigModal::new("http://localhost:4096".into());
+        // Url -> Username -> Password -> Apply.
         modal.handle_event(key(Scancode::Tab));
         modal.handle_event(key(Scancode::Tab));
         modal.handle_event(key(Scancode::Tab));
         let action = modal.handle_event(key(Scancode::Enter));
         assert_eq!(
             action,
-            Action::TestServerConnection(ServerConnection::new(
+            Action::ApplyServerConnection(ServerConnection::new(
                 "http://localhost:4096",
                 None::<String>,
                 None::<String>,
@@ -1407,7 +1409,7 @@ mod tests {
         let action = modal.handle_event(key(Scancode::Enter));
         assert_eq!(
             action,
-            Action::TestServerConnection(ServerConnection::new(
+            Action::ApplyServerConnection(ServerConnection::new(
                 "http://localhost:4096",
                 Some("user"),
                 Some("secret"),

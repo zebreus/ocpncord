@@ -487,12 +487,6 @@ impl<T: embedded_nal_async::TcpConnect + 'static, D: embedded_nal_async::Dns + '
         Some(self.server_connection.clone())
     }
 
-    async fn test_server_connection(&mut self, connection: &ServerConnection) -> Result<Health> {
-        let connection = normalize_server_connection(connection.clone());
-        self.health_for_base_url(&connection.url, Some(&connection))
-            .await
-    }
-
     async fn set_server_connection(&mut self, connection: ServerConnection) -> Result<()> {
         self.server_connection = normalize_server_connection(connection);
         Ok(())
