@@ -473,6 +473,41 @@ enum CreateSessionPurpose {
     NewChat,
 }
 
+/// A session belonging to the active session's scope: the active (root) session
+/// the user opened plus its descendant subagent sessions. Message content and
+/// per-session ambient state are only surfaced for sessions in this scope, so a
+/// session created elsewhere on the shared event stream can no longer hijack the
+/// view or leak its transcript into the active one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopeEntry {
+    parent_id: Option<String>,
+    agent: Option<String>,
+    title: String,
+}
+
+impl ScopeEntry {
+    fn from_session(session: &ocpncord_backend::Session) -> Self {
+        Self {
+            parent_id: session.parent_id.clone(),
+            agent: session.agent.clone(),
+            title: session.title.clone(),
+        }
+    }
+
+    /// A short label for the subagent divider, e.g. "agent: title" / "title".
+    fn label(&self) -> String {
+        match self.agent.as_deref().filter(|agent| !agent.is_empty()) {
+            Some(agent) if !self.title.is_empty() => alloc::format!("{agent}: {}", self.title),
+            Some(agent) => agent.into(),
+            None if !self.title.is_empty() => self.title.clone(),
+            None => "subagent".into(),
+        }
+    }
+}
+
+/// A loaded session paired with its transcript.
+type LoadedSession = (ocpncord_backend::Session, Vec<LoadedMessage>);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiCommand {
     Models,
@@ -600,7 +635,7 @@ enum BackendOpResult<B: Backend> {
     },
     ListSessions(ocpncord_backend::Result<Vec<ocpncord_backend::Session>>),
     LoadSession {
-        result: ocpncord_backend::Result<(ocpncord_backend::Session, Vec<LoadedMessage>)>,
+        result: ocpncord_backend::Result<(LoadedSession, Vec<LoadedSession>)>,
     },
     DeleteSession(ocpncord_backend::Result<Vec<ocpncord_backend::Session>>),
     OpenModelPicker {
@@ -645,6 +680,9 @@ pub struct AppState {
     user_work: UserWorkQueue,
     active_assistant_finalized: bool,
     active_session_idle: bool,
+    // The active session plus its descendant subagent sessions. Keyed by session
+    // id; always contains the active (root) session once one is selected.
+    scope_sessions: BTreeMap<String, ScopeEntry>,
     sync_known_sequences: BTreeMap<String, u64>,
     connection: ConnectionState,
     last_connection_tier: ConnectionTier,
@@ -711,6 +749,7 @@ impl AppState {
             user_work: UserWorkQueue::new(),
             active_assistant_finalized: false,
             active_session_idle: false,
+            scope_sessions: BTreeMap::new(),
             sync_known_sequences: BTreeMap::new(),
             connection: ConnectionState::new(),
             last_connection_tier: ConnectionTier::Yellow,
@@ -1058,6 +1097,7 @@ impl AppState {
         self.user_work.clear();
         self.active_assistant_finalized = false;
         self.active_session_idle = false;
+        self.scope_sessions.clear();
         self.sync_known_sequences.clear();
         self.connection = ConnectionState::new();
         self.last_connection_tier = ConnectionTier::Yellow;
@@ -1345,6 +1385,59 @@ impl AppState {
         self.active_session.as_ref().map(|s| s.id.as_str()) == Some(session_id)
     }
 
+    /// True only for the active (root) session — used by the streaming state
+    /// machine so a finishing subagent does not end the parent's response.
+    fn is_active_root(&self, session_id: &str) -> bool {
+        self.active_session_matches(session_id)
+    }
+
+    /// True for the active session or any descendant subagent session — used to
+    /// decide whether message content and per-session ambient state belong to
+    /// the view the user opened.
+    fn session_in_scope(&self, session_id: &str) -> bool {
+        self.is_active_root(session_id) || self.scope_sessions.contains_key(session_id)
+    }
+
+    /// Reset the scope to a single freshly-selected root session and drop every
+    /// piece of transient per-session state so nothing bleeds across a switch.
+    fn reset_scope_for(&mut self, session: &ocpncord_backend::Session) {
+        self.scope_sessions.clear();
+        self.scope_sessions
+            .insert(session.id.clone(), ScopeEntry::from_session(session));
+        self.chat.clear_partial_stream();
+        self.current_session_status = None;
+        self.todos.clear();
+        self.is_streaming = false;
+        self.active_assistant_finalized = false;
+        self.active_session_idle = false;
+    }
+
+    /// Register a descendant subagent session if its parent is already in scope.
+    /// Returns true when the session was added.
+    fn register_scope_session(&mut self, session: &ocpncord_backend::Session) -> bool {
+        let in_scope = session
+            .parent_id
+            .as_deref()
+            .is_some_and(|parent| self.session_in_scope(parent));
+        if !in_scope {
+            return false;
+        }
+        self.scope_sessions
+            .insert(session.id.clone(), ScopeEntry::from_session(session));
+        true
+    }
+
+    /// Labels for every in-scope descendant subagent (excludes the root), keyed
+    /// by session id, for nested transcript rendering.
+    fn scope_child_labels(&self) -> BTreeMap<String, String> {
+        let root = self.active_session.as_ref().map(|s| s.id.as_str());
+        self.scope_sessions
+            .iter()
+            .filter(|(id, _)| Some(id.as_str()) != root)
+            .map(|(id, entry)| (id.clone(), entry.label()))
+            .collect()
+    }
+
     fn apply_session_status(
         &mut self,
         session_id: String,
@@ -1399,11 +1492,14 @@ impl AppState {
     }
 
     fn apply_message_updated(&mut self, session_id: String, message: ocpncord_backend::Message) {
-        if !self.active_session_matches(&session_id) {
+        if !self.session_in_scope(&session_id) {
             return;
         }
 
-        if self.chat.apply_message_updated(message) {
+        let completed = self.chat.apply_message_updated(message);
+        // Only the root session's completion drives the response state machine;
+        // a finishing subagent must not end the parent's response.
+        if completed && self.is_active_root(&session_id) {
             self.active_assistant_finalized = true;
             if !self.user_work.has_pending_work() || self.active_session_idle {
                 self.finish_streaming_response();
@@ -1412,7 +1508,7 @@ impl AppState {
     }
 
     fn apply_message_removed(&mut self, session_id: String, message_id: String) {
-        if !self.active_session_matches(&session_id) {
+        if !self.session_in_scope(&session_id) {
             return;
         }
         self.chat.remove_message(&message_id);
@@ -1620,43 +1716,56 @@ impl AppState {
                         self.dispatch_next_user_work();
                     }
                     ocpncord_backend::BackendEvent::SessionCreated { session } => {
-                        let is_new = self
-                            .active_session
-                            .as_ref()
-                            .map(|s| s.id != session.id)
-                            .unwrap_or(true);
-                        self.active_session = Some(session);
-                        self.active_mode = AppMode::Chat;
-                        if is_new && self.user_work.is_empty() {
-                            self.chat.clear_messages();
-                            self.current_session_status = None;
+                        // The event stream is server/directory-wide. Never adopt
+                        // a session created elsewhere as the active one — local
+                        // creation flows already set `active_session` via the
+                        // CreateSession op result. Here we only refresh the
+                        // active session's metadata, or nest a freshly-created
+                        // subagent under an in-scope parent.
+                        if self.is_active_root(&session.id) {
+                            self.active_session = Some(session);
+                            self.error = None;
+                        } else {
+                            self.register_scope_session(&session);
                         }
-                        self.error = None;
                     }
                     ocpncord_backend::BackendEvent::SessionUpdated { session } => {
-                        if let Some(active) = &mut self.active_session {
-                            if active.id == session.id {
-                                *active = session;
-                            }
+                        if self.is_active_root(&session.id) {
+                            self.active_session = Some(session);
+                        } else if let Some(entry) = self.scope_sessions.get_mut(&session.id) {
+                            // Keep a nested subagent's divider label fresh.
+                            *entry = ScopeEntry::from_session(&session);
                         }
                     }
                     ocpncord_backend::BackendEvent::SessionStatus { session_id, status } => {
                         self.apply_session_status(session_id, status);
                     }
-                    ocpncord_backend::BackendEvent::SessionDeleted { .. } => {
-                        self.active_session = None;
-                        self.chat.clear_messages();
-                        self.active_mode = AppMode::StartPage;
-                        self.current_session_status = None;
+                    ocpncord_backend::BackendEvent::SessionDeleted { session_id } => {
+                        if self.is_active_root(&session_id) {
+                            // The session in view was deleted — tear down the view.
+                            self.active_session = None;
+                            self.scope_sessions.clear();
+                            self.chat.clear_messages();
+                            self.chat.clear_partial_stream();
+                            self.active_mode = AppMode::StartPage;
+                            self.current_session_status = None;
+                            self.todos.clear();
+                            self.is_streaming = false;
+                        } else if self.scope_sessions.remove(&session_id).is_some() {
+                            // A subagent session ended — drop its nested messages.
+                            self.chat.remove_messages_for_session(&session_id);
+                        }
                     }
                     ocpncord_backend::BackendEvent::SessionIdle { session_id } => {
                         self.handle_session_idle(&session_id);
                     }
                     ocpncord_backend::BackendEvent::SessionError { session_id, error } => {
                         log::error!("session error for {session_id}: {error:?}");
-                        self.error = Some(alloc::format!("Session error: {:?}", error));
-                        if self.active_session_matches(&session_id) {
-                            self.finish_streaming_response();
+                        if self.session_in_scope(&session_id) {
+                            self.error = Some(alloc::format!("Session error: {:?}", error));
+                            if self.is_active_root(&session_id) {
+                                self.finish_streaming_response();
+                            }
                         }
                     }
                     ocpncord_backend::BackendEvent::SessionDiff { .. } => {}
@@ -1677,9 +1786,7 @@ impl AppState {
                         ref part,
                         ..
                     } => {
-                        if self.active_session.as_ref().map(|s| s.id.as_str())
-                            == Some(session_id.as_str())
-                        {
+                        if self.session_in_scope(&session_id) {
                             self.mark_response_active();
                             self.chat.merge_stream_part(Some(part_id), part.clone());
                         }
@@ -1690,10 +1797,7 @@ impl AppState {
                         field,
                         delta,
                         ..
-                    } if field == "text"
-                        && self.active_session.as_ref().map(|s| s.id.as_str())
-                            == Some(session_id.as_str()) =>
-                    {
+                    } if field == "text" && self.session_in_scope(session_id) => {
                         self.mark_response_active();
                         self.chat.merge_stream_delta(part_id, delta);
                     }
@@ -1703,13 +1807,17 @@ impl AppState {
                         part_id,
                         ..
                     } => {
-                        if self.active_session_matches(&session_id) {
+                        if self.session_in_scope(&session_id) {
                             self.chat.remove_stream_part(&part_id);
                         }
                     }
                     ocpncord_backend::BackendEvent::PermissionAsked { request } => {
-                        self.pending_permissions.push_back(request);
-                        self.open_next_blocking_modal_if_idle();
+                        // Only prompt for sessions in the active scope; a
+                        // background session must not interrupt the user.
+                        if self.session_in_scope(&request.session_id) {
+                            self.pending_permissions.push_back(request);
+                            self.open_next_blocking_modal_if_idle();
+                        }
                     }
                     ocpncord_backend::BackendEvent::PermissionReplied { request_id, .. } => {
                         self.remove_pending_permission_by_id(&request_id);
@@ -1717,8 +1825,10 @@ impl AppState {
                         self.open_next_blocking_modal_if_idle();
                     }
                     ocpncord_backend::BackendEvent::QuestionAsked { request } => {
-                        self.pending_questions.push_back(request);
-                        self.open_next_blocking_modal_if_idle();
+                        if self.session_in_scope(&request.session_id) {
+                            self.pending_questions.push_back(request);
+                            self.open_next_blocking_modal_if_idle();
+                        }
                     }
                     ocpncord_backend::BackendEvent::QuestionRejected { request_id, .. } => {
                         self.remove_pending_question_by_id(&request_id);
@@ -1731,15 +1841,20 @@ impl AppState {
                         self.open_next_blocking_modal_if_idle();
                     }
                     ocpncord_backend::BackendEvent::CommandExecuted {
-                        name, arguments, ..
+                        name,
+                        arguments,
+                        session_id,
+                        ..
                     } => {
-                        self.push_toast(Toast {
-                            title: Some("Command".into()),
-                            message: alloc::format!("{name} {arguments}"),
-                            variant: ToastVariant::Info,
-                            created_at: self.tick,
-                            duration: 12,
-                        });
+                        if self.session_in_scope(&session_id) {
+                            self.push_toast(Toast {
+                                title: Some("Command".into()),
+                                message: alloc::format!("{name} {arguments}"),
+                                variant: ToastVariant::Info,
+                                created_at: self.tick,
+                                duration: 12,
+                            });
+                        }
                     }
                     ocpncord_backend::BackendEvent::FileEdited { file } => {
                         self.push_toast(Toast {
@@ -1760,13 +1875,18 @@ impl AppState {
                         });
                     }
                     ocpncord_backend::BackendEvent::PtyCreated { info } => {
+                        // PTY events carry no sessionID, so a PTY from another
+                        // session can't be attributed to ours — register it but
+                        // never hijack the view into Terminal mode. The user can
+                        // open it with Ctrl+X T.
                         self.terminal.set_from_pty(&info);
                         self.side_panel_tab = Tab::Pane;
-                        self.active_mode = AppMode::Terminal;
                     }
                     ocpncord_backend::BackendEvent::PtyUpdated { .. } => {}
                     ocpncord_backend::BackendEvent::PtyDeleted { .. } => {
-                        self.active_mode = AppMode::Chat;
+                        if self.active_mode == AppMode::Terminal {
+                            self.active_mode = AppMode::Chat;
+                        }
                     }
                     ocpncord_backend::BackendEvent::PtyExited { exit_code, .. } => {
                         self.terminal.status = ocpncord_backend::PtyStatus::Exited;
@@ -1837,8 +1957,15 @@ impl AppState {
                     ocpncord_backend::BackendEvent::VcsBranchUpdated { branch } => {
                         self.current_branch = Some(branch);
                     }
-                    ocpncord_backend::BackendEvent::TodoUpdated { ref todos, .. } => {
-                        self.todos = todos.clone();
+                    ocpncord_backend::BackendEvent::TodoUpdated {
+                        ref todos,
+                        ref session_id,
+                        ..
+                    } => {
+                        // The todos panel reflects the root session's plan only.
+                        if self.is_active_root(session_id) {
+                            self.todos = todos.clone();
+                        }
                     }
                     ocpncord_backend::BackendEvent::TuiPromptAppend { ref text } => {
                         self.prompt_bar.append_text(text);
@@ -2333,6 +2460,8 @@ impl AppState {
     ) {
         match result {
             Ok(session) => {
+                // A freshly-created session is a brand-new root scope.
+                self.reset_scope_for(&session);
                 self.active_session = Some(session);
                 match purpose {
                     CreateSessionPurpose::UserWork { work_id } => {
@@ -2378,18 +2507,23 @@ impl AppState {
 
     fn handle_load_session(
         &mut self,
-        result: ocpncord_backend::Result<(ocpncord_backend::Session, Vec<LoadedMessage>)>,
+        result: ocpncord_backend::Result<(LoadedSession, Vec<LoadedSession>)>,
     ) {
         match result {
-            Ok((session, messages)) => {
+            Ok(((session, messages), children)) => {
+                self.reset_scope_for(&session);
                 self.active_session = Some(session);
                 self.active_mode = AppMode::Chat;
-                self.is_streaming = false;
                 self.user_work.clear();
-                self.active_assistant_finalized = false;
-                self.active_session_idle = false;
-                self.current_session_status = None;
-                self.chat.replace_messages(messages);
+                // Root transcript first, then each in-scope subagent's transcript
+                // (rendered nested by session id).
+                let mut combined = messages;
+                for (child, child_messages) in children {
+                    if self.register_scope_session(&child) {
+                        combined.extend(child_messages);
+                    }
+                }
+                self.chat.replace_messages(combined);
                 self.clear_active_modal();
                 self.open_next_blocking_modal_if_idle();
             }
@@ -2749,6 +2883,7 @@ impl AppState {
             }
             AppMode::Chat => {
                 let queued_messages = self.user_work.queued_messages();
+                let child_labels = self.scope_child_labels();
                 let rows = Layout::new(
                     Direction::Vertical,
                     [
@@ -2768,6 +2903,8 @@ impl AppState {
                         queued_messages: &queued_messages,
                         is_streaming: self.is_streaming,
                         display_policy: &self.display_policy,
+                        active_session_id: self.active_session.as_ref().map(|s| s.id.as_str()),
+                        child_labels: &child_labels,
                     },
                     self.chat_scroll,
                 );
@@ -3193,7 +3330,18 @@ async fn execute_backend_op<B: Backend>(backend: &mut B, op: BackendOp) -> Backe
             let result = async {
                 let session = backend.get_session(&session_id).await?;
                 let messages = load_messages(backend, &session_id).await?;
-                Ok((session, messages))
+                // Seed the subagent tree: load existing child sessions and their
+                // transcripts so they render nested under the parent on open.
+                // Child fetch failures degrade gracefully to no children.
+                let mut children = Vec::new();
+                if let Ok(child_sessions) = backend.children_sessions(&session_id).await {
+                    for child in child_sessions {
+                        if let Ok(child_messages) = load_messages(backend, &child.id).await {
+                            children.push((child, child_messages));
+                        }
+                    }
+                }
+                Ok(((session, messages), children))
             }
             .await;
             BackendOpResult::LoadSession { result }
@@ -3722,6 +3870,21 @@ mod tests {
         )
     }
 
+    /// Make `id` the active (root) session so events scoped to it are accepted.
+    fn select_test_session<B: Backend>(app: &mut TestApp<B>, id: &str) {
+        let session = make_session(id, "Session");
+        app.state.reset_scope_for(&session);
+        app.state.active_session = Some(session);
+    }
+
+    /// A child (subagent) session whose parent is `parent_id`.
+    fn make_child_session(id: &str, parent_id: &str, agent: &str) -> ocpncord_backend::Session {
+        let mut session = make_session(id, "Subagent");
+        session.parent_id = Some(parent_id.into());
+        session.agent = Some(agent.into());
+        session
+    }
+
     fn new_app_with_events<B: Backend, E: futures_core::Stream<Item = Event> + Unpin>(
         backend: B,
         events: E,
@@ -4187,7 +4350,9 @@ mod tests {
     }
 
     #[test]
-    fn run_handles_live_events_from_subscribe() {
+    fn live_session_created_does_not_hijack_active_session() {
+        // The event stream is server-wide; a session created elsewhere must not
+        // become the active session or clear the view the user is looking at.
         let mut backend = MockBackend::default();
         backend.live_events = vec![live_event(ocpncord_backend::BackendEvent::SessionCreated {
             session: make_session("session-from-background", "Background"),
@@ -4197,12 +4362,7 @@ mod tests {
 
         futures::executor::block_on(app.run());
 
-        assert_eq!(
-            app.state
-                .active_session()
-                .map(|session| session.id.as_str()),
-            Some("session-from-background")
-        );
+        assert_eq!(app.state.active_session().map(|session| session.id.as_str()), None);
     }
 
     #[test]
@@ -7250,6 +7410,7 @@ mod tests {
     #[test]
     fn permission_request_opens_modal_and_enter_replies_once() {
         let mut app = new_app(MockBackend::default());
+        select_test_session(&mut app, "session-1");
 
         run(
             &mut app,
@@ -7281,6 +7442,7 @@ mod tests {
     #[test]
     fn permission_escape_rejects_and_opens_next_queued_request() {
         let mut app = new_app(MockBackend::default());
+        select_test_session(&mut app, "session-1");
 
         run(
             &mut app,
@@ -7317,6 +7479,7 @@ mod tests {
     #[test]
     fn external_permission_reply_removes_matching_id_without_popping_front() {
         let mut app = new_app(MockBackend::default());
+        select_test_session(&mut app, "session-1");
 
         run(
             &mut app,
@@ -7357,6 +7520,7 @@ mod tests {
     #[test]
     fn question_request_submits_nested_answers_and_escape_rejects() {
         let mut app = new_app(MockBackend::default());
+        select_test_session(&mut app, "session-1");
 
         run(
             &mut app,
@@ -7388,5 +7552,175 @@ mod tests {
             app.state.active_modal().is_none(),
             "question modal should close after reject"
         );
+    }
+
+    #[test]
+    fn foreign_top_level_session_created_does_not_change_scope() {
+        let mut app = new_app(MockBackend::default());
+        select_test_session(&mut app, "session-1");
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::SessionCreated {
+                session: make_session("session-2", "Other"),
+            }),
+        );
+
+        assert_eq!(
+            app.state.active_session().map(|s| s.id.as_str()),
+            Some("session-1")
+        );
+        assert!(!app.state.session_in_scope("session-2"));
+    }
+
+    #[test]
+    fn child_session_created_is_scoped_under_parent() {
+        let mut app = new_app(MockBackend::default());
+        select_test_session(&mut app, "session-1");
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::SessionCreated {
+                session: make_child_session("child-1", "session-1", "explorer"),
+            }),
+        );
+
+        // Active session is unchanged; the child is in scope.
+        assert_eq!(
+            app.state.active_session().map(|s| s.id.as_str()),
+            Some("session-1")
+        );
+        assert!(app.state.session_in_scope("child-1"));
+        assert_eq!(
+            app.state.scope_child_labels().get("child-1").map(String::as_str),
+            Some("explorer: Subagent")
+        );
+    }
+
+    #[test]
+    fn child_session_message_parts_are_accepted_unrelated_are_dropped() {
+        let mut app = new_app(MockBackend::default());
+        select_test_session(&mut app, "session-1");
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::SessionCreated {
+                session: make_child_session("child-1", "session-1", "explorer"),
+            }),
+        );
+
+        let text = ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+            identity: Default::default(),
+            text: "subagent output".into(),
+        });
+        run(
+            &mut app,
+            Event::Backend(message_part_updated("child-1", "m-c", "p-c", text)),
+        );
+        assert_eq!(app.state.partial_parts().len(), 1, "child part accepted");
+
+        let other = ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+            identity: Default::default(),
+            text: "foreign".into(),
+        });
+        run(
+            &mut app,
+            Event::Backend(message_part_updated("other-session", "m-o", "p-o", other)),
+        );
+        assert_eq!(
+            app.state.partial_parts().len(),
+            1,
+            "out-of-scope part dropped"
+        );
+    }
+
+    #[test]
+    fn switching_sessions_clears_previous_partial_stream() {
+        let mut app = new_app(MockBackend::default());
+        select_test_session(&mut app, "session-1");
+        let text = ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
+            identity: Default::default(),
+            text: "in flight".into(),
+        });
+        run(
+            &mut app,
+            Event::Backend(message_part_updated("session-1", "m-1", "p-1", text)),
+        );
+        assert_eq!(app.state.partial_parts().len(), 1);
+
+        app.state.handle_load_session(Ok((
+            (make_session("session-2", "Second"), Vec::new()),
+            Vec::new(),
+        )));
+
+        assert!(
+            app.state.partial_parts().is_empty(),
+            "previous session's partial stream must not bleed into the new one"
+        );
+        assert_eq!(
+            app.state.active_session().map(|s| s.id.as_str()),
+            Some("session-2")
+        );
+        assert!(!app.state.session_in_scope("session-1"));
+    }
+
+    #[test]
+    fn load_session_seeds_subagent_tree() {
+        let mut app = new_app(MockBackend::default());
+        let child = make_child_session("child-1", "session-1", "explorer");
+        app.state.handle_load_session(Ok((
+            (make_session("session-1", "Root"), Vec::new()),
+            vec![(child, Vec::new())],
+        )));
+
+        assert!(app.state.session_in_scope("child-1"));
+        assert_eq!(
+            app.state.scope_child_labels().get("child-1").map(String::as_str),
+            Some("explorer: Subagent")
+        );
+    }
+
+    #[test]
+    fn permission_from_foreign_session_is_ignored() {
+        let mut app = new_app(MockBackend::default());
+        select_test_session(&mut app, "session-1");
+        let mut request = permission_request("perm-x");
+        request.session_id = "other-session".into();
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::PermissionAsked { request }),
+        );
+
+        assert!(app.state.active_modal().is_none());
+        assert_eq!(app.state.pending_permissions.len(), 0);
+    }
+
+    #[test]
+    fn todo_updated_is_scoped_to_active_root() {
+        let mut app = new_app(MockBackend::default());
+        select_test_session(&mut app, "session-1");
+        let todo = ocpncord_backend::Todo {
+            content: "do it".into(),
+            status: "pending".into(),
+            priority: "high".into(),
+        };
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::TodoUpdated {
+                session_id: "other-session".into(),
+                todos: vec![todo.clone()],
+            }),
+        );
+        assert!(app.state.todos.is_empty(), "foreign todos ignored");
+
+        run(
+            &mut app,
+            Event::Backend(ocpncord_backend::BackendEvent::TodoUpdated {
+                session_id: "session-1".into(),
+                todos: vec![todo],
+            }),
+        );
+        assert_eq!(app.state.todos.len(), 1, "active-session todos applied");
     }
 }

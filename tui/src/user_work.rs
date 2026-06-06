@@ -99,10 +99,6 @@ impl UserWorkQueue {
         Self::default()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.active.is_none() && self.pending.is_empty()
-    }
-
     pub(crate) fn has_active_work(&self) -> bool {
         self.active.is_some()
     }

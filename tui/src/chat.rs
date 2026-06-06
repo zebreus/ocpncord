@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Style;
-use ratatui::text::{Line, Text};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget, Wrap,
 };
@@ -273,6 +273,13 @@ impl ChatState {
     pub(crate) fn remove_message(&mut self, message_id: &str) {
         self.messages
             .retain(|message| message.id.as_deref() != Some(message_id));
+    }
+
+    /// Drop every loaded message belonging to a session (e.g. when a nested
+    /// subagent session ends and should no longer appear in the transcript).
+    pub(crate) fn remove_messages_for_session(&mut self, session_id: &str) {
+        self.messages
+            .retain(|message| message.session_id.as_deref() != Some(session_id));
     }
 
     pub(crate) fn merge_stream_part(
@@ -773,6 +780,11 @@ pub(crate) struct ChatTranscript<'a> {
     pub queued_messages: &'a [LoadedMessage],
     pub is_streaming: bool,
     pub display_policy: &'a ChatDisplayPolicy,
+    /// The active (root) session id. Messages from other in-scope sessions are
+    /// rendered nested under a subagent divider.
+    pub active_session_id: Option<&'a str>,
+    /// Display labels for in-scope subagent sessions, keyed by session id.
+    pub child_labels: &'a BTreeMap<String, String>,
 }
 
 /// Renders the Chat message area using the provided data.
@@ -798,8 +810,40 @@ pub(crate) fn render_chat(
     }
 
     let mut lines: Vec<Line<'_>> = Vec::new();
+    // Track the session of the previous message so a subagent divider is emitted
+    // once per contiguous group of nested messages.
+    let mut current_child: Option<&str> = None;
     for msg in transcript.messages {
-        render_message(&mut lines, msg, theme, transcript.display_policy);
+        let child_session = msg.session_id.as_deref().filter(|sid| {
+            transcript
+                .active_session_id
+                .is_some_and(|active| *sid != active)
+        });
+        match child_session {
+            Some(sid) => {
+                if current_child != Some(sid) {
+                    let label = transcript
+                        .child_labels
+                        .get(sid)
+                        .map(String::as_str)
+                        .unwrap_or("subagent");
+                    lines.push(
+                        Line::from(alloc::format!("↳ subagent {label}"))
+                            .style(theme.part_subtask),
+                    );
+                    current_child = Some(sid);
+                }
+                let mut child_lines: Vec<Line<'_>> = Vec::new();
+                render_message(&mut child_lines, msg, theme, transcript.display_policy);
+                for line in child_lines {
+                    lines.push(indent_line(line));
+                }
+            }
+            None => {
+                current_child = None;
+                render_message(&mut lines, msg, theme, transcript.display_policy);
+            }
+        }
     }
 
     for part in transcript.active_parts {
@@ -1213,6 +1257,18 @@ fn reasoning_lines(text: &str, style: Style) -> Vec<Line<'_>> {
     lines
 }
 
+/// Indent a rendered line by two columns, preserving its style and alignment.
+/// Used to nest subagent transcript lines under their divider.
+fn indent_line(line: Line<'_>) -> Line<'_> {
+    let style = line.style;
+    let alignment = line.alignment;
+    let mut spans = line.spans;
+    spans.insert(0, Span::raw("  "));
+    let mut indented = Line::from(spans).style(style);
+    indented.alignment = alignment;
+    indented
+}
+
 fn wrapped_height(lines: &[Line<'_>], width: u16) -> usize {
     let width = width.max(1) as usize;
     lines
@@ -1248,6 +1304,8 @@ mod tests {
                         queued_messages: &[],
                         is_streaming: false,
                         display_policy: &ChatDisplayPolicy::default(),
+                        active_session_id: None,
+                        child_labels: &alloc::collections::BTreeMap::new(),
                     },
                     0,
                 );
@@ -1286,6 +1344,8 @@ mod tests {
                         queued_messages: &[],
                         is_streaming: false,
                         display_policy: &ChatDisplayPolicy::default(),
+                        active_session_id: None,
+                        child_labels: &alloc::collections::BTreeMap::new(),
                     },
                     0,
                 );
@@ -1319,6 +1379,8 @@ mod tests {
                         queued_messages: &[],
                         is_streaming: true,
                         display_policy: &ChatDisplayPolicy::default(),
+                        active_session_id: None,
+                        child_labels: &alloc::collections::BTreeMap::new(),
                     },
                     0,
                 );
@@ -1328,6 +1390,60 @@ mod tests {
         let buf = terminal.backend().buffer();
         let has_text = buf.content().iter().any(|c| c.symbol() == "s");
         assert!(has_text);
+    }
+
+    #[test]
+    fn child_session_message_renders_with_subagent_divider() {
+        let theme = Theme::default();
+        let msgs = vec![
+            LoadedMessage {
+                id: Some("m-root".into()),
+                session_id: Some("root".into()),
+                role: MessageRole::User,
+                parts: vec![Part::Text(TextPart {
+                    identity: Default::default(),
+                    text: "parent".into(),
+                })],
+            },
+            LoadedMessage {
+                id: Some("m-child".into()),
+                session_id: Some("child".into()),
+                role: MessageRole::Assistant,
+                parts: vec![Part::Text(TextPart {
+                    identity: Default::default(),
+                    text: "nested".into(),
+                })],
+            },
+        ];
+        let mut labels = BTreeMap::new();
+        labels.insert("child".to_string(), "explorer".to_string());
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_chat(
+                    frame,
+                    &theme,
+                    frame.area(),
+                    ChatTranscript {
+                        messages: &msgs,
+                        active_parts: &[],
+                        queued_messages: &[],
+                        is_streaming: false,
+                        display_policy: &ChatDisplayPolicy::default(),
+                        active_session_id: Some("root"),
+                        child_labels: &labels,
+                    },
+                    0,
+                );
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let screen: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(screen.contains("subagent"), "divider missing: {screen}");
+        assert!(screen.contains("explorer"), "label missing: {screen}");
     }
 
     #[test]
