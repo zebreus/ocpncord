@@ -364,10 +364,10 @@ impl ChatState {
     }
 
     pub(crate) fn merge_stream_delta(&mut self, part_id: String, delta: String) {
-        let text = {
+        let acc_len = {
             let acc = self.partial_texts.entry(part_id.clone()).or_default();
             acc.push_str(&delta);
-            acc.clone()
+            acc.len()
         };
 
         let index = self
@@ -394,7 +394,18 @@ impl ChatState {
             }
         };
 
-        set_stream_text(&mut self.partial_parts[index], text, kind);
+        // Fast path: when the target part already holds the accumulated text
+        // minus this delta (the steady-state streaming case), append the delta
+        // in place. This keeps streaming O(total) instead of cloning the whole
+        // accumulator on every chunk (which made a growing message O(n^2)).
+        if !append_stream_text(&mut self.partial_parts[index], &delta, kind, acc_len) {
+            let text = self
+                .partial_texts
+                .get(&part_id)
+                .cloned()
+                .unwrap_or_default();
+            set_stream_text(&mut self.partial_parts[index], text, kind);
+        }
         self.partial_part_indices.insert(part_id, index);
         self.latest_text_part_index = Some(index);
     }
@@ -714,6 +725,33 @@ fn stream_text(part: &ocpncord_backend::Part) -> Option<String> {
     }
 }
 
+/// Appends `delta` to a streaming text part in place, but only when the part is
+/// already the expected kind and its current length plus the delta exactly
+/// matches the accumulated length (`acc_len`). That guard guarantees the part
+/// holds everything before this delta, so an in-place append is equivalent to
+/// resetting it to the full accumulator — without the O(n) copy. Returns false
+/// (caller resyncs via `set_stream_text`) when the part diverged or changed
+/// kind.
+fn append_stream_text(
+    part: &mut ocpncord_backend::Part,
+    delta: &str,
+    kind: StreamTextKind,
+    acc_len: usize,
+) -> bool {
+    let current = match (kind, part) {
+        (StreamTextKind::Text, ocpncord_backend::Part::Text(text)) => &mut text.text,
+        (StreamTextKind::Reasoning, ocpncord_backend::Part::Reasoning(reasoning)) => {
+            &mut reasoning.text
+        }
+        _ => return false,
+    };
+    if current.len() + delta.len() != acc_len {
+        return false;
+    }
+    current.push_str(delta);
+    true
+}
+
 fn set_stream_text(part: &mut ocpncord_backend::Part, text: String, kind: StreamTextKind) {
     *part = match kind {
         StreamTextKind::Text => ocpncord_backend::Part::Text(ocpncord_backend::TextPart {
@@ -776,17 +814,27 @@ pub(crate) fn render_chat(
         render_queued_message(&mut lines, msg, theme, transcript.display_policy);
     }
 
+    // Wrapped heights at full width and at width-1 (the layout once a scrollbar
+    // steals a column) are the only two measurements needed; compute each at
+    // most once and reuse them for both the scrollbar decision and the scroll
+    // offset, instead of re-wrapping the whole transcript three times.
     let full_width_height = wrapped_height(&lines, msg_area.width);
-    let show_scrollbar = full_width_height > msg_area.height as usize
-        || (msg_area.width > 1
-            && wrapped_height(&lines, msg_area.width - 1) > msg_area.height as usize);
-    let text_area = if show_scrollbar && msg_area.width > 1 {
-        Rect::new(msg_area.x, msg_area.y, msg_area.width - 1, msg_area.height)
+    let narrow_height = if msg_area.width > 1 {
+        wrapped_height(&lines, msg_area.width - 1)
     } else {
-        msg_area
+        full_width_height
+    };
+    let show_scrollbar = full_width_height > msg_area.height as usize
+        || (msg_area.width > 1 && narrow_height > msg_area.height as usize);
+    let (text_area, content_height) = if show_scrollbar && msg_area.width > 1 {
+        (
+            Rect::new(msg_area.x, msg_area.y, msg_area.width - 1, msg_area.height),
+            narrow_height,
+        )
+    } else {
+        (msg_area, full_width_height)
     };
 
-    let content_height = wrapped_height(&lines, text_area.width);
     let max_scroll = content_height.saturating_sub(text_area.height as usize) as u16;
     let scroll_y = max_scroll.saturating_sub(scroll.min(max_scroll));
 
@@ -1678,6 +1726,33 @@ mod tests {
 
         match &state.partial_parts()[0] {
             Part::Text(text) => assert_eq!(text.text, "hello"),
+            other => panic!("expected text part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_stream_deltas_accumulate_in_order() {
+        let mut state = ChatState::new();
+        for chunk in ["Hello", ", ", "world", "!"] {
+            state.merge_stream_delta("text-1".into(), chunk.into());
+        }
+        assert_eq!(state.partial_parts().len(), 1);
+        match &state.partial_parts()[0] {
+            Part::Text(text) => assert_eq!(text.text, "Hello, world!"),
+            other => panic!("expected text part, got {other:?}"),
+        }
+
+        // A full-part replace then a further delta keeps accumulating correctly.
+        state.merge_stream_part(
+            Some("text-1".into()),
+            Part::Text(TextPart {
+                identity: Default::default(),
+                text: "Reset".into(),
+            }),
+        );
+        state.merge_stream_delta("text-1".into(), " and continue".into());
+        match &state.partial_parts()[0] {
+            Part::Text(text) => assert_eq!(text.text, "Reset and continue"),
             other => panic!("expected text part, got {other:?}"),
         }
     }

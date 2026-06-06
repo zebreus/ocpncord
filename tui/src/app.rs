@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 use core::future::Future;
 use core::pin::Pin;
-use core::task::Poll;
+use core::task::{Context, Poll, Waker};
 
 use futures_core::Stream;
 use ocpncord_backend::{Backend, BackendError, EventEnvelope, EventScope};
@@ -3081,6 +3081,51 @@ fn driver_poll_slot(cursor: u8, offset: u8) -> u8 {
     (cursor + offset) % 2
 }
 
+/// Polls the in-flight backend op and the live/platform event sources once,
+/// returning the first ready `DriverEvent` (or `Poll::Pending` when nothing is
+/// ready). A completed op result is stashed in `completed_op`. Shared by the
+/// blocking wait and the non-blocking drain so both stay in sync.
+fn poll_driver_event<'op, B, E>(
+    cx: &mut Context<'_>,
+    active_op: &mut Option<BackendOpFuture<'op, B>>,
+    live_events: &mut Option<B::EventStream>,
+    events: &mut E,
+    poll_cursor: u8,
+    completed_op: &mut Option<BackendOpResult<B>>,
+) -> Poll<DriverEvent>
+where
+    B: Backend,
+    E: Stream<Item = Event> + Unpin,
+{
+    if let Some(op) = active_op.as_mut() {
+        if let Poll::Ready(result) = op.as_mut().poll(cx) {
+            *completed_op = Some(result);
+            return Poll::Ready(DriverEvent::Operation);
+        }
+    }
+
+    for offset in 0..2u8 {
+        match driver_poll_slot(poll_cursor, offset) {
+            0 => {
+                if let Some(stream) = live_events {
+                    if let Poll::Ready(event) = Pin::new(stream).poll_next(cx) {
+                        return Poll::Ready(DriverEvent::Live(event));
+                    }
+                }
+            }
+            _ => {
+                if let Poll::Ready(event) = Pin::new(&mut *events).poll_next(cx) {
+                    if let Some(event) = event {
+                        return Poll::Ready(DriverEvent::Platform(event));
+                    }
+                    return Poll::Ready(DriverEvent::PlatformClosed);
+                }
+            }
+        }
+    }
+    Poll::Pending
+}
+
 type BackendOpFuture<'a, B> = Pin<Box<dyn Future<Output = BackendOpResult<B>> + 'a>>;
 
 #[cfg(test)]
@@ -3357,6 +3402,29 @@ where
         }
     }
 
+    fn dispatch_driver_event(
+        state: &mut AppState,
+        live_events: &mut Option<B::EventStream>,
+        event: DriverEvent,
+    ) -> bool {
+        match event {
+            DriverEvent::Platform(event) => state.handle_event(event),
+            DriverEvent::Live(Some(Ok(envelope))) => state.apply_live_envelope(envelope),
+            DriverEvent::Live(Some(Err(error))) => {
+                *live_events = None;
+                state.handle_live_stream_failure(format!("{error}"));
+                true
+            }
+            DriverEvent::Live(None) => {
+                *live_events = None;
+                state.handle_live_stream_failure("live stream closed".into());
+                true
+            }
+            DriverEvent::Operation => true,
+            DriverEvent::PlatformClosed => false,
+        }
+    }
+
     pub async fn run(&mut self) {
         let Self {
             state,
@@ -3372,6 +3440,7 @@ where
         let _ = ratatui_terminal.draw(|frame| state.render(frame));
 
         let mut active_op: Option<BackendOpFuture<'_, B>> = None;
+        let noop_waker = Waker::noop();
         loop {
             if active_op.is_none() {
                 if let Some(op) = state.pending_ops.pop_front() {
@@ -3380,60 +3449,59 @@ where
                 }
             }
 
+            // Block until at least one source is ready, then handle that event.
             let mut completed_op = None;
             let event = futures::future::poll_fn(|cx| {
-                if let Some(op) = active_op.as_mut() {
-                    if let Poll::Ready(result) = op.as_mut().poll(cx) {
-                        completed_op = Some(result);
-                        return Poll::Ready(DriverEvent::Operation);
-                    }
-                }
-
-                for offset in 0..2u8 {
-                    match driver_poll_slot(*poll_cursor, offset) {
-                        0 => {
-                            if let Some(stream) = live_events {
-                                if let Poll::Ready(event) = Pin::new(stream).poll_next(cx) {
-                                    return Poll::Ready(DriverEvent::Live(event));
-                                }
-                            }
-                        }
-                        _ => {
-                            if let Poll::Ready(event) = Pin::new(&mut *events).poll_next(cx) {
-                                if let Some(event) = event {
-                                    return Poll::Ready(DriverEvent::Platform(event));
-                                }
-                                return Poll::Ready(DriverEvent::PlatformClosed);
-                            }
-                        }
-                    }
-                }
-                Poll::Pending
+                poll_driver_event(
+                    cx,
+                    &mut active_op,
+                    &mut *live_events,
+                    &mut *events,
+                    *poll_cursor,
+                    &mut completed_op,
+                )
             })
             .await;
             *poll_cursor = (*poll_cursor + 1) % 2;
-
-            if let Some(result) = completed_op {
+            if let Some(result) = completed_op.take() {
                 active_op = None;
                 Self::apply_backend_op_result_to(state, live_events, result);
             }
+            let mut running = Self::dispatch_driver_event(state, live_events, event);
 
-            let running = match event {
-                DriverEvent::Platform(event) => state.handle_event(event),
-                DriverEvent::Live(Some(Ok(envelope))) => state.apply_live_envelope(envelope),
-                DriverEvent::Live(Some(Err(error))) => {
-                    *live_events = None;
-                    state.handle_live_stream_failure(format!("{error}"));
-                    true
+            // Coalesce redraws: drain every event that is already ready before
+            // drawing, so a burst of streaming deltas collapses into a single
+            // redraw instead of a full transcript re-render per chunk. Polling
+            // with a no-op waker only checks readiness now; the next blocking
+            // poll above re-registers the real waker, so no wake-ups are lost.
+            let mut drain_cx = Context::from_waker(noop_waker);
+            while running {
+                if active_op.is_none() {
+                    if let Some(op) = state.pending_ops.pop_front() {
+                        state.mark_backend_op_started(&op);
+                        active_op = Some(backend_op_future_from_ptr(backend_ptr, op));
+                    }
                 }
-                DriverEvent::Live(None) => {
-                    *live_events = None;
-                    state.handle_live_stream_failure("live stream closed".into());
-                    true
+
+                let mut completed_op = None;
+                let event = match poll_driver_event(
+                    &mut drain_cx,
+                    &mut active_op,
+                    &mut *live_events,
+                    &mut *events,
+                    *poll_cursor,
+                    &mut completed_op,
+                ) {
+                    Poll::Ready(event) => event,
+                    Poll::Pending => break,
+                };
+                *poll_cursor = (*poll_cursor + 1) % 2;
+                if let Some(result) = completed_op.take() {
+                    active_op = None;
+                    Self::apply_backend_op_result_to(state, live_events, result);
                 }
-                DriverEvent::Operation => true,
-                DriverEvent::PlatformClosed => false,
-            };
+                running = Self::dispatch_driver_event(state, live_events, event);
+            }
 
             let _ = ratatui_terminal.draw(|frame| state.render(frame));
             if !running {
