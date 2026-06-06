@@ -7,6 +7,7 @@
 //! Wrapping the transport in [`BufferedTcpConnect`] serves those tiny reads from a
 //! small in-memory buffer that a single underlying read fills.
 
+use alloc::boxed::Box;
 use core::net::SocketAddr;
 use embedded_io_async::{ErrorType, Read, Write};
 use embedded_nal_async::TcpConnect;
@@ -47,9 +48,13 @@ impl<T: TcpConnect> TcpConnect for BufferedTcpConnect<T> {
 }
 
 /// A connection that serves reads from a small internal buffer and writes through.
+///
+/// The buffer is heap-allocated: this connection is embedded in reqwless's request
+/// future, which lives on the caller's task stack, and a 4 KiB inline array there
+/// overflows the badge's stack-constrained network task. `Box` keeps the future small.
 pub struct BufferedConnection<C> {
     inner: C,
-    buf: [u8; READ_BUFFER_SIZE],
+    buf: Box<[u8; READ_BUFFER_SIZE]>,
     start: usize,
     end: usize,
 }
@@ -58,7 +63,7 @@ impl<C> BufferedConnection<C> {
     fn new(inner: C) -> Self {
         Self {
             inner,
-            buf: [0u8; READ_BUFFER_SIZE],
+            buf: Box::new([0u8; READ_BUFFER_SIZE]),
             start: 0,
             end: 0,
         }
@@ -87,7 +92,7 @@ impl<C: Read> Read for BufferedConnection<C> {
             }
             // Otherwise refill with a single underlying read. This never
             // over-blocks: one read returns whatever is already available.
-            let n = self.inner.read(&mut self.buf).await?;
+            let n = self.inner.read(&mut self.buf[..]).await?;
             if n == 0 {
                 return Ok(0);
             }
